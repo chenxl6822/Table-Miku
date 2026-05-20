@@ -22,7 +22,7 @@ from .goal_parser import ParsedGoalInput, parse_goal_input
 from .paths import asset_path
 from .planner import add_goal, ensure_goal_plans, today_tasks
 from .reminders import ReminderManager
-from .sprites import load_sprite, sprite_source_hint
+from .sprites import load_keyboard, load_sprite, sprite_source_hint
 from .storage import load_goals, load_settings, save_settings
 from .weather import get_weather
 
@@ -62,6 +62,7 @@ class TypingMiku(QWidget):
         self.frame = 0
         self.expression = "focus"
         self.sprites: dict[str, QPixmap] = {}
+        self.keyboard = load_keyboard()
 
         self.animation_timer = QTimer(self)
         self.animation_timer.setInterval(95)
@@ -171,6 +172,23 @@ class TypingMiku(QWidget):
         )
 
     def _draw_keyboard(self, painter: QPainter, left_tap: int, right_tap: int) -> None:
+        if not self.keyboard.isNull():
+            y = 168 + math.sin(self.frame / 9) * 0.8
+            painter.drawPixmap(
+                QRectF(24, y, 252, 88).toRect(),
+                self.keyboard.scaled(
+                    252,
+                    88,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                ),
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            glow_x = 68 + (self.frame // 3 % 10) * 16
+            painter.setBrush(QColor(130, 245, 255, 88))
+            painter.drawRoundedRect(QRectF(glow_x, y + 30, 14, 9), 3, 3)
+            return
+
         painter.setPen(QPen(QColor("#25304a"), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         base = QPainterPath()
         base.moveTo(56, 204)
@@ -503,7 +521,7 @@ class TableMiku(QWidget):
         city, ok = QInputDialog.getText(
             self,
             "设置城市",
-            "建议输入“城市,省份”，例如：湘潭,湖南。输入 auto 会使用 IP 定位，可能受 VPN 影响：",
+            "建议输入“区县,城市,省份”，例如：雨湖区,湘潭,湖南。输入 auto 会使用 IP 定位，可能受 VPN 影响：",
             text=str(self.settings.get("city", "auto")),
         )
         if not ok:

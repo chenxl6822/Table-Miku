@@ -1,5 +1,5 @@
 {
-  "city": "湘潭,湖南",
+  "city": "雨湖区,湘潭,湖南",
   "reminders_enabled": true,
   "reminder_interval_minutes": 60,
   "scheduled_reminders": [
@@ -29,6 +29,6 @@
     "start": 23,
     "end": 7
   },
-  "last_reminder_at": null,
+  "last_reminder_at": "2026-05-20T22:45:14",
   "bubble_seconds": 7
 }

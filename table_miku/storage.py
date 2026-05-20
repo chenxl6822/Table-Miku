@@ -10,7 +10,7 @@ from .paths import user_data_dir
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "city": "湘潭,湖南",
+    "city": "雨湖区,湘潭,湖南",
     "reminders_enabled": True,
     "reminder_interval_minutes": 60,
     "scheduled_reminders": [

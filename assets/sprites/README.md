@@ -8,6 +8,7 @@
 - `miku_focus.png`：专注表情，可选。
 - `miku_surprised.png`：惊讶表情，可选。
 - `miku_sleepy.png`：困困表情，可选。
+- `keyboard.png`：AI 生成的键盘素材，程序会优先使用它替代代码绘制键盘。
 
 如果提供 `miku_sprite_sheet.png`，程序会自动裁成 5 个表情。若图片带棋盘格假透明背景，程序会尽量从边缘去除背景。
 

@@ -18,6 +18,7 @@ SPRITE_FILENAMES = {
     "sleepy": "miku_sleepy.png",
 }
 SPRITE_SHEET = "miku_sprite_sheet.png"
+KEYBOARD_ASSET = "keyboard.png"
 SPRITE_ORDER = ["idle", "focus", "happy", "surprised", "sleepy"]
 
 # Transparent chibi-style references found through web search. Most public PNG
@@ -59,6 +60,13 @@ def load_sprite(expression: str = "idle") -> QPixmap:
 
 def sprite_source_hint() -> str:
     return "请把 AI 生成的五表情横向图放到 assets/sprites/miku_sprite_sheet.png，或放入 miku_idle.png。"
+
+
+def load_keyboard() -> QPixmap:
+    pixmap = _load_pixmap(SPRITE_DIR / KEYBOARD_ASSET)
+    if pixmap.isNull():
+        return QPixmap()
+    return _trim_transparentized(pixmap)
 
 
 def _load_pixmap(path: Path) -> QPixmap:

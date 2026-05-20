@@ -104,13 +104,13 @@ dist/TableMiku/TableMiku.exe
 
 ```json
 {
-  "city": "auto"
+  "city": "雨湖区,湘潭,湖南"
 }
 ```
 
-建议填写 `城市,省份`，例如 `湘潭,湖南`。`auto` 表示使用 IP 自动定位，但 IP 定位会受 VPN、代理、运营商出口影响，不保证等于真实所在地。
+建议填写 `区县,城市,省份`，例如 `雨湖区,湘潭,湖南`。`auto` 表示使用 IP 自动定位，但 IP 定位会受 VPN、代理、运营商出口影响，不保证等于真实所在地，也通常无法精确到区县。
 
-天气位置解析会优先使用 OpenStreetMap Nominatim 地理库做省市消歧，再回退到 Open-Meteo 地理编码；天气数据使用 Open-Meteo 当前天气接口。
+天气位置解析会优先使用 OpenStreetMap Nominatim 地理库做省/市/区县消歧，再回退到 Open-Meteo 地理编码；天气数据使用 Open-Meteo 当前天气接口。
 
 ### 修改定时提醒
 
@@ -173,6 +173,14 @@ assets/sprites/miku_sprite_sheet.png
 ```
 
 表情顺序为 `idle`、`focus`、`happy`、`surprised`、`sleepy`。程序会自动裁剪并尽量去除棋盘格假透明背景。
+
+仓库也内置了 AI 生成的键盘素材：
+
+```text
+assets/sprites/keyboard.png
+```
+
+程序会优先使用这张键盘图片，以匹配 Miku 的半立体可爱画风；图片缺失时才回退到代码绘制键盘。
 
 推荐把风格接近参考图的透明 PNG 放到：
 
