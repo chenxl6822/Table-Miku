@@ -8,7 +8,8 @@ Table Miku 是一个 Windows 桌面 Miku 桌宠：可以透明置顶、自由拖
 
 - 透明无边框桌宠窗口，默认在屏幕右下角显示。
 - 左键按住拖动，左键轻点触发随机对话。
-- Miku 是自绘动态形象，会眨眼、轻微浮动并敲键盘，不再依赖单张贴图。
+- Miku 本体优先使用透明 PNG 精灵图，键盘由程序绘制并带按键动画。
+- 默认读取 `assets/sprites/miku_idle.png`；也支持 `miku_happy.png`、`miku_focus.png`、`miku_surprised.png`、`miku_sleepy.png` 做表情切换。
 - 右键菜单：
   - 查看今日任务
   - 导入学习目标/时间表
@@ -163,17 +164,26 @@ dist/TableMiku/TableMiku.exe
 
 ## 使用自己的 Miku 图片
 
-当前版本默认使用程序自绘的动态敲键盘 Miku，`assets/miku.svg` 仅作为窗口图标和备用资源。
+当前版本默认优先使用真实 PNG 精灵图，`assets/miku.svg` 仅作为窗口图标和备用资源。
 
-如果你想使用自己的图片，把图片放到：
+推荐把风格接近参考图的透明 PNG 放到：
 
 ```text
-assets/miku.png
+assets/sprites/miku_idle.png
 ```
 
-程序会优先读取 `miku.png`，其次读取 `miku.jpg`，最后读取内置的 `miku.svg`。
+如需表情变化，可以继续放入：
 
-建议使用透明背景或接近正方形的图片，这样桌宠显示效果更好。
+```text
+assets/sprites/miku_happy.png
+assets/sprites/miku_focus.png
+assets/sprites/miku_surprised.png
+assets/sprites/miku_sleepy.png
+```
+
+如果没有本地精灵图，程序会尝试从代码中的参考 URL 缓存下载一张 chibi Miku 透明图。网上 PNG 聚合站的素材通常只适合个人学习或非商业使用；如果要转发或发布，请替换为你确认授权可用的素材。
+
+建议图片使用透明背景，主体接近正方形，角色朝向正面或略微俯视，这样和键盘叠加效果更自然。
 
 ## 常见问题
 
