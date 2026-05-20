@@ -108,7 +108,9 @@ dist/TableMiku/TableMiku.exe
 }
 ```
 
-`auto` 表示使用 IP 自动定位。也可以改成 `Beijing`、`Guangzhou`、`Shenzhen` 等城市名。
+建议填写 `城市,省份`，例如 `湘潭,湖南`。`auto` 表示使用 IP 自动定位，但 IP 定位会受 VPN、代理、运营商出口影响，不保证等于真实所在地。
+
+天气位置解析会优先使用 OpenStreetMap Nominatim 地理库做省市消歧，再回退到 Open-Meteo 地理编码；天气数据使用 Open-Meteo 当前天气接口。
 
 ### 修改定时提醒
 

@@ -503,7 +503,7 @@ class TableMiku(QWidget):
         city, ok = QInputDialog.getText(
             self,
             "设置城市",
-            "输入城市名，或输入 auto 使用 IP 自动定位：",
+            "建议输入“城市,省份”，例如：湘潭,湖南。输入 auto 会使用 IP 定位，可能受 VPN 影响：",
             text=str(self.settings.get("city", "auto")),
         )
         if not ok:
