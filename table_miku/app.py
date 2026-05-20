@@ -28,12 +28,12 @@ from .weather import get_weather
 
 
 CHAT_LINES = [
-    "键盘已经热身完毕，今天我们把最小任务先跑起来。",
-    "给我 25 分钟专注时间，我负责噼里啪啦给你加油。",
-    "实习准备别靠玄学：项目、算法、简历，今天推进一小块。",
-    "先让代码跑起来，再让 README 说人话，完美可以晚点来。",
-    "卡住就把问题写下来。能被描述的问题，已经解决了一半。",
-    "今天只要赢过昨天一点点，就算 Miku 盖章通过。",
+    "键盘热身完毕，先做一个最小任务吧。",
+    "给我 25 分钟专注时间，我负责加油。",
+    "项目、算法、简历，今天推进一小块。",
+    "先让代码跑起来，完美可以晚点来。",
+    "卡住就写下问题，问题清楚就好办了。",
+    "今天赢过昨天一点点，就算 Miku 盖章通过。",
 ]
 
 IMPORT_EXAMPLE = """支持多种输入格式，例如：
@@ -266,6 +266,49 @@ class TextInputDialog(QDialog):
         return self.editor.toPlainText()
 
 
+class TaskDialog(QDialog):
+    def __init__(self, tasks: list[str], schedule: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("今日任务")
+        self.resize(460, 360)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("今日学习计划")
+        title.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
+        title.setStyleSheet("color: #27385f;")
+        layout.addWidget(title)
+
+        content = QTextEdit(self)
+        content.setReadOnly(True)
+        content.setFont(QFont("Microsoft YaHei UI", 10))
+        content.setStyleSheet(
+            """
+            QTextEdit {
+                background: #ffffff;
+                border: 2px solid #d5def3;
+                border-radius: 14px;
+                padding: 12px;
+                color: #27385f;
+            }
+            """
+        )
+        content.setPlainText(self._format(tasks, schedule))
+        layout.addWidget(content)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _format(tasks: list[str], schedule: list[str]) -> str:
+        blocks: list[str] = []
+        if tasks:
+            blocks.append("今日任务\n" + "\n".join(f"{index}. {task}" for index, task in enumerate(tasks, 1)))
+        if schedule:
+            blocks.append("定时提醒\n" + "\n".join(f"- {item}" for item in schedule))
+        return "\n\n".join(blocks) if blocks else "今天还没有任务。右键导入一个目标吧。"
+
+
 class TableMiku(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -289,7 +332,7 @@ class TableMiku(QWidget):
         self.bubble.setWordWrap(True)
         self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.bubble.setGeometry(10, 6, 280, 92)
-        self.bubble.setFont(QFont("Microsoft YaHei UI", 10))
+        self.bubble.setFont(QFont("Microsoft YaHei UI", 9))
         self.bubble.setStyleSheet(
             """
             QLabel {
@@ -319,10 +362,15 @@ class TableMiku(QWidget):
 
     def say(self, text: str) -> None:
         self.settings = load_settings()
-        self.bubble.setText(text)
+        self.bubble.setText(self._bubble_text(text))
         self.bubble.show()
         seconds = int(self.settings.get("bubble_seconds", 7))
         self.hide_timer.start(max(seconds, 3) * 1000)
+
+    @staticmethod
+    def _bubble_text(text: str) -> str:
+        compact = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        return compact if len(compact) <= 72 else compact[:69] + "..."
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
@@ -380,12 +428,8 @@ class TableMiku(QWidget):
         self.pet.set_expression("happy")
         tasks = today_tasks(load_goals())
         schedule = self._schedule_lines()
-        parts = []
-        if tasks:
-            parts.append("今日学习：\n" + "\n".join(tasks[:2]))
-        if schedule:
-            parts.append("定时提醒：\n" + "\n".join(schedule[:4]))
-        self.say("\n\n".join(parts) if parts else "今天还没有任务。右键导入一个目标吧。")
+        TaskDialog(tasks, schedule, self).exec()
+        self.say("今日任务已打开。先挑最小的一项开始吧。")
 
     def import_goal(self) -> None:
         dialog = TextInputDialog(

@@ -164,7 +164,13 @@ dist/TableMiku/TableMiku.exe
 
 ## 使用自己的 Miku 图片
 
-当前版本默认优先使用真实 PNG 精灵图，`assets/miku.svg` 仅作为窗口图标和备用资源。
+当前版本默认优先使用真实 PNG 精灵图，`assets/miku.svg` 仅作为窗口图标和备用资源。仓库已内置一张 AI 生成的五表情横向精灵图：
+
+```text
+assets/sprites/miku_sprite_sheet.png
+```
+
+表情顺序为 `idle`、`focus`、`happy`、`surprised`、`sleepy`。程序会自动裁剪并尽量去除棋盘格假透明背景。
 
 推荐把风格接近参考图的透明 PNG 放到：
 
