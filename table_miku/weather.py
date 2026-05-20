@@ -29,33 +29,62 @@ WMO_DESCRIPTIONS = {
 }
 
 
-def _get_json(url: str, timeout: float = 5.0) -> dict[str, Any]:
+def _get_json(url: str, timeout: float = 6.0) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "Table-Miku/0.1"},
+        headers={"User-Agent": "Table-Miku/0.2"},
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
-def get_weather(city: str) -> str:
-    city = city.strip() or "Shanghai"
+def detect_location() -> dict[str, Any]:
+    """Approximate the current location by public IP."""
+    data = _get_json("http://ip-api.com/json/?lang=zh-CN")
+    if data.get("status") != "success":
+        raise RuntimeError("IP 定位失败")
+    return {
+        "name": data.get("city") or data.get("regionName") or "当前位置",
+        "region": data.get("regionName") or "",
+        "country": data.get("country") or "",
+        "latitude": data["lat"],
+        "longitude": data["lon"],
+    }
+
+
+def geocode_city(city: str) -> dict[str, Any] | None:
     query = urllib.parse.urlencode({"name": city, "count": 1, "language": "zh"})
     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?{query}"
     geo = _get_json(geo_url)
     results = geo.get("results") or []
     if not results:
-        return f"没有找到「{city}」的天气位置，换个城市名试试吧。"
-
+        return None
     location = results[0]
-    latitude = location["latitude"]
-    longitude = location["longitude"]
-    display_name = location.get("name", city)
+    return {
+        "name": location.get("name", city),
+        "region": location.get("admin1", ""),
+        "country": location.get("country", ""),
+        "latitude": location["latitude"],
+        "longitude": location["longitude"],
+    }
+
+
+def get_weather(city: str = "auto") -> str:
+    location: dict[str, Any] | None = None
+    requested = (city or "auto").strip()
+
+    if requested.lower() in {"auto", "定位", "自动定位", "当前位置"}:
+        location = detect_location()
+    else:
+        location = geocode_city(requested)
+        if location is None:
+            return f"没有找到「{requested}」的天气位置。可以把城市设置为 auto，让 Miku 自动定位。"
+
     weather_query = urllib.parse.urlencode(
         {
-            "latitude": latitude,
-            "longitude": longitude,
-            "current": "temperature_2m,weather_code,wind_speed_10m",
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": "temperature_2m,weather_code,wind_speed_10m,relative_humidity_2m",
             "timezone": "auto",
         }
     )
@@ -64,6 +93,10 @@ def get_weather(city: str) -> str:
     current = weather.get("current") or {}
     temperature = current.get("temperature_2m")
     wind = current.get("wind_speed_10m")
+    humidity = current.get("relative_humidity_2m")
     code = current.get("weather_code")
     description = WMO_DESCRIPTIONS.get(code, "天气情况未知")
-    return f"{display_name}现在{description}，{temperature}°C，风速 {wind} km/h。出门记得看天色，学习也别忘了喝水。"
+
+    place_bits = [location.get("name", "当前位置"), location.get("region"), location.get("country")]
+    place = "，".join([str(bit) for bit in place_bits if bit])
+    return f"{place}：现在{description}，{temperature}°C，湿度 {humidity}%，风速 {wind} km/h。"

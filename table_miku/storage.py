@@ -10,9 +10,15 @@ from .paths import user_data_dir
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "city": "Shanghai",
+    "city": "auto",
     "reminders_enabled": True,
     "reminder_interval_minutes": 60,
+    "scheduled_reminders": [
+        {"time": "08:30", "task": "复习编程基础，整理今天要攻克的知识点。"},
+        {"time": "14:30", "task": "推进项目或刷 2 道算法题，留下可复盘的记录。"},
+        {"time": "20:30", "task": "整理简历/项目 README，复盘今天的学习成果。"}
+    ],
+    "fired_reminders": {},
     "quiet_hours": {"start": 23, "end": 7},
     "last_reminder_at": None,
     "bubble_seconds": 7,
