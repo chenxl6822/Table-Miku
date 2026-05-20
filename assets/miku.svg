@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="hair" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#8deff0"/>
+      <stop offset="1" stop-color="#49c9d0"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="7" stdDeviation="5" flood-color="#23315a" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <path d="M45 76 C13 104 11 164 44 207 C37 169 46 124 76 95 Z" fill="#67d8df" stroke="#25365e" stroke-width="7" stroke-linecap="round"/>
+    <path d="M211 76 C243 104 245 164 212 207 C219 169 210 124 180 95 Z" fill="#67d8df" stroke="#25365e" stroke-width="7" stroke-linecap="round"/>
+    <path d="M41 105 C37 46 79 17 128 17 C177 17 219 46 215 105 C212 157 175 196 128 196 C81 196 44 157 41 105 Z" fill="url(#hair)" stroke="#25365e" stroke-width="7"/>
+    <path d="M48 102 C67 101 80 76 88 34 C96 72 113 91 128 100 C139 90 157 70 167 34 C174 76 189 101 208 103 C200 47 169 23 128 23 C87 23 56 47 48 102 Z" fill="#8deff0" stroke="#25365e" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M72 131 C75 107 105 106 111 130 C102 147 82 148 72 131 Z" fill="#eaffff" stroke="#25365e" stroke-width="6"/>
+    <path d="M145 130 C153 106 183 108 186 132 C176 148 154 147 145 130 Z" fill="#eaffff" stroke="#25365e" stroke-width="6"/>
+    <circle cx="93" cy="128" r="13" fill="#68e8ef"/>
+    <circle cx="166" cy="128" r="13" fill="#68e8ef"/>
+    <circle cx="98" cy="123" r="4" fill="#ffffff"/>
+    <circle cx="171" cy="123" r="4" fill="#ffffff"/>
+    <path d="M118 151 C124 158 134 158 139 151" fill="none" stroke="#25365e" stroke-width="5" stroke-linecap="round"/>
+    <path d="M91 155 C81 151 72 153 64 160" fill="none" stroke="#ef9ab0" stroke-width="5" stroke-linecap="round"/>
+    <path d="M165 155 C175 151 184 153 192 160" fill="none" stroke="#ef9ab0" stroke-width="5" stroke-linecap="round"/>
+    <path d="M92 193 L164 193 L151 231 L105 231 Z" fill="#f8fbff" stroke="#25365e" stroke-width="7" stroke-linejoin="round"/>
+    <path d="M111 195 L128 217 L145 195" fill="#ff9db6" stroke="#25365e" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M112 221 C122 214 134 214 144 221" fill="none" stroke="#ff7fa2" stroke-width="6" stroke-linecap="round"/>
+    <rect x="53" y="22" width="23" height="43" rx="6" fill="#26365e" transform="rotate(-10 64 44)"/>
+    <rect x="181" y="22" width="23" height="43" rx="6" fill="#26365e" transform="rotate(10 192 44)"/>
+    <rect x="59" y="27" width="8" height="29" rx="3" fill="#ff8db1" transform="rotate(-10 63 42)"/>
+    <rect x="189" y="27" width="8" height="29" rx="3" fill="#ff8db1" transform="rotate(10 193 42)"/>
+  </g>
+</svg>

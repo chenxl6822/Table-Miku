@@ -1,0 +1,11 @@
+{
+  "city": "Shanghai",
+  "reminders_enabled": true,
+  "reminder_interval_minutes": 60,
+  "quiet_hours": {
+    "start": 23,
+    "end": 7
+  },
+  "last_reminder_at": null,
+  "bubble_seconds": 7
+}
