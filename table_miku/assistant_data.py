@@ -112,6 +112,57 @@ def load_timetable() -> list[dict[str, Any]]:
     return payload if isinstance(payload, list) else []
 
 
+def parse_course_time_slots(raw: str, season: str = "default") -> list[dict[str, str]]:
+    text = raw.strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        season = str(payload.get("season") or season or "default")
+        items = payload.get("slots") or payload.get("course_time_slots") or []
+        return [_normalize_slot(item, season) for item in items if _normalize_slot(item, season)]
+    if isinstance(payload, list):
+        return [_normalize_slot(item, season) for item in payload if _normalize_slot(item, season)]
+
+    slots: list[dict[str, str]] = []
+    for line in text.splitlines():
+        cleaned = " ".join(line.strip().split())
+        if not cleaned:
+            continue
+        time_match = TIME_RANGE_RE.search(cleaned)
+        if not time_match:
+            continue
+        local_season = season
+        season_match = re.search(r"(冬季|夏季|冬令|夏令|winter|summer|default|默认)", cleaned, re.I)
+        if season_match:
+            local_season = _normalize_season(season_match.group(1))
+        section_match = re.search(r"(\d{1,2}\s*[-~到至]\s*\d{1,2}|\d{1,2})\s*(?:节|课)?", cleaned)
+        if not section_match:
+            continue
+        slots.append(
+            {
+                "season": local_season,
+                "section": _normalize_section(section_match.group(1)),
+                "start": _normalize_time(time_match.group("start"), time_match.group("start_min")),
+                "end": _normalize_time(time_match.group("end"), time_match.group("end_min")),
+            }
+        )
+    return _dedupe_slots(slots)
+
+
+def format_course_time_slots(slots: list[dict[str, Any]], limit: int = 20) -> str:
+    if not slots:
+        return ""
+    lines = [
+        f"{slot.get('season', 'default')} {slot.get('section')} {slot.get('start')}-{slot.get('end')}"
+        for slot in slots[:limit]
+    ]
+    return "\n".join(lines)
+
+
 def extract_pdf_text(path: Path) -> str:
     try:
         from pypdf import PdfReader
@@ -373,6 +424,43 @@ def _repair_pdf_text(text: str) -> str:
 def _normalize_section(section: str) -> str:
     compact = re.sub(r"\s+", "", section).replace("到", "-").replace("至", "-").replace("~", "-")
     return f"{compact}节"
+
+
+def _normalize_slot(item: Any, season: str) -> dict[str, str]:
+    if not isinstance(item, dict):
+        return {}
+    section = str(item.get("section") or item.get("节次") or item.get("class") or "").strip()
+    start = str(item.get("start") or item.get("开始") or "").strip()
+    end = str(item.get("end") or item.get("结束") or "").strip()
+    if not section or not re.match(r"^[0-2]?\d:[0-5]\d$", start) or not re.match(r"^[0-2]?\d:[0-5]\d$", end):
+        return {}
+    return {
+        "season": _normalize_season(str(item.get("season") or item.get("季节") or season or "default")),
+        "section": _normalize_section(section.replace("节", "")),
+        "start": start,
+        "end": end,
+    }
+
+
+def _normalize_season(value: str) -> str:
+    value = value.strip().lower()
+    if value in {"冬季", "冬令", "winter"}:
+        return "winter"
+    if value in {"夏季", "夏令", "summer"}:
+        return "summer"
+    return "default"
+
+
+def _dedupe_slots(slots: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for slot in slots:
+        key = (slot.get("season", ""), slot.get("section", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(slot)
+    return unique
 
 
 def _dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:

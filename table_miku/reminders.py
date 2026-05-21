@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from .assistant_data import load_timetable
 from .pomodoro import pomodoro_tick
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings
@@ -54,6 +55,12 @@ class ReminderManager(QObject):
             self.reminder.emit(scheduled_message)
             return
 
+        course_message = self._course_message(settings, now)
+        if course_message:
+            save_settings(settings)
+            self.reminder.emit(course_message)
+            return
+
         interval = int(settings.get("reminder_interval_minutes", 60))
         last_raw = settings.get("last_reminder_at")
         if last_raw:
@@ -91,6 +98,68 @@ class ReminderManager(QObject):
                         fired.pop(old_key, None)
                 return f"{reminder_time} 到啦：\n{task}"
         return ""
+
+    @staticmethod
+    def _course_message(settings: dict[str, Any], now: datetime) -> str:
+        course_settings = settings.get("course_reminders") or {}
+        if not course_settings.get("enabled", True):
+            return ""
+
+        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
+        lead_minutes = int(course_settings.get("lead_minutes", 10))
+        current_time = now.strftime("%H:%M")
+        today_key = now.date().isoformat()
+        fired = settings.setdefault("fired_course_reminders", {})
+        today_fired = set(fired.get(today_key, []))
+        slots = ReminderManager._course_slot_map(settings)
+
+        for entry in load_timetable():
+            if str(entry.get("weekday", "")) != weekday:
+                continue
+            start = str(entry.get("start") or "").strip()
+            end = str(entry.get("end") or "").strip()
+            section = str(entry.get("section") or "").strip()
+            if not start and section:
+                slot = slots.get(section)
+                if slot:
+                    start = slot.get("start", "")
+                    end = slot.get("end", "")
+            if not start:
+                continue
+            try:
+                class_start = datetime.combine(now.date(), time.fromisoformat(start))
+            except ValueError:
+                continue
+            remind_at = (class_start - timedelta(minutes=lead_minutes)).strftime("%H:%M")
+            marker = f"{weekday}|{section}|{start}|{entry.get('course')}"
+            if remind_at == current_time and marker not in today_fired:
+                today_fired.add(marker)
+                fired[today_key] = sorted(today_fired)
+                for old_key in list(fired.keys()):
+                    if old_key != today_key:
+                        fired.pop(old_key, None)
+                when = f"{start}-{end}" if end else start
+                return f"课程提醒：{lead_minutes} 分钟后上课。\n{weekday} {when} {entry.get('course')}"
+        return ""
+
+    @staticmethod
+    def _course_slot_map(settings: dict[str, Any]) -> dict[str, dict[str, str]]:
+        season = str(settings.get("course_time_season", "default"))
+        slots: dict[str, dict[str, str]] = {}
+        fallback: dict[str, dict[str, str]] = {}
+        for item in settings.get("course_time_slots") or []:
+            if not isinstance(item, dict):
+                continue
+            section = str(item.get("section", "")).strip()
+            if not section:
+                continue
+            normalized = {"start": str(item.get("start", "")), "end": str(item.get("end", ""))}
+            if item.get("season", "default") == season:
+                slots[section] = normalized
+            elif item.get("season", "default") == "default":
+                fallback[section] = normalized
+        fallback.update(slots)
+        return fallback
 
     @staticmethod
     def _in_quiet_hours(settings: dict[str, Any]) -> bool:

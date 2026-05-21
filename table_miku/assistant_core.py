@@ -127,7 +127,15 @@ class PersonalAssistant(QObject):
         settings = load_settings()
         assistant = settings.get("assistant") or {}
         context = self._agent_context()
-        result = run_personal_agent(context, "请给我下一步工作提醒和异常摘要。", str(assistant.get("ai_model", "gpt-5-nano")))
+        provider = str(assistant.get("ai_provider", "openai"))
+        model_key = "deepseek_model" if provider == "deepseek" else "ai_model"
+        result = run_personal_agent(
+            context,
+            "请给我下一步工作提醒和异常摘要。",
+            str(assistant.get(model_key, "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano")),
+            provider,
+            str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
+        )
         append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, result.metadata)
         self.notice.emit("smile" if result.ok else "focus", result.text)
 

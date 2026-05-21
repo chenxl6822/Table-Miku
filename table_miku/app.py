@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 from .assistant_data import (
     add_application_record,
     add_interview_review,
+    format_course_time_slots,
     format_application_summary,
     format_interview_summary,
     format_timetable,
@@ -33,6 +35,7 @@ from .assistant_data import (
     load_application_records,
     load_interview_reviews,
     load_timetable,
+    parse_course_time_slots,
 )
 from .assistant_core import PersonalAssistant
 from .goal_parser import ParsedGoalInput, parse_goal_input
@@ -87,6 +90,19 @@ INTERVIEW_EXAMPLE = """公司：星河科技
 轮次：一面
 复盘：项目讲清楚了，但数据库索引回答不够具体。
 下一步：整理 3 个索引失效案例，明晚用 STAR 结构重讲项目亮点。
+"""
+
+COURSE_TIME_EXAMPLE = """# 可粘贴默认、冬季或夏季时间表
+default 1-2节 08:00-09:40
+default 3-4节 10:00-11:40
+default 5-6节 14:00-15:40
+default 7-8节 16:00-17:40
+default 9-10节 19:00-20:40
+
+winter 1-2节 08:00-09:40
+winter 3-4节 10:00-11:40
+summer 1-2节 08:00-09:40
+summer 3-4节 10:00-11:40
 """
 
 DIALOG_STYLE = """
@@ -223,6 +239,7 @@ class TextInputDialog(QDialog):
     def __init__(self, title: str, intro: str, example: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.setWindowIcon(QIcon(str(export_menu_icon())))
         self.resize(560, 430)
         self.setStyleSheet(DIALOG_STYLE)
         layout = QVBoxLayout(self)
@@ -252,6 +269,7 @@ class TaskDialog(QDialog):
     def __init__(self, tasks: list[str], schedule: list[str], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("今日任务")
+        self.setWindowIcon(QIcon(str(export_menu_icon())))
         self.resize(460, 360)
         self.setStyleSheet(DIALOG_STYLE)
 
@@ -418,6 +436,8 @@ class TableMiku(QWidget):
     @staticmethod
     def _bubble_text(text: str) -> str:
         compact = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        if len(compact) > 80:
+            compact = TableMiku._summarize_long_text(compact)
         if len(compact) <= 42:
             return compact
         wrapped = textwrap.wrap(
@@ -429,6 +449,16 @@ class TableMiku(QWidget):
             replace_whitespace=False,
         )
         return "\n".join(wrapped)
+
+    @staticmethod
+    def _summarize_long_text(text: str) -> str:
+        parts = [part.strip(" ，。；;") for part in re.split(r"[。；;]\s*|\n+", text) if part.strip()]
+        if not parts:
+            return text[:100]
+        summary = "；".join(parts[:3])
+        if len(summary) > 72:
+            summary = summary[:69] + "..."
+        return "摘要：" + summary
 
     def _on_pet_pressed(self, x: float, y: float) -> None:
         del x, y
@@ -469,7 +499,9 @@ class TableMiku(QWidget):
             self,
         )
         pomodoro_action = QAction("番茄钟：开始/暂停", self)
+        view_timetable_action = QAction("查看课程表", self)
         timetable_pdf_action = QAction("导入课程表 PDF", self)
+        course_time_action = QAction("导入课程时间表", self)
         application_action = QAction("新增投递记录", self)
         interview_action = QAction("新增面试复盘", self)
         records_action = QAction("查看助理记录", self)
@@ -500,7 +532,9 @@ class TableMiku(QWidget):
         ai_plan_action.triggered.connect(self.show_ai_plan)
         toggle_ai_action.triggered.connect(self.toggle_ai_agent)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
+        view_timetable_action.triggered.connect(self.show_timetable)
         timetable_pdf_action.triggered.connect(self.import_timetable_pdf)
+        course_time_action.triggered.connect(self.import_course_time_slots)
         application_action.triggered.connect(self.add_application)
         interview_action.triggered.connect(self.add_interview_review)
         records_action.triggered.connect(self.show_assistant_records)
@@ -519,7 +553,7 @@ class TableMiku(QWidget):
         menu.addAction(ai_plan_action)
         menu.addAction(toggle_ai_action)
         menu.addSeparator()
-        for action in (pomodoro_action, timetable_pdf_action, application_action, interview_action, records_action):
+        for action in (pomodoro_action, view_timetable_action, timetable_pdf_action, course_time_action, application_action, interview_action, records_action):
             menu.addAction(action)
         menu.addSeparator()
         menu.addAction(startup_action)
@@ -705,10 +739,37 @@ class TableMiku(QWidget):
             return
         if entries:
             self.pet.set_expression("happy")
-            self.say(f"课程表导入完成，共识别 {len(entries)} 节课。")
+            self.say(f"课程表导入完成，共识别 {len(entries)} 节课。可右键查看课程表，我也会按课程时间提前提醒。")
         else:
             self.pet.set_expression("surprised")
             self.say("PDF 已读取，但没识别到“周几 + 时间段 + 课程”的行。可以换一版可复制文本的课表 PDF。")
+
+    def show_timetable(self) -> None:
+        text = format_timetable(load_timetable(), 80)
+        time_slots = format_course_time_slots((load_settings().get("course_time_slots") or []), 30)
+        if time_slots:
+            text = (text or "暂时还没有课程表。") + "\n\n课程时间表：\n" + time_slots
+        dialog = TextInputDialog("课程表", "课程提醒会使用这里的课表和课程时间表。", text or "暂时还没有课程表。", self)
+        dialog.editor.setReadOnly(True)
+        dialog.exec()
+        self.pet.set_expression("smile")
+
+    def import_course_time_slots(self) -> None:
+        current = format_course_time_slots((load_settings().get("course_time_slots") or []), 80) or COURSE_TIME_EXAMPLE
+        dialog = TextInputDialog("导入课程时间表", "支持文字或 JSON。冬夏时间表可用 winter/summer 标记；没有标记则作为默认时间表。", current, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        slots = parse_course_time_slots(dialog.text())
+        if not slots:
+            self.pet.set_expression("surprised")
+            self.say("我没有识别到课程时间。请按“winter 1-2节 08:00-09:40”的格式输入。")
+            return
+        self.settings = load_settings()
+        self.settings["course_time_slots"] = slots
+        self.settings.setdefault("course_reminders", {})["enabled"] = True
+        save_settings(self.settings)
+        self.pet.set_expression("happy")
+        self.say(f"课程时间表已导入，共 {len(slots)} 条。课程提醒已开启。")
 
     def add_application(self) -> None:
         dialog = TextInputDialog("新增投递记录", "可按示例填写，也支持 JSON。Miku 会把它纳入 AI 规划上下文。", APPLICATION_EXAMPLE, self)
