@@ -30,6 +30,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "cpu_enabled": True,
         "cpu_warning_percent": 85,
         "cpu_warning_checks": 3,
+        "memory_enabled": True,
+        "memory_warning_percent": 88,
+        "memory_warning_checks": 2,
         "network_enabled": True,
         "network_check_interval_minutes": 2,
         "network_timeout_seconds": 4,
@@ -38,6 +41,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
             {"name": "百度", "url": "https://www.baidu.com/"},
             {"name": "Google", "url": "https://www.google.com/generate_204"},
         ],
+    },
+    "assistant": {
+        "enabled": True,
+        "daily_brief_time": "08:20",
+        "weather_report_time": "08:10",
+        "startup_brief": True,
+        "command_max_output_chars": 420,
+        "ai_agent_enabled": False,
+        "ai_model": "gpt-5-nano",
     },
 }
 

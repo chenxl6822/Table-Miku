@@ -2,7 +2,7 @@
 
 Table Miku 是一个 Windows 桌面 Miku 桌宠：可以透明置顶、自由拖动、点击互动、提醒学习计划，也可以查询当前城市天气。
 
-这个项目的 v1 目标是先做成一个稳定、能本地运行、能打包转发的桌宠。规划能力暂时使用本地规则模板，不需要配置 AI API Key。
+这个项目的 v1 目标是先做成一个稳定、能本地运行、能打包转发的桌宠。默认使用本地规则模板；如果安装 OpenAI Agents SDK 并配置 API Key，可以升级为 AI Agent 规划和汇报。
 
 ## 功能
 
@@ -17,6 +17,10 @@ Table Miku 是一个 Windows 桌面 Miku 桌宠：可以透明置顶、自由拖
   - 提醒当前城市天气
   - 设置/自动定位城市
   - 立即检测电脑/网络
+  - 生成助手简报
+  - 立即天气汇报
+  - 运行并监视命令
+  - AI 规划/汇报（可选）
   - 暂停/开启系统监测
   - 暂停/开启学习提醒
   - 关闭 Miku
@@ -24,7 +28,8 @@ Table Miku 是一个 Windows 桌面 Miku 桌宠：可以透明置顶、自由拖
 - 支持导入自定义目标，并生成每日学习提醒。
 - 支持具体时间提醒，例如 `08:30 复习基础`、`20:30 整理项目 README`。
 - 天气默认使用 `auto` 通过 IP 粗略定位，也可以手动设置城市名。
-- 支持 CPU 告警和网络连通性提示：默认检测百度与 Google，适合判断普通上网和 VPN/代理是否正常。
+- 支持 CPU、内存告警和网络连通性提示：默认检测百度与 Google，适合判断普通上网和 VPN/代理是否正常。
+- 支持助手简报、每日天气汇报、命令完成提醒；适合让桌宠盯着测试、打包、长时间脚本是否跑完。
 - 支持打包为 `.exe` 后转发给他人使用。
 
 ## 项目结构
@@ -34,6 +39,10 @@ Table-Miku/
 ├─ main.py
 ├─ table_miku/
 │  ├─ app.py
+│  ├─ agent_adapter.py
+│  ├─ assistant_core.py
+│  ├─ assistant_log.py
+│  ├─ command_runner.py
 │  ├─ paths.py
 │  ├─ planner.py
 │  ├─ reminders.py
@@ -139,7 +148,7 @@ dist/TableMiku/TableMiku.exe
 
 ### 修改系统监测
 
-系统监测默认开启：每 30 秒采样一次 CPU；CPU 连续 3 次超过 85% 会告警，恢复后也会提示。网络默认每 2 分钟检测一次百度和 Google，启动时和右键“立即检测电脑/网络”会立刻汇报。
+系统监测默认开启：每 30 秒采样一次 CPU 和内存；CPU 连续 3 次超过 85% 会告警，内存连续 2 次超过 88% 会告警，恢复后也会提示。网络默认每 2 分钟检测一次百度和 Google，启动时和右键“立即检测电脑/网络”会立刻汇报。
 
 打开 `data/settings.json`，可以调整：
 
@@ -148,6 +157,7 @@ dist/TableMiku/TableMiku.exe
   "system_monitor": {
     "enabled": true,
     "cpu_warning_percent": 85,
+    "memory_warning_percent": 88,
     "network_check_interval_minutes": 2,
     "network_targets": [
       {"name": "百度", "url": "https://www.baidu.com/"},
@@ -158,6 +168,33 @@ dist/TableMiku/TableMiku.exe
 ```
 
 百度能连、Google 不能连，通常表示国内网络可用但 Google/VPN/代理出口有问题；两者都不能连，通常表示断网、DNS 或代理配置异常。
+
+### 修改个人助手
+
+个人助手默认开启：启动后生成一次简报；每天 `08:10` 做天气汇报，`08:20` 做今日简报；右键“运行并监视命令”可以让 Miku 运行 PowerShell 命令，命令结束后自动提示退出码和简短输出。
+
+```json
+{
+  "assistant": {
+    "enabled": true,
+    "daily_brief_time": "08:20",
+    "weather_report_time": "08:10",
+    "startup_brief": true,
+    "command_max_output_chars": 420,
+    "ai_agent_enabled": false,
+    "ai_model": "gpt-5-nano"
+  }
+}
+```
+
+命令监视输入示例：
+
+```powershell
+cwd=D:\code\Table Pet
+.\.venv\Scripts\python.exe -m compileall main.py table_miku
+```
+
+`AI 规划/汇报（可选）` 默认不会调用云端模型。要启用真正的 OpenAI Agents SDK，需要安装可选依赖 `openai-agents` 并配置 `OPENAI_API_KEY`，然后把 `assistant.ai_agent_enabled` 改为 `true`。
 
 ## 导入学习目标格式
 

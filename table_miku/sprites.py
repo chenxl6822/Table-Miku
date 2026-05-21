@@ -69,6 +69,27 @@ def load_keyboard() -> QPixmap:
     return _trim_transparentized(pixmap)
 
 
+def export_runtime_sprite_assets() -> dict[str, Path]:
+    target_dir = user_data_dir() / "runtime_assets"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    exported: dict[str, Path] = {}
+
+    for expression in SPRITE_ORDER:
+        target = target_dir / f"miku_{expression}.png"
+        pixmap = load_sprite(expression)
+        if not pixmap.isNull():
+            pixmap.save(str(target), "PNG")
+            exported[expression] = target
+
+    keyboard = load_keyboard()
+    if not keyboard.isNull():
+        target = target_dir / KEYBOARD_ASSET
+        keyboard.save(str(target), "PNG")
+        exported["keyboard"] = target
+
+    return exported
+
+
 def _load_pixmap(path: Path) -> QPixmap:
     if not path.exists():
         return QPixmap()

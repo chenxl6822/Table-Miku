@@ -24,6 +24,14 @@ class ProbeResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class SystemSnapshot:
+    cpu_percent: float | None
+    memory_percent: float | None
+    memory_available_mb: int | None
+    network: list[ProbeResult]
+
+
 class CpuSampler:
     """Sample total Windows CPU usage from kernel times without extra deps."""
 
@@ -73,18 +81,55 @@ class CpuSampler:
         return (int(value.dwHighDateTime) << 32) + int(value.dwLowDateTime)
 
 
+class MemorySampler:
+    def sample(self) -> tuple[float, int] | None:
+        status = self._memory_status()
+        if status is None or status.ullTotalPhys <= 0:
+            return None
+        used_percent = float(status.dwMemoryLoad)
+        available_mb = int(status.ullAvailPhys / 1024 / 1024)
+        return used_percent, available_mb
+
+    @staticmethod
+    def _memory_status() -> Any | None:
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.wintypes.DWORD),
+                ("dwMemoryLoad", ctypes.wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.dwLength = ctypes.sizeof(self)
+
+        status = MemoryStatusEx()
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))  # type: ignore[attr-defined]
+        return status if ok else None
+
+
 class SystemMonitor(QObject):
     notice = Signal(str, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._cpu = CpuSampler()
+        self._memory = MemorySampler()
         self._cpu_high_count = 0
+        self._memory_high_count = 0
         self._cpu_alerting = False
+        self._memory_alerting = False
         self._last_network_state = ""
         self._last_network_report_at: datetime | None = None
         self._network_running = False
         self._last_network_check_at: datetime | None = None
+        self.latest_snapshot = SystemSnapshot(None, None, None, [])
 
         self._timer = QTimer(self)
         self._timer.setInterval(30_000)
@@ -96,6 +141,7 @@ class SystemMonitor(QObject):
 
     def check_now(self) -> None:
         self._check_cpu(force_report=True)
+        self._check_memory(force_report=True)
         self._check_network(force_report=True)
 
     def _first_check(self) -> None:
@@ -115,6 +161,7 @@ class SystemMonitor(QObject):
         interval_seconds = int(monitor.get("check_interval_seconds", 30))
         self._timer.setInterval(max(interval_seconds, 10) * 1000)
         self._check_cpu(force_report=False)
+        self._check_memory(force_report=False)
 
         network_minutes = int(monitor.get("network_check_interval_minutes", 5))
         due_at = datetime.now() - timedelta(minutes=max(network_minutes, 1))
@@ -151,6 +198,50 @@ class SystemMonitor(QObject):
             self._cpu_alerting = False
             self.notice.emit("smile", f"CPU 已恢复：当前约 {usage:.0f}%，电脑喘过气来了。")
 
+        self.latest_snapshot = SystemSnapshot(
+            cpu_percent=usage,
+            memory_percent=self.latest_snapshot.memory_percent,
+            memory_available_mb=self.latest_snapshot.memory_available_mb,
+            network=self.latest_snapshot.network,
+        )
+
+    def _check_memory(self, force_report: bool) -> None:
+        monitor = (load_settings().get("system_monitor") or {})
+        if not monitor.get("memory_enabled", True):
+            return
+
+        sampled = self._memory.sample()
+        if sampled is None:
+            if force_report:
+                self.notice.emit("focus", "内存监测暂时读不到数据，稍后我会再试。")
+            return
+
+        used_percent, available_mb = sampled
+        self.latest_snapshot = SystemSnapshot(
+            cpu_percent=self.latest_snapshot.cpu_percent,
+            memory_percent=used_percent,
+            memory_available_mb=available_mb,
+            network=self.latest_snapshot.network,
+        )
+        threshold = float(monitor.get("memory_warning_percent", 88))
+        required_checks = int(monitor.get("memory_warning_checks", 2))
+        if used_percent >= threshold:
+            self._memory_high_count += 1
+        else:
+            self._memory_high_count = 0
+
+        if force_report:
+            level = "surprised" if used_percent >= threshold else "smile"
+            self.notice.emit(level, f"内存状态：已用 {used_percent:.0f}%，可用约 {available_mb} MB。")
+            return
+
+        if self._memory_high_count >= max(required_checks, 1) and not self._memory_alerting:
+            self._memory_alerting = True
+            self.notice.emit("surprised", f"内存压力偏高：已用约 {used_percent:.0f}%，可用 {available_mb} MB。可以先关掉浏览器重标签或大程序。")
+        elif self._memory_alerting and used_percent < max(threshold - 12, 55):
+            self._memory_alerting = False
+            self.notice.emit("smile", f"内存已恢复：已用约 {used_percent:.0f}%，可用 {available_mb} MB。")
+
     def _check_network(self, force_report: bool) -> None:
         monitor = (load_settings().get("system_monitor") or {})
         if not monitor.get("network_enabled", True) or self._network_running:
@@ -173,6 +264,12 @@ class SystemMonitor(QObject):
                 {"name": "Google", "url": "https://www.google.com/generate_204"},
             ]
             results = [probe_network_target(str(item["name"]), str(item["url"]), timeout) for item in targets]
+            self.latest_snapshot = SystemSnapshot(
+                cpu_percent=self.latest_snapshot.cpu_percent,
+                memory_percent=self.latest_snapshot.memory_percent,
+                memory_available_mb=self.latest_snapshot.memory_available_mb,
+                network=results,
+            )
             state = "|".join(f"{result.name}:{int(result.ok)}" for result in results)
             now = datetime.now()
             healthy_minutes = int(monitor.get("network_healthy_report_minutes", 30))

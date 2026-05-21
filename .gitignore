@@ -8,3 +8,4 @@ dist/
 *.log
 .pytest_cache/
 data/*.broken
+data/runtime_assets/
