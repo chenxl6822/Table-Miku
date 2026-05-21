@@ -52,7 +52,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "ai_use_direct_api": True,
         "ai_provider": "openai",
         "ai_model": "gpt-5-nano",
-        "deepseek_model": "deepseek-chat",
+        "deepseek_model": "deepseek-v4-flash",
         "deepseek_base_url": "https://api.deepseek.com",
     },
     "course_reminders": {
@@ -83,7 +83,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "knowledge": {
         "enabled": True,
-        "topics": ["计算机网络", "计算机组成", "数据结构", "操作系统", "编译器", "数据库"],
+        "topics": ["计算机网络", "计算机组成原理", "数据结构", "操作系统", "编译原理", "数据库原理"],
     },
 }
 

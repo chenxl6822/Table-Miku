@@ -838,7 +838,8 @@ class TableMiku(QWidget):
         threading.Thread(target=self._refresh_knowledge_worker, daemon=True).start()
 
     def _refresh_knowledge_worker(self) -> None:
-        records = refresh_computer_knowledge()
+        topics = (load_settings().get("knowledge") or {}).get("topics") or None
+        records = refresh_computer_knowledge(list(topics) if isinstance(topics, list) else None)
         online = sum(1 for record in records if not record.get("offline"))
         self.async_notice.emit("happy" if online else "focus", f"计算机知识库已更新：{online}/{len(records)} 条来自 Wikipedia。")
 

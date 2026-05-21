@@ -7,11 +7,12 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
-from .assistant_data import assistant_context
+from .assistant_data import assistant_context, load_timetable
 from .agent_adapter import agents_sdk_status, run_personal_agent
 from .assistant_log import append_event, recent_events
 from .command_runner import WatchedCommand, parse_command_spec
 from .knowledge_base import knowledge_context
+from .pomodoro import pomodoro_status
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings
 from .system_monitor import SystemSnapshot
@@ -101,6 +102,13 @@ class PersonalAssistant(QObject):
         if tasks:
             first_task = " ".join(tasks[0].splitlines())
             parts.append(_short(first_task, 120))
+        courses = _today_courses()
+        if courses:
+            parts.append(_short("今日课程：" + "；".join(courses[:3]), 120))
+        parts.append(pomodoro_status(settings))
+        assistant_summary = assistant_context()
+        if assistant_summary:
+            parts.append(_short(assistant_summary, 140))
         knowledge = knowledge_context(2)
         if knowledge:
             parts.append(_short(knowledge, 120))
@@ -136,7 +144,7 @@ class PersonalAssistant(QObject):
         result = run_personal_agent(
             context,
             "请给我下一步工作提醒和异常摘要。",
-            str(assistant.get(model_key, "deepseek-chat" if provider == "deepseek" else "gpt-5-nano")),
+            str(assistant.get(model_key, "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano")),
             provider,
             str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
         )
@@ -198,3 +206,14 @@ def format_snapshot(snapshot: SystemSnapshot | None) -> str:
 def _short(text: str, limit: int = 30) -> str:
     compact = " ".join(text.split())
     return compact if len(compact) <= limit else compact[: limit - 3] + "..."
+
+
+def _today_courses() -> list[str]:
+    weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now().weekday()]
+    lines: list[str] = []
+    for entry in load_timetable():
+        if entry.get("weekday") != weekday:
+            continue
+        when = str(entry.get("section") or f"{entry.get('start')}-{entry.get('end')}").strip("-")
+        lines.append(f"{when} {entry.get('course')}")
+    return lines

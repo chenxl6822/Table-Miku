@@ -42,7 +42,7 @@ def run_personal_agent(
         return _run_chat_completions_api(
             context,
             request,
-            model or "deepseek-chat",
+            model or "deepseek-v4-flash",
             base_url or "https://api.deepseek.com",
             "DEEPSEEK_API_KEY",
             "deepseek",
@@ -111,9 +111,9 @@ def _run_chat_completions_api(
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        return AgentResult(False, f"{provider_name} API 调用失败：HTTP {exc.code}。{_short_error(detail)}", {"provider": provider_name, "model": model})
+        return AgentResult(False, _api_failure_message(provider_name, exc.code, detail), {"provider": provider_name, "model": model})
     except OSError as exc:
-        return AgentResult(False, f"{provider_name} API 暂时连不上：{exc}", {"provider": provider_name, "model": model})
+        return AgentResult(False, f"{provider_name} API 暂时连不上：请检查联网权限、代理或防火墙。{exc}", {"provider": provider_name, "model": model})
 
     text = ""
     choices = data.get("choices")
@@ -169,9 +169,9 @@ def _run_responses_api(context: str, request: str, model: str) -> AgentResult:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        return AgentResult(False, f"AI API 调用失败：HTTP {exc.code}。{_short_error(detail)}", {"provider": "responses-api", "model": model})
+        return AgentResult(False, _api_failure_message("OpenAI", exc.code, detail), {"provider": "responses-api", "model": model})
     except OSError as exc:
-        return AgentResult(False, f"AI API 暂时连不上：{exc}", {"provider": "responses-api", "model": model})
+        return AgentResult(False, f"OpenAI API 暂时连不上：请检查联网权限、代理或防火墙。{exc}", {"provider": "responses-api", "model": model})
 
     text = _extract_response_text(data)
     metadata = {
@@ -224,3 +224,19 @@ def _env_value(name: str) -> str:
 def _short_error(text: str, limit: int = 96) -> str:
     compact = " ".join(text.split())
     return compact if len(compact) <= limit else compact[: limit - 3] + "..."
+
+
+def _api_failure_message(provider_name: str, status_code: int, detail: str) -> str:
+    compact = _short_error(detail, 140)
+    lowered = compact.lower()
+    if status_code == 401 or "invalid_api_key" in lowered or "unauthorized" in lowered:
+        return f"{provider_name} API 认证失败：请检查 API key 是否正确、是否已启用。HTTP {status_code}。{compact}"
+    if status_code == 429:
+        if "quota" in lowered or "credit" in lowered or "balance" in lowered:
+            return f"{provider_name} API 额度不足：请检查余额、额度或消费上限。HTTP {status_code}。{compact}"
+        return f"{provider_name} API 触发速率限制：请降低请求频率或稍后重试。HTTP {status_code}。{compact}"
+    if status_code == 400 and ("model" in lowered or "not found" in lowered):
+        return f"{provider_name} API 模型不可用：请检查模型名和账号权限。HTTP {status_code}。{compact}"
+    if status_code == 403:
+        return f"{provider_name} API 权限不足：请检查账号、项目或模型权限。HTTP {status_code}。{compact}"
+    return f"{provider_name} API 调用失败：HTTP {status_code}。{compact}"
