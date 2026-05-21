@@ -10,3 +10,6 @@ dist/
 data/*.broken
 data/runtime_assets/
 data/*.jsonl
+data/applications.json
+data/interviews.json
+data/timetable.json

@@ -47,6 +47,8 @@ TIME_RANGE_RE = re.compile(
     r"\s*(?:-|~|—|至|到)\s*"
     r"(?P<end>[01]?\d|2[0-3])[:：](?P<end_min>[0-5]\d)"
 )
+SECTION_RE = re.compile(r"[（(](?P<section>\d{1,2}\s*[-~到至]\s*\d{1,2}|\d{1,2})\s*节[）)]")
+COURSE_TITLE_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9ⅠⅡⅢⅣⅤ（）()、]+")
 
 
 def add_application_record(raw: str) -> dict[str, Any]:
@@ -119,12 +121,15 @@ def extract_pdf_text(path: Path) -> str:
     reader = PdfReader(str(path))
     chunks: list[str] = []
     for page in reader.pages:
-        chunks.append(page.extract_text() or "")
+        layout = page.extract_text(extraction_mode="layout") or ""
+        plain = page.extract_text() or ""
+        chunks.append(layout if len(layout) >= len(plain) * 0.8 else plain)
     return "\n".join(chunks)
 
 
 def parse_timetable_text(raw: str) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
+    entries.extend(_parse_layout_timetable(raw))
     for line in raw.splitlines():
         cleaned = " ".join(line.strip().split())
         if not cleaned:
@@ -135,7 +140,7 @@ def parse_timetable_text(raw: str) -> list[dict[str, Any]]:
             continue
         course = cleaned
         if weekday:
-            course = course.replace(weekday, "", 1)
+            course = _remove_weekday_alias(course)
         course = TIME_RANGE_RE.sub("", course, count=1)
         course = re.sub(r"^[,，:：;\-\s]+", "", course).strip()
         course = course or "课程"
@@ -147,7 +152,7 @@ def parse_timetable_text(raw: str) -> list[dict[str, Any]]:
                 "course": course,
             }
         )
-    return entries
+    return _dedupe_entries(entries)
 
 
 def assistant_context() -> str:
@@ -185,10 +190,13 @@ def format_interview_summary(records: list[dict[str, Any]], limit: int = 5) -> s
 def format_timetable(entries: list[dict[str, Any]], limit: int = 8) -> str:
     if not entries:
         return ""
-    lines = [
-        f"{entry.get('weekday') or '未定'} {entry.get('start')}-{entry.get('end')} {entry.get('course')}"
-        for entry in entries[-limit:]
-    ]
+    lines = []
+    for entry in entries[-limit:]:
+        if entry.get("section"):
+            when = str(entry.get("section"))
+        else:
+            when = f"{entry.get('start')}-{entry.get('end')}"
+        lines.append(f"{entry.get('weekday') or '未定'} {when} {entry.get('course')}")
     return "课程表：\n" + "\n".join(lines)
 
 
@@ -221,10 +229,168 @@ def _parse_structured_note(raw: str) -> dict[str, Any]:
 
 
 def _find_weekday(text: str) -> str:
-    for raw, normalized in WEEKDAY_ALIASES.items():
+    for raw, normalized in sorted(WEEKDAY_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
         if raw in text:
             return normalized
     return ""
+
+
+def _remove_weekday_alias(text: str) -> str:
+    for raw in sorted(WEEKDAY_ALIASES, key=len, reverse=True):
+        if raw in text:
+            return text.replace(raw, "", 1)
+    return text
+
+
+def _parse_layout_timetable(raw: str) -> list[dict[str, Any]]:
+    lines = raw.splitlines()
+    header = next((line for line in lines if "星期一" in line and "星期日" in line), "")
+    if not header:
+        return []
+
+    columns = _weekday_columns(header)
+    if not columns:
+        return []
+
+    column_chunks = {weekday: [] for weekday, _, _ in columns}
+    for line in lines[lines.index(header) + 1 :]:
+        for match in re.finditer(r"\S(?:.*?\S)?(?=\s{2,}|\s*$)", line.rstrip()):
+            chunk = match.group(0).strip()
+            if not chunk or chunk in {"上午", "下午", "晚上"} or chunk.isdigit():
+                continue
+            weekday = _weekday_for_position(match.start(), columns)
+            if weekday:
+                column_chunks[weekday].append(chunk)
+
+    entries: list[dict[str, Any]] = []
+    for weekday, chunks in column_chunks.items():
+        text = _repair_pdf_text(" ".join(chunks))
+        entries.extend(_parse_course_blocks(weekday, text))
+    return entries
+
+
+def _weekday_columns(header: str) -> list[tuple[str, int, int]]:
+    points: list[tuple[str, int]] = []
+    for raw, normalized in WEEKDAY_ALIASES.items():
+        if not raw.startswith("星期"):
+            continue
+        index = header.find(raw)
+        if index >= 0:
+            points.append((normalized, index))
+    points.sort(key=lambda item: item[1])
+    if not points:
+        return []
+
+    columns: list[tuple[str, int, int]] = []
+    for index, (weekday, start) in enumerate(points):
+        previous_start = points[index - 1][1] if index else max(0, start - 16)
+        next_start = points[index + 1][1] if index + 1 < len(points) else start + 32
+        left = max(0, (previous_start + start) // 2) if index else max(0, start - 8)
+        right = (start + next_start) // 2 if index + 1 < len(points) else start + 36
+        columns.append((weekday, left, right))
+    return columns
+
+
+def _weekday_for_position(position: int, columns: list[tuple[str, int, int]]) -> str:
+    for weekday, left, right in columns:
+        if left <= position < right:
+            return weekday
+    nearest = min(columns, key=lambda item: abs(position - item[1]), default=None)
+    return nearest[0] if nearest and abs(position - nearest[1]) <= 10 else ""
+
+
+def _parse_course_blocks(weekday: str, text: str) -> list[dict[str, Any]]:
+    matches = list(SECTION_RE.finditer(text))
+    entries: list[dict[str, Any]] = []
+    for index, match in enumerate(matches):
+        prefix = text[: match.start()]
+        previous_end = matches[index - 1].end() if index else 0
+        title_area = text[previous_end : match.start()].strip()
+        title = _last_course_title(title_area) or _last_course_title(prefix)
+        if not title or _looks_like_metadata(title):
+            continue
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        detail = text[match.end() : next_start].strip(" /")
+        entries.append(
+            {
+                "weekday": weekday,
+                "section": _normalize_section(match.group("section")),
+                "start": "",
+                "end": "",
+                "course": title,
+                "detail": detail,
+            }
+        )
+    return entries
+
+
+def _last_course_title(text: str) -> str:
+    candidates = [candidate.strip(" /:：-") for candidate in COURSE_TITLE_RE.findall(text)]
+    candidates = [candidate for candidate in candidates if len(candidate) >= 2 and not _looks_like_metadata(candidate)]
+    if len(candidates) >= 2 and candidates[-1].startswith(("（", "(")):
+        return candidates[-2] + candidates[-1]
+    return candidates[-1] if candidates else ""
+
+
+def _looks_like_metadata(text: str) -> bool:
+    normalized = text.strip(" /:：-")
+    if normalized in {"考试", "考查", "未安排", "教师", "学分", "校本部", "本部"}:
+        return True
+    if ("节" in normalized or "(" in normalized or "（" in normalized) and re.search(r"\d", normalized):
+        return True
+    if re.fullmatch(r"[\u4e00-\u9fff]{2,3}", normalized) and normalized not in {"足球"}:
+        return True
+    if re.fullmatch(r"\d+周", normalized):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "校区",
+            "场地",
+            "教师",
+            "考核方式",
+            "学分",
+            "本部",
+            "打印时间",
+            "兴教楼",
+            "逸夫楼",
+            "计算中心",
+            "足球场",
+            "报告厅",
+            "阶梯",
+        )
+    )
+
+
+def _repair_pdf_text(text: str) -> str:
+    return (
+        text.replace("（ JAVA ）", "（JAVA）")
+        .replace("（JAVA ）", "（JAVA）")
+        .replace("国际安 全", "国际安全")
+    )
+
+
+def _normalize_section(section: str) -> str:
+    compact = re.sub(r"\s+", "", section).replace("到", "-").replace("至", "-").replace("~", "-")
+    return f"{compact}节"
+
+
+def _dedupe_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str, str, str]] = set()
+    unique: list[dict[str, Any]] = []
+    for entry in entries:
+        key = (
+            str(entry.get("weekday", "")),
+            str(entry.get("section", "")),
+            str(entry.get("start", "")),
+            str(entry.get("end", "")),
+            str(entry.get("course", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+    return unique
 
 
 def _normalize_time(hour: str, minute: str) -> str:

@@ -97,6 +97,9 @@ Item {
 
     function showBubble(message, seconds) {
         bubbleText.text = message
+        var lines = Math.max(1, message.split("\n").length)
+        bubble.height = Math.min(142, Math.max(92, 48 + lines * 20))
+        bubble.y = 4
         bubble.visible = true
         bubbleHideTimer.stop()
         bubbleIn.restart()
@@ -410,9 +413,9 @@ Item {
     Rectangle {
         id: bubble
         x: 10
-        y: 8
+        y: 4
         width: 300
-        height: 86
+        height: 92
         radius: 22
         color: "#fbfdff"
         border.color: "#8094b8"
@@ -427,7 +430,7 @@ Item {
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             wrapMode: Text.WordWrap
-            maximumLineCount: 4
+            maximumLineCount: 5
             elide: Text.ElideRight
             minimumPixelSize: 10
             fontSizeMode: Text.Fit

@@ -40,7 +40,7 @@ from .paths import PROJECT_ROOT, asset_path
 from .pomodoro import pomodoro_status, start_pomodoro, stop_pomodoro
 from .planner import add_goal, ensure_goal_plans, today_tasks
 from .reminders import ReminderManager
-from .sprites import export_runtime_sprite_assets
+from .sprites import export_menu_icon, export_runtime_sprite_assets
 from .startup import is_startup_enabled, set_startup_enabled
 from .storage import load_goals, load_settings, save_settings
 from .system_monitor import SystemMonitor
@@ -401,17 +401,8 @@ class TableMiku(QWidget):
         self.settings = load_settings()
         seconds = int(self.settings.get("bubble_seconds", 7))
         bubble_text = self._bubble_text(text)
-        lines = max(1, bubble_text.count("\n") + 1)
-        self.bubble.setGeometry(10, 8, 300, min(132, max(86, 46 + lines * 19)))
-        self.bubble.setText(bubble_text)
-        self.bubble.show()
-        self.bubble.raise_()
-        self._bubble_hiding = False
-        self.bubble_animation.stop()
-        self.bubble_animation.setStartValue(self.bubble_effect.opacity())
-        self.bubble_animation.setEndValue(1.0)
-        self.bubble_animation.start()
-        self.hide_timer.start(max(seconds, 10 if len(bubble_text) > 96 else 3) * 1000)
+        self.bubble.hide()
+        self.pet.show_bubble(bubble_text, max(seconds, 10 if len(bubble_text) > 96 else 3))
 
     def _hide_bubble(self) -> None:
         self._bubble_hiding = True
@@ -483,6 +474,9 @@ class TableMiku(QWidget):
         interview_action = QAction("新增面试复盘", self)
         records_action = QAction("查看助理记录", self)
         startup_action = QAction("关闭开机自启" if is_startup_enabled() else "开启开机自启", self)
+        menu_icon = QIcon(str(export_menu_icon()))
+        if not menu_icon.isNull():
+            timetable_pdf_action.setIcon(menu_icon)
         monitor_settings = self.settings.get("system_monitor") or {}
         toggle_monitor_action = QAction(
             "暂停系统监测" if monitor_settings.get("enabled", True) else "开启系统监测",

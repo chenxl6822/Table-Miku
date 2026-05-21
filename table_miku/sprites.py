@@ -3,8 +3,8 @@ from __future__ import annotations
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QRect
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
 from .paths import PROJECT_ROOT, user_data_dir
 
@@ -88,6 +88,32 @@ def export_runtime_sprite_assets() -> dict[str, Path]:
         exported["keyboard"] = target
 
     return exported
+
+
+def export_menu_icon(name: str = "miku_menu_icon.png") -> Path:
+    target_dir = user_data_dir() / "runtime_assets"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / name
+
+    source = load_sprite("happy")
+    if source.isNull():
+        source = load_sprite("idle")
+    if source.isNull():
+        return target
+
+    canvas = QPixmap(64, 64)
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setBrush(QColor("#e9fbff"))
+    painter.setPen(QColor("#7fd9e9"))
+    painter.drawEllipse(3, 3, 58, 58)
+
+    scaled = source.scaled(54, 54, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    painter.drawPixmap((64 - scaled.width()) // 2, 8 + (48 - scaled.height()) // 2, scaled)
+    painter.end()
+    canvas.save(str(target), "PNG")
+    return target
 
 
 def _load_pixmap(path: Path) -> QPixmap:
