@@ -20,6 +20,10 @@ def asset_path(name: str) -> Path:
     return bundled_root() / "assets" / name
 
 
+def qml_path(name: str) -> Path:
+    return bundled_root() / "table_miku" / "qml" / name
+
+
 def user_data_dir() -> Path:
     """Store editable data beside source in dev, and in AppData when packaged."""
     if getattr(sys, "frozen", False):

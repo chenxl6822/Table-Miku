@@ -6,10 +6,10 @@ from pathlib import Path
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
-from .paths import PROJECT_ROOT, user_data_dir
+from .paths import asset_path, user_data_dir
 
 
-SPRITE_DIR = PROJECT_ROOT / "assets" / "sprites"
+SPRITE_DIR = asset_path("sprites")
 SPRITE_FILENAMES = {
     "idle": "miku_idle.png",
     "happy": "miku_happy.png",

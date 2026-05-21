@@ -87,7 +87,7 @@ python main.py
 安装依赖后执行：
 
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" main.py
+pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "data;data" --add-data "table_miku/qml;table_miku/qml" main.py
 ```
 
 打包成功后，可执行文件会出现在：
@@ -314,7 +314,7 @@ pip install pyinstaller
 然后重新执行打包命令：
 
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" main.py
+pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "data;data" --add-data "table_miku/qml;table_miku/qml" main.py
 ```
 
 如果仍然失败，可以先用源码运行方式使用项目。

@@ -42,7 +42,7 @@ from .assistant_data import (
 from .assistant_core import PersonalAssistant
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import format_knowledge, load_knowledge, refresh_computer_knowledge
-from .paths import PROJECT_ROOT, asset_path
+from .paths import PROJECT_ROOT, asset_path, qml_path
 from .pomodoro import pomodoro_status, start_pomodoro, stop_pomodoro
 from .planner import add_goal, ensure_goal_plans, today_tasks
 from .reminders import ReminderManager
@@ -184,11 +184,14 @@ class QmlMiku(QQuickWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        qml_path = Path(__file__).parent / "qml" / "PetScene.qml"
-        self.setSource(QUrl.fromLocalFile(str(qml_path)))
+        pet_scene_path = qml_path("PetScene.qml")
+        self.engine().addImportPath(str(pet_scene_path.parent))
+        self.setSource(QUrl.fromLocalFile(str(pet_scene_path)))
         self._root = self.rootObject()
         if self._root is None:
-            raise RuntimeError("PetScene.qml failed to load")
+            errors = "; ".join(error.toString() for error in self.errors())
+            detail = f": {errors}" if errors else f" at {pet_scene_path}"
+            raise RuntimeError(f"PetScene.qml failed to load{detail}")
         self._load_sprite_assets()
 
         self.expression_timer = QTimer(self)
