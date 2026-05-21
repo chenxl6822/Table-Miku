@@ -272,17 +272,17 @@ class TextInputDialog(QDialog):
 
 
 class TaskDialog(QDialog):
-    def __init__(self, tasks: list[str], schedule: list[str], parent: QWidget | None = None) -> None:
+    def __init__(self, report: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("今日任务")
         self.setWindowIcon(QIcon(str(export_menu_icon())))
-        self.resize(460, 360)
+        self.resize(500, 440)
         self.setStyleSheet(DIALOG_STYLE)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(12)
-        title = QLabel("今日学习计划")
+        title = QLabel("今日任务全景")
         title.setObjectName("dialogTitle")
         title.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
         title.setStyleSheet("color: #27385f;")
@@ -291,21 +291,12 @@ class TaskDialog(QDialog):
         content = QTextEdit(self)
         content.setReadOnly(True)
         content.setFont(QFont("Microsoft YaHei UI", 10))
-        content.setPlainText(self._format(tasks, schedule))
+        content.setPlainText(report)
         layout.addWidget(content)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
-
-    @staticmethod
-    def _format(tasks: list[str], schedule: list[str]) -> str:
-        blocks: list[str] = []
-        if tasks:
-            blocks.append("今日任务\n" + "\n".join(f"{index}. {task}" for index, task in enumerate(tasks, 1)))
-        if schedule:
-            blocks.append("定时提醒\n" + "\n".join(f"- {item}" for item in schedule))
-        return "\n\n".join(blocks) if blocks else "今天还没有任务。右键导入一个目标吧。"
 
 
 class TableMiku(QWidget):
@@ -589,9 +580,51 @@ class TableMiku(QWidget):
 
     def show_today_tasks(self) -> None:
         self.pet.set_expression("happy")
+        settings = load_settings()
+        blocks: list[str] = []
+
         tasks = today_tasks(load_goals())
-        schedule = self._schedule_lines() + self._today_course_lines()
-        TaskDialog(tasks, schedule, self).exec()
+        if tasks:
+            lines = [f"{i}. {task}" for i, task in enumerate(tasks, 1)]
+            blocks.append("学习目标\n" + "\n".join(lines))
+
+        courses = self._today_course_lines()
+        if courses:
+            blocks.append("今日课程\n" + "\n".join(f"- {c}" for c in courses))
+
+        schedule = self._schedule_lines()
+        if schedule:
+            blocks.append("定时提醒\n" + "\n".join(f"- {s}" for s in schedule))
+
+        blocks.append(pomodoro_status(settings))
+
+        apps = format_application_summary(load_application_records(), 5)
+        if apps:
+            blocks.append(apps)
+
+        interviews = format_interview_summary(load_interview_reviews(), 5)
+        if interviews:
+            blocks.append(interviews)
+
+        knowledge = format_knowledge(load_knowledge(), 6)
+        if knowledge:
+            blocks.append("计算机知识库\n" + knowledge)
+
+        snapshot = self.system_monitor.latest_snapshot
+        if snapshot:
+            parts: list[str] = []
+            if snapshot.cpu_percent is not None:
+                parts.append(f"CPU {snapshot.cpu_percent:.0f}%")
+            if snapshot.memory_percent is not None:
+                parts.append(f"内存 {snapshot.memory_percent:.0f}%")
+            if snapshot.network:
+                statuses = [f"{n.name}: {'通' if n.ok else '断'}" for n in snapshot.network]
+                parts.append("网络 " + "，".join(statuses))
+            if parts:
+                blocks.append("系统状态\n" + "；".join(parts))
+
+        report = "\n\n".join(blocks) if blocks else "今天还没有任务。右键导入一个目标吧。"
+        TaskDialog(report, self).exec()
         self.say("今日任务已打开。先挑最小的一项开始吧。")
 
     def import_goal(self) -> None:

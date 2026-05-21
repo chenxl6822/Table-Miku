@@ -7,7 +7,14 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
-from .assistant_data import assistant_context, load_timetable
+from .assistant_data import (
+    assistant_context,
+    format_application_summary,
+    format_interview_summary,
+    load_application_records,
+    load_interview_reviews,
+    load_timetable,
+)
 from .agent_adapter import agents_sdk_status, run_personal_agent
 from .assistant_log import append_event, recent_events
 from .command_runner import WatchedCommand, parse_command_spec
@@ -98,29 +105,46 @@ class PersonalAssistant(QObject):
         settings = load_settings()
         snapshot = self._system_snapshot_provider()
         tasks = today_tasks(load_goals())
-        parts = ["今日助手简报："]
-        if tasks:
-            first_task = " ".join(tasks[0].splitlines())
-            parts.append(_short(first_task, 120))
         courses = _today_courses()
-        if courses:
-            parts.append(_short("今日课程：" + "；".join(courses[:3]), 120))
-        parts.append(pomodoro_status(settings))
-        assistant_summary = assistant_context()
-        if assistant_summary:
-            parts.append(_short(assistant_summary, 140))
+        apps = format_application_summary(load_application_records(), 3)
+        interviews = format_interview_summary(load_interview_reviews(), 3)
         knowledge = knowledge_context(2)
-        if knowledge:
-            parts.append(_short(knowledge, 120))
+
+        full_parts: list[str] = []
+        if tasks:
+            full_parts.append("今日任务：\n" + "\n".join(" ".join(t.splitlines()) for t in tasks[:3]))
+        if courses:
+            full_parts.append("今日课程：" + "；".join(courses))
+        full_parts.append(pomodoro_status(settings))
+        if apps:
+            full_parts.append(apps)
+        if interviews:
+            full_parts.append(interviews)
         system_line = format_snapshot(snapshot)
         if system_line:
-            parts.append(system_line)
-        recent = recent_events(2)
-        if recent:
-            parts.append("最近：" + "；".join(str(item.get("title", "")) for item in recent if item.get("title")))
-        message = "\n".join(part for part in parts if part)
-        append_event("brief", "生成今日简报", message)
-        self.notice.emit("smile", message)
+            full_parts.append(system_line)
+        if knowledge:
+            full_parts.append(knowledge)
+        full_report = "\n\n".join(full_parts)
+        append_event("brief", "生成今日简报", full_report)
+
+        bubble_lines: list[str] = []
+        if tasks:
+            first = " ".join(tasks[0].splitlines())
+            bubble_lines.append(_short(first, 72))
+        if courses:
+            bubble_lines.append("课程：" + "、".join(c.split()[-1] if c.split() else c for c in courses[:2]))
+        pomo = pomodoro_status(settings)
+        if pomo and "未启动" not in pomo:
+            bubble_lines.append(_short(pomo, 48))
+        if apps:
+            app_line = _short(apps.split("\n")[-1] if "\n" in apps else apps, 48)
+            if app_line:
+                bubble_lines.append(app_line)
+        if not bubble_lines:
+            bubble_lines.append("今天还没有学习目标，右键导入一个吧。")
+        bubble = "今日简报：\n" + "\n".join(bubble_lines[:5])
+        self.notice.emit("smile", bubble)
 
         if (settings.get("assistant") or {}).get("ai_agent_enabled", False):
             self._agent_worker()
@@ -139,12 +163,13 @@ class PersonalAssistant(QObject):
         settings = load_settings()
         assistant = settings.get("assistant") or {}
         context = self._agent_context()
-        provider = str(assistant.get("ai_provider", "openai"))
+        provider = str(assistant.get("ai_provider", "deepseek"))
         model_key = "deepseek_model" if provider == "deepseek" else "ai_model"
+        default_model = "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano"
         result = run_personal_agent(
             context,
             "请给我下一步工作提醒和异常摘要。",
-            str(assistant.get(model_key, "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano")),
+            str(assistant.get(model_key, default_model)),
             provider,
             str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
         )
@@ -161,7 +186,7 @@ class PersonalAssistant(QObject):
                 "系统状态：" + (snapshot or "暂无"),
                 "最近事件：" + (" | ".join(str(event.get("title", "")) for event in events) or "暂无"),
                 assistant_context(),
-                knowledge_context(),
+                knowledge_context(4),
             ]
         )
 

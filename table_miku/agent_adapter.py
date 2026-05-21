@@ -19,22 +19,24 @@ class AgentResult:
 
 
 def agents_sdk_status() -> str:
-    if _env_value("DEEPSEEK_API_KEY"):
+    deepseek_key = _env_value("DEEPSEEK_API_KEY")
+    openai_key = _api_key()
+    if deepseek_key:
         return "DeepSeek API ready"
-    if not _api_key():
-        return "缺少 OPENAI_API_KEY 或 DEEPSEEK_API_KEY。"
-    try:
-        import agents  # noqa: F401
-    except ImportError:
-        return "OpenAI API 可用；openai-agents 未安装，将使用 Responses API。"
-    return "Agents SDK ready"
+    if openai_key:
+        try:
+            import agents  # noqa: F401
+        except ImportError:
+            return "OpenAI API 可用；openai-agents 未安装，将使用 Responses API。"
+        return "OpenAI Agents SDK ready"
+    return "缺少 DEEPSEEK_API_KEY 或 OPENAI_API_KEY。请在 .env.local 或环境变量中配置。"
 
 
 def run_personal_agent(
     context: str,
     request: str,
-    model: str = "gpt-5-nano",
-    provider: str = "openai",
+    model: str = "deepseek-v4-flash",
+    provider: str = "deepseek",
     base_url: str = "",
 ) -> AgentResult:
     provider = provider.lower().strip()

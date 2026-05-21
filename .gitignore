@@ -17,3 +17,5 @@ data/applications.json
 data/interviews.json
 data/timetable.json
 data/knowledge_base.json
+data/settings.json
+data/goals.json
