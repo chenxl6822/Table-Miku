@@ -72,7 +72,13 @@ class PersonalAssistant(QObject):
         assistant = settings.get("assistant") or {}
         if not assistant.get("ai_agent_enabled", False):
             status = agents_sdk_status()
-            self.notice.emit("focus", f"AI Agent 预留好了，但还没启用：{status}")
+            provider = assistant.get("ai_provider", "deepseek")
+            if provider == "deepseek" and "DeepSeek API ready" in status:
+                self.notice.emit("focus", "AI 助理未开启：DeepSeek API 已就绪，右键开启 AI 助理即可使用。")
+            elif provider != "deepseek" and "OpenAI" in status:
+                self.notice.emit("focus", f"AI 助理未开启：{status}，右键开启 AI 助理即可使用。")
+            else:
+                self.notice.emit("focus", f"AI 助理未开启：{status}")
             return
         self._run_thread(self._agent_worker)
 

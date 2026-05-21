@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .paths import user_data_dir
+from .paths import PROJECT_ROOT, user_data_dir
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -130,7 +131,9 @@ def write_json(filename: str, payload: Any) -> None:
 def load_settings() -> dict[str, Any]:
     settings = read_json("settings.json", DEFAULT_SETTINGS)
     merged = deepcopy(DEFAULT_SETTINGS)
-    return _deep_merge(merged, settings)
+    result = _deep_merge(merged, settings)
+    _normalize_assistant_provider(result)
+    return result
 
 
 def _deep_merge(default: dict[str, Any], override: Any) -> dict[str, Any]:
@@ -142,6 +145,41 @@ def _deep_merge(default: dict[str, Any], override: Any) -> dict[str, Any]:
         else:
             default[key] = value
     return default
+
+
+def _normalize_assistant_provider(settings: dict[str, Any]) -> None:
+    """If user config still has openai but no OpenAI key exists and DeepSeek key does,
+    auto-switch to DeepSeek at runtime without persisting the change."""
+    assistant = settings.get("assistant")
+    if not isinstance(assistant, dict):
+        return
+    if assistant.get("ai_provider") != "openai":
+        return
+    if _env_value("OPENAI_API_KEY"):
+        return
+    if not _env_value("DEEPSEEK_API_KEY"):
+        return
+    assistant["ai_provider"] = "deepseek"
+    assistant.setdefault("deepseek_model", "deepseek-v4-flash")
+    assistant.setdefault("deepseek_base_url", "https://api.deepseek.com")
+
+
+def _env_value(name: str) -> str:
+    key = os.environ.get(name, "").strip()
+    if key:
+        return key
+    for filename in (".env.local", ".env"):
+        path = PROJECT_ROOT / filename
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8-sig").splitlines():
+                cleaned = line.strip().lstrip("﻿")
+                if cleaned.startswith(f"{name}="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return ""
 
 
 def save_settings(settings: dict[str, Any]) -> None:

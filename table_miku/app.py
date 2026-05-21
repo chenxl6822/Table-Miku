@@ -299,6 +299,26 @@ class TaskDialog(QDialog):
         layout.addWidget(buttons)
 
 
+def _deepseek_key_exists() -> bool:
+    import os
+
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if key:
+        return True
+    for filename in (".env.local", ".env"):
+        path = PROJECT_ROOT / filename
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8-sig").splitlines():
+                cleaned = line.strip().lstrip("﻿")
+                if cleaned.startswith("DEEPSEEK_API_KEY="):
+                    return bool(line.split("=", 1)[1].strip().strip('"').strip("'"))
+        except OSError:
+            continue
+    return False
+
+
 class TableMiku(QWidget):
     async_notice = Signal(str, str)
 
@@ -768,6 +788,10 @@ class TableMiku(QWidget):
         assistant = self.settings.setdefault("assistant", {})
         enabled = not assistant.get("ai_agent_enabled", False)
         assistant["ai_agent_enabled"] = enabled
+        if enabled and assistant.get("ai_provider") == "openai" and _deepseek_key_exists():
+            assistant["ai_provider"] = "deepseek"
+            assistant.setdefault("deepseek_model", "deepseek-v4-flash")
+            assistant.setdefault("deepseek_base_url", "https://api.deepseek.com")
         save_settings(self.settings)
         self.pet.set_expression("thinking" if enabled else "sleepy")
         if enabled:
