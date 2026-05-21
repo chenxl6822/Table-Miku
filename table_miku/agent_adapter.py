@@ -42,7 +42,7 @@ def run_personal_agent(
         return _run_chat_completions_api(
             context,
             request,
-            model or "deepseek-v4-flash",
+            model or "deepseek-chat",
             base_url or "https://api.deepseek.com",
             "DEEPSEEK_API_KEY",
             "deepseek",

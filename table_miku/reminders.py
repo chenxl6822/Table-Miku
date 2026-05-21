@@ -32,6 +32,9 @@ class ReminderManager(QObject):
         if scheduled:
             first = scheduled[0]
             next_tip = f"\n下一次定时提醒：{first.get('time')} {first.get('task')}"
+        today_courses = self._today_course_lines()
+        if today_courses:
+            next_tip += "\n今日课程：" + "；".join(today_courses[:3])
         if tasks:
             self.reminder.emit("今天的学习雷达启动：\n" + "\n".join(tasks[:2]) + next_tip)
 
@@ -160,6 +163,17 @@ class ReminderManager(QObject):
                 fallback[section] = normalized
         fallback.update(slots)
         return fallback
+
+    @staticmethod
+    def _today_course_lines() -> list[str]:
+        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now().weekday()]
+        lines: list[str] = []
+        for entry in load_timetable():
+            if entry.get("weekday") != weekday:
+                continue
+            when = str(entry.get("section") or f"{entry.get('start')}-{entry.get('end')}").strip("-")
+            lines.append(f"{when} {entry.get('course')}")
+        return lines
 
     @staticmethod
     def _in_quiet_hours(settings: dict[str, Any]) -> bool:

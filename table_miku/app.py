@@ -3,10 +3,12 @@ from __future__ import annotations
 import random
 import re
 import sys
+import threading
 import textwrap
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Q_ARG, QEasingCurve, QMetaObject, QPoint, QPropertyAnimation, QUrl, Qt, QTimer
+from PySide6.QtCore import Q_ARG, QEasingCurve, QMetaObject, QPoint, QPropertyAnimation, QUrl, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import (
@@ -39,6 +41,7 @@ from .assistant_data import (
 )
 from .assistant_core import PersonalAssistant
 from .goal_parser import ParsedGoalInput, parse_goal_input
+from .knowledge_base import format_knowledge, load_knowledge, refresh_computer_knowledge
 from .paths import PROJECT_ROOT, asset_path
 from .pomodoro import pomodoro_status, start_pomodoro, stop_pomodoro
 from .planner import add_goal, ensure_goal_plans, today_tasks
@@ -303,6 +306,8 @@ class TaskDialog(QDialog):
 
 
 class TableMiku(QWidget):
+    async_notice = Signal(str, str)
+
     def __init__(self) -> None:
         super().__init__()
         ensure_goal_plans()
@@ -320,6 +325,7 @@ class TableMiku(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
+        self.async_notice.connect(self._handle_system_notice)
 
         self.pet = QmlMiku(self)
         self.pet.setGeometry(0, 0, self.width(), self.height())
@@ -505,6 +511,8 @@ class TableMiku(QWidget):
         application_action = QAction("新增投递记录", self)
         interview_action = QAction("新增面试复盘", self)
         records_action = QAction("查看助理记录", self)
+        knowledge_action = QAction("更新计算机知识库", self)
+        view_knowledge_action = QAction("查看计算机知识库", self)
         startup_action = QAction("关闭开机自启" if is_startup_enabled() else "开启开机自启", self)
         menu_icon = QIcon(str(export_menu_icon()))
         if not menu_icon.isNull():
@@ -538,6 +546,8 @@ class TableMiku(QWidget):
         application_action.triggered.connect(self.add_application)
         interview_action.triggered.connect(self.add_interview_review)
         records_action.triggered.connect(self.show_assistant_records)
+        knowledge_action.triggered.connect(self.refresh_knowledge)
+        view_knowledge_action.triggered.connect(self.show_knowledge)
         startup_action.triggered.connect(self.toggle_startup)
         toggle_monitor_action.triggered.connect(self.toggle_system_monitor)
         toggle_action.triggered.connect(self.toggle_reminders)
@@ -553,7 +563,17 @@ class TableMiku(QWidget):
         menu.addAction(ai_plan_action)
         menu.addAction(toggle_ai_action)
         menu.addSeparator()
-        for action in (pomodoro_action, view_timetable_action, timetable_pdf_action, course_time_action, application_action, interview_action, records_action):
+        for action in (
+            pomodoro_action,
+            view_timetable_action,
+            timetable_pdf_action,
+            course_time_action,
+            application_action,
+            interview_action,
+            records_action,
+            knowledge_action,
+            view_knowledge_action,
+        ):
             menu.addAction(action)
         menu.addSeparator()
         menu.addAction(startup_action)
@@ -567,7 +587,7 @@ class TableMiku(QWidget):
     def show_today_tasks(self) -> None:
         self.pet.set_expression("happy")
         tasks = today_tasks(load_goals())
-        schedule = self._schedule_lines()
+        schedule = self._schedule_lines() + self._today_course_lines()
         TaskDialog(tasks, schedule, self).exec()
         self.say("今日任务已打开。先挑最小的一项开始吧。")
 
@@ -637,6 +657,16 @@ class TableMiku(QWidget):
             for item in self.settings.get("scheduled_reminders", [])
             if item.get("time") and item.get("task")
         ]
+
+    def _today_course_lines(self) -> list[str]:
+        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now().weekday()]
+        lines: list[str] = []
+        for entry in load_timetable():
+            if entry.get("weekday") != weekday:
+                continue
+            when = str(entry.get("section") or f"{entry.get('start')}-{entry.get('end')}").strip("-")
+            lines.append(f"{weekday} {when} {entry.get('course')}")
+        return lines
 
     def set_city(self) -> None:
         self.settings = load_settings()
@@ -795,6 +825,22 @@ class TableMiku(QWidget):
         ]
         text = "\n\n".join(block for block in blocks if block) or "暂时还没有课程表、投递记录或面试复盘。"
         dialog = TextInputDialog("助理记录", "这些记录会进入 AI 规划上下文。", text, self)
+        dialog.editor.setReadOnly(True)
+        dialog.exec()
+        self.pet.set_expression("smile")
+
+    def refresh_knowledge(self) -> None:
+        self.pet.set_expression("thinking")
+        self.say("我开始连接 Wikipedia 更新计算机知识库。网络不通时会使用本地备用摘要。")
+        threading.Thread(target=self._refresh_knowledge_worker, daemon=True).start()
+
+    def _refresh_knowledge_worker(self) -> None:
+        records = refresh_computer_knowledge()
+        online = sum(1 for record in records if not record.get("offline"))
+        self.async_notice.emit("happy" if online else "focus", f"计算机知识库已更新：{online}/{len(records)} 条来自 Wikipedia。")
+
+    def show_knowledge(self) -> None:
+        dialog = TextInputDialog("计算机知识库", "这些知识会进入 Miku 的规划上下文。", format_knowledge(load_knowledge()), self)
         dialog.editor.setReadOnly(True)
         dialog.exec()
         self.pet.set_expression("smile")

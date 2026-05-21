@@ -11,6 +11,7 @@ from .assistant_data import assistant_context
 from .agent_adapter import agents_sdk_status, run_personal_agent
 from .assistant_log import append_event, recent_events
 from .command_runner import WatchedCommand, parse_command_spec
+from .knowledge_base import knowledge_context
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings
 from .system_monitor import SystemSnapshot
@@ -99,7 +100,10 @@ class PersonalAssistant(QObject):
         parts = ["今日助手简报："]
         if tasks:
             first_task = " ".join(tasks[0].splitlines())
-            parts.append(first_task)
+            parts.append(_short(first_task, 120))
+        knowledge = knowledge_context(2)
+        if knowledge:
+            parts.append(_short(knowledge, 120))
         system_line = format_snapshot(snapshot)
         if system_line:
             parts.append(system_line)
@@ -132,7 +136,7 @@ class PersonalAssistant(QObject):
         result = run_personal_agent(
             context,
             "请给我下一步工作提醒和异常摘要。",
-            str(assistant.get(model_key, "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano")),
+            str(assistant.get(model_key, "deepseek-chat" if provider == "deepseek" else "gpt-5-nano")),
             provider,
             str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
         )
@@ -149,6 +153,7 @@ class PersonalAssistant(QObject):
                 "系统状态：" + (snapshot or "暂无"),
                 "最近事件：" + (" | ".join(str(event.get("title", "")) for event in events) or "暂无"),
                 assistant_context(),
+                knowledge_context(),
             ]
         )
 
