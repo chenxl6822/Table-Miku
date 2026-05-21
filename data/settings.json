@@ -30,5 +30,26 @@
     "end": 7
   },
   "last_reminder_at": "2026-05-20T22:45:14",
-  "bubble_seconds": 7
+  "bubble_seconds": 7,
+  "system_monitor": {
+    "enabled": true,
+    "check_interval_seconds": 30,
+    "cpu_enabled": true,
+    "cpu_warning_percent": 85,
+    "cpu_warning_checks": 3,
+    "network_enabled": true,
+    "network_check_interval_minutes": 2,
+    "network_timeout_seconds": 4,
+    "network_healthy_report_minutes": 30,
+    "network_targets": [
+      {
+        "name": "百度",
+        "url": "https://www.baidu.com/"
+      },
+      {
+        "name": "Google",
+        "url": "https://www.google.com/generate_204"
+      }
+    ]
+  }
 }
