@@ -24,6 +24,21 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "quiet_hours": {"start": 23, "end": 7},
     "last_reminder_at": None,
     "bubble_seconds": 7,
+    "system_monitor": {
+        "enabled": True,
+        "check_interval_seconds": 30,
+        "cpu_enabled": True,
+        "cpu_warning_percent": 85,
+        "cpu_warning_checks": 3,
+        "network_enabled": True,
+        "network_check_interval_minutes": 2,
+        "network_timeout_seconds": 4,
+        "network_healthy_report_minutes": 30,
+        "network_targets": [
+            {"name": "百度", "url": "https://www.baidu.com/"},
+            {"name": "Google", "url": "https://www.google.com/generate_204"},
+        ],
+    },
 }
 
 DEFAULT_GOALS: list[dict[str, Any]] = [
@@ -69,8 +84,18 @@ def write_json(filename: str, payload: Any) -> None:
 def load_settings() -> dict[str, Any]:
     settings = read_json("settings.json", DEFAULT_SETTINGS)
     merged = deepcopy(DEFAULT_SETTINGS)
-    merged.update(settings)
-    return merged
+    return _deep_merge(merged, settings)
+
+
+def _deep_merge(default: dict[str, Any], override: Any) -> dict[str, Any]:
+    if not isinstance(override, dict):
+        return default
+    for key, value in override.items():
+        if isinstance(default.get(key), dict) and isinstance(value, dict):
+            default[key] = _deep_merge(deepcopy(default[key]), value)
+        else:
+            default[key] = value
+    return default
 
 
 def save_settings(settings: dict[str, Any]) -> None:

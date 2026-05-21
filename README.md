@@ -16,12 +16,15 @@ Table Miku 是一个 Windows 桌面 Miku 桌宠：可以透明置顶、自由拖
   - 编辑定时提醒
   - 提醒当前城市天气
   - 设置/自动定位城市
+  - 立即检测电脑/网络
+  - 暂停/开启系统监测
   - 暂停/开启学习提醒
   - 关闭 Miku
 - 内置“大二学生准备进入公司实习”学习路线。
 - 支持导入自定义目标，并生成每日学习提醒。
 - 支持具体时间提醒，例如 `08:30 复习基础`、`20:30 整理项目 README`。
 - 天气默认使用 `auto` 通过 IP 粗略定位，也可以手动设置城市名。
+- 支持 CPU 告警和网络连通性提示：默认检测百度与 Google，适合判断普通上网和 VPN/代理是否正常。
 - 支持打包为 `.exe` 后转发给他人使用。
 
 ## 项目结构
@@ -35,6 +38,7 @@ Table-Miku/
 │  ├─ planner.py
 │  ├─ reminders.py
 │  ├─ storage.py
+│  ├─ system_monitor.py
 │  └─ weather.py
 ├─ assets/
 │  └─ miku.svg
@@ -89,7 +93,7 @@ dist/TableMiku/TableMiku.exe
 
 配置文件在源码运行时位于 `data/` 目录：
 
-- `data/settings.json`：城市、提醒开关、提醒间隔、免打扰时间。
+- `data/settings.json`：城市、提醒开关、提醒间隔、免打扰时间、系统监测配置。
 - `data/goals.json`：学习目标和学习计划。
 
 打包成 `.exe` 后，用户数据会保存到：
@@ -132,6 +136,28 @@ dist/TableMiku/TableMiku.exe
 ```
 
 也可以在桌宠右键菜单中选择“编辑定时提醒”，每行按 `HH:MM 任务内容` 输入。
+
+### 修改系统监测
+
+系统监测默认开启：每 30 秒采样一次 CPU；CPU 连续 3 次超过 85% 会告警，恢复后也会提示。网络默认每 2 分钟检测一次百度和 Google，启动时和右键“立即检测电脑/网络”会立刻汇报。
+
+打开 `data/settings.json`，可以调整：
+
+```json
+{
+  "system_monitor": {
+    "enabled": true,
+    "cpu_warning_percent": 85,
+    "network_check_interval_minutes": 2,
+    "network_targets": [
+      {"name": "百度", "url": "https://www.baidu.com/"},
+      {"name": "Google", "url": "https://www.google.com/generate_204"}
+    ]
+  }
+}
+```
+
+百度能连、Google 不能连，通常表示国内网络可用但 Google/VPN/代理出口有问题；两者都不能连，通常表示断网、DNS 或代理配置异常。
 
 ## 导入学习目标格式
 

@@ -4,12 +4,13 @@ import math
 import random
 import sys
 
-from PySide6.QtCore import QPoint, QRectF, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QEasingCurve, QPoint, QRectF, Qt, QPropertyAnimation, QTimer
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QGraphicsOpacityEffect,
     QInputDialog,
     QLabel,
     QMenu,
@@ -24,6 +25,7 @@ from .planner import add_goal, ensure_goal_plans, today_tasks
 from .reminders import ReminderManager
 from .sprites import load_keyboard, load_sprite, sprite_source_hint
 from .storage import load_goals, load_settings, save_settings
+from .system_monitor import SystemMonitor
 from .weather import get_weather
 
 
@@ -51,38 +53,132 @@ IMPORT_EXAMPLE = """支持多种输入格式，例如：
 }
 """
 
+DIALOG_STYLE = """
+QDialog {
+    background: #f7fbff;
+    color: #263553;
+}
+QLabel#dialogTitle {
+    color: #1f2d4a;
+}
+QLabel#dialogIntro {
+    color: #52627f;
+    line-height: 150%;
+}
+QTextEdit {
+    background: rgba(255, 255, 255, 245);
+    border: 1px solid #c9d6ec;
+    border-radius: 12px;
+    color: #263553;
+    padding: 12px;
+    selection-background-color: #b8f5ff;
+}
+QPushButton {
+    min-width: 84px;
+    min-height: 30px;
+    border: 1px solid #bdd0ea;
+    border-radius: 8px;
+    padding: 6px 12px;
+    background: #ffffff;
+    color: #263553;
+    font-weight: 600;
+}
+QPushButton:hover {
+    background: #e9fbff;
+    border-color: #7fd9e9;
+}
+QPushButton:pressed {
+    background: #d8f6ff;
+}
+"""
+
+MENU_STYLE = """
+QMenu {
+    background: rgba(255, 255, 255, 246);
+    border: 1px solid #c8d5eb;
+    border-radius: 12px;
+    padding: 8px;
+    color: #263553;
+}
+QMenu::item {
+    min-width: 176px;
+    padding: 8px 12px;
+    border-radius: 8px;
+}
+QMenu::item:selected {
+    background: #e7fbff;
+    color: #1d405f;
+}
+QMenu::separator {
+    height: 1px;
+    background: #dce6f5;
+    margin: 6px 4px;
+}
+"""
+
 
 class TypingMiku(QWidget):
     """Compact desktop-pet sprite with a realistic typing keyboard overlay."""
 
     EXPRESSIONS = ["focus", "smile", "happy", "surprised", "sleepy"]
+    EXPRESSION_TRAITS = {
+        "focus": {"tempo": 1.05, "bounce": 2.0, "lift": 0.0, "scale": 1.0, "accent": "#43d9f5"},
+        "smile": {"tempo": 0.9, "bounce": 2.4, "lift": -1.0, "scale": 1.01, "accent": "#4fd6c6"},
+        "happy": {"tempo": 1.18, "bounce": 3.2, "lift": -2.5, "scale": 1.035, "accent": "#ff8cad"},
+        "surprised": {"tempo": 1.32, "bounce": 2.8, "lift": -4.0, "scale": 1.045, "accent": "#ffd166"},
+        "sleepy": {"tempo": 0.58, "bounce": 1.2, "lift": 1.5, "scale": 0.985, "accent": "#8ea0c4"},
+    }
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.frame = 0
         self.expression = "focus"
+        self.previous_expression = "focus"
+        self.transition_frame = 0
+        self.transition_frames = 18
+        self.click_pulse = 0.0
+        self.particles: list[dict[str, object]] = []
         self.sprites: dict[str, QPixmap] = {}
         self.keyboard = load_keyboard()
 
         self.animation_timer = QTimer(self)
-        self.animation_timer.setInterval(95)
+        self.animation_timer.setInterval(33)
         self.animation_timer.timeout.connect(self._next_frame)
         self.animation_timer.start()
 
         self.expression_timer = QTimer(self)
-        self.expression_timer.setInterval(4_500)
+        self.expression_timer.setInterval(5_200)
         self.expression_timer.timeout.connect(self.random_expression)
         self.expression_timer.start()
 
     def set_expression(self, expression: str) -> None:
-        self.expression = expression if expression in self.EXPRESSIONS else "focus"
+        next_expression = expression if expression in self.EXPRESSIONS else "focus"
+        if next_expression == self.expression:
+            return
+        self.previous_expression = self.expression
+        self.expression = next_expression
+        self.transition_frame = self.transition_frames
+        self._burst_for_expression(next_expression)
         self.update()
 
     def random_expression(self) -> None:
-        self.set_expression(random.choice(self.EXPRESSIONS))
+        choices = [expression for expression in self.EXPRESSIONS if expression != self.expression]
+        self.set_expression(random.choice(choices))
+        self.expression_timer.setInterval(random.randint(4_800, 7_200))
+
+    def nudge(self) -> None:
+        self.click_pulse = 1.0
+        self.set_expression(random.choice(["happy", "smile", "surprised"]))
+        self._burst_for_expression("happy", count=12)
 
     def _next_frame(self) -> None:
-        self.frame = (self.frame + 1) % 240
+        self.frame = (self.frame + 1) % 10_000
+        if self.transition_frame:
+            self.transition_frame -= 1
+        self.click_pulse = max(0.0, self.click_pulse - 0.055)
+        self._update_particles()
+        if self.expression in {"focus", "smile"} and self.frame % 9 == 0:
+            self._spawn_particle("key", 92 + random.random() * 116, 202 + random.random() * 18)
         self.update()
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -90,24 +186,50 @@ class TypingMiku(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        bounce = math.sin(self.frame / 8) * 2.2
-        left_tap = -5 if self.frame % 14 < 7 else 2
-        right_tap = 3 if self.frame % 18 < 9 else -5
-        blink = self.expression != "surprised" and self.frame % 72 in {0, 1, 2}
+        trait = self.EXPRESSION_TRAITS[self.expression]
+        progress = self._transition_progress()
+        pop = math.sin(progress * math.pi) * 0.018 if self.transition_frame else 0.0
+        click_pop = math.sin(self.click_pulse * math.pi) * 0.025 if self.click_pulse else 0.0
+        scale = float(trait["scale"]) + pop + click_pop
+        bounce = math.sin(self.frame / (8.0 / float(trait["tempo"]))) * float(trait["bounce"]) + float(trait["lift"])
+        left_tap = math.sin(self.frame / 3.2) * 4.4
+        right_tap = math.sin(self.frame / 3.7 + 1.6) * 4.7
+        blink = self.expression != "surprised" and self.frame % 145 in {0, 1, 2, 3}
 
-        self._draw_shadow(painter)
+        self._draw_shadow(painter, scale)
+        self._draw_aura(painter, QColor(str(trait["accent"])))
+        self._draw_particles(painter, behind=True)
+        painter.save()
         painter.translate(0, bounce)
+        painter.translate(self.width() / 2, 138)
+        painter.scale(scale, scale)
+        painter.translate(-self.width() / 2, -138)
         self._draw_sprite(painter, blink)
         self._draw_keyboard(painter, left_tap, right_tap)
+        painter.restore()
+        self._draw_particles(painter, behind=False)
         painter.end()
 
-    def _draw_shadow(self, painter: QPainter) -> None:
+    def _draw_shadow(self, painter: QPainter, scale: float) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(22, 31, 54, 55))
-        painter.drawEllipse(QRectF(43, 232, 214, 26))
+        painter.setBrush(QColor(22, 31, 54, 44))
+        width = 214 * (1.02 - (scale - 1.0) * 1.8)
+        painter.drawEllipse(QRectF((self.width() - width) / 2, 232, width, 26))
+
+    def _draw_aura(self, painter: QPainter, color: QColor) -> None:
+        painter.save()
+        glow = QRadialGradient(self.width() / 2, 128, 114)
+        color.setAlpha(46 if self.expression != "sleepy" else 28)
+        glow.setColorAt(0.0, color)
+        glow.setColorAt(0.55, QColor(color.red(), color.green(), color.blue(), 12))
+        glow.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(glow)
+        painter.drawEllipse(QRectF(34, 22, 232, 218))
+        painter.restore()
 
     def _draw_sprite(self, painter: QPainter, blink: bool) -> None:
-        pixmap = self._sprite_for_current_expression()
+        pixmap = self._sprite_for_expression(self.expression)
         if pixmap.isNull():
             self._draw_missing_sprite_hint(painter)
             return
@@ -116,8 +238,26 @@ class TypingMiku(QWidget):
         height = 172
         x = (self.width() - width) / 2
         y = 16 + math.sin(self.frame / 11) * 1.5
+        rect = QRectF(x, y, width, height).toRect()
+        progress = self._transition_progress()
+        old_pixmap = self._sprite_for_expression(self.previous_expression)
+        if self.transition_frame and not old_pixmap.isNull():
+            painter.save()
+            painter.setOpacity(1.0 - progress)
+            painter.drawPixmap(
+                rect,
+                old_pixmap.scaled(
+                    int(width),
+                    int(height),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                ),
+            )
+            painter.restore()
+        painter.save()
+        painter.setOpacity(progress if self.transition_frame else 1.0)
         painter.drawPixmap(
-            QRectF(x, y, width, height).toRect(),
+            rect,
             pixmap.scaled(
                 int(width),
                 int(height),
@@ -125,10 +265,11 @@ class TypingMiku(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             ),
         )
+        painter.restore()
         self._draw_expression_effects(painter, blink)
 
-    def _sprite_for_current_expression(self) -> QPixmap:
-        key = self.expression if self.expression in {"happy", "focus", "surprised", "sleepy"} else "idle"
+    def _sprite_for_expression(self, expression: str) -> QPixmap:
+        key = expression if expression in {"happy", "focus", "surprised", "sleepy"} else "idle"
         if key not in self.sprites:
             self.sprites[key] = load_sprite(key)
         if self.sprites[key].isNull() and "idle" not in self.sprites:
@@ -143,12 +284,13 @@ class TypingMiku(QWidget):
         if self.expression == "happy":
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#ff8cad"))
-            painter.drawEllipse(QRectF(226, 48, 18, 18))
-            painter.drawEllipse(QRectF(241, 48, 18, 18))
+            float_y = math.sin(self.frame / 8) * 2
+            painter.drawEllipse(QRectF(226, 48 + float_y, 18, 18))
+            painter.drawEllipse(QRectF(241, 48 + float_y, 18, 18))
             heart = QPainterPath()
-            heart.moveTo(243, 73)
-            heart.lineTo(225, 55)
-            heart.lineTo(260, 55)
+            heart.moveTo(243, 73 + float_y)
+            heart.lineTo(225, 55 + float_y)
+            heart.lineTo(260, 55 + float_y)
             heart.closeSubpath()
             painter.drawPath(heart)
         elif self.expression == "surprised":
@@ -158,7 +300,93 @@ class TypingMiku(QWidget):
         elif self.expression == "sleepy":
             painter.setPen(QPen(QColor("#6d80a7"), 2))
             painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-            painter.drawText(QRectF(216, 36, 58, 28), Qt.AlignmentFlag.AlignCenter, "Zzz")
+            painter.drawText(QRectF(216, 36 + math.sin(self.frame / 12) * 3, 58, 28), Qt.AlignmentFlag.AlignCenter, "Zzz")
+        elif self.expression == "focus":
+            painter.setPen(QPen(QColor(67, 217, 245, 145), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawArc(QRectF(57, 33, 186, 154), 22 * 16, 22 * 16)
+            painter.drawArc(QRectF(57, 33, 186, 154), 136 * 16, 18 * 16)
+
+    def _transition_progress(self) -> float:
+        if not self.transition_frame:
+            return 1.0
+        linear = 1.0 - self.transition_frame / self.transition_frames
+        return 1.0 - pow(1.0 - linear, 3)
+
+    def _burst_for_expression(self, expression: str, count: int = 8) -> None:
+        kinds = {
+            "happy": "heart",
+            "smile": "spark",
+            "surprised": "spark",
+            "sleepy": "bubble",
+            "focus": "key",
+        }
+        kind = kinds.get(expression, "spark")
+        for _ in range(count):
+            self._spawn_particle(kind, 96 + random.random() * 112, 70 + random.random() * 54)
+
+    def _spawn_particle(self, kind: str, x: float, y: float) -> None:
+        palette = {
+            "heart": QColor("#ff8cad"),
+            "spark": QColor("#ffd166"),
+            "bubble": QColor("#9fb1d8"),
+            "key": QColor("#43d9f5"),
+        }
+        self.particles.append(
+            {
+                "kind": kind,
+                "x": x,
+                "y": y,
+                "vx": random.uniform(-0.34, 0.34),
+                "vy": random.uniform(-1.12, -0.28),
+                "life": random.randint(24, 48),
+                "max_life": 48,
+                "size": random.uniform(3.4, 7.2),
+                "color": palette.get(kind, QColor("#43d9f5")),
+                "behind": kind == "key",
+            }
+        )
+        if len(self.particles) > 42:
+            self.particles = self.particles[-42:]
+
+    def _update_particles(self) -> None:
+        alive: list[dict[str, object]] = []
+        for particle in self.particles:
+            particle["x"] = float(particle["x"]) + float(particle["vx"])
+            particle["y"] = float(particle["y"]) + float(particle["vy"])
+            particle["vy"] = float(particle["vy"]) + 0.018
+            particle["life"] = int(particle["life"]) - 1
+            if int(particle["life"]) > 0:
+                alive.append(particle)
+        self.particles = alive
+
+    def _draw_particles(self, painter: QPainter, behind: bool) -> None:
+        painter.save()
+        for particle in self.particles:
+            if bool(particle.get("behind")) != behind:
+                continue
+            life = int(particle["life"])
+            max_life = int(particle["max_life"])
+            opacity = max(0.0, min(1.0, life / max_life))
+            color = QColor(particle["color"])  # type: ignore[arg-type]
+            color.setAlpha(int(color.alpha() * opacity))
+            x = float(particle["x"])
+            y = float(particle["y"])
+            size = float(particle["size"]) * (0.72 + opacity * 0.34)
+            painter.setOpacity(opacity)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            kind = str(particle["kind"])
+            if kind == "heart":
+                heart = QPainterPath()
+                heart.moveTo(x, y + size)
+                heart.cubicTo(x - size * 1.4, y - size * 0.2, x - size, y - size, x, y - size * 0.25)
+                heart.cubicTo(x + size, y - size, x + size * 1.4, y - size * 0.2, x, y + size)
+                painter.drawPath(heart)
+            elif kind == "key":
+                painter.drawRoundedRect(QRectF(x, y, size * 2.4, size), 2, 2)
+            else:
+                painter.drawEllipse(QRectF(x, y, size, size))
+        painter.restore()
 
     def _draw_missing_sprite_hint(self, painter: QPainter) -> None:
         painter.setPen(QPen(QColor("#243653"), 2))
@@ -171,9 +399,11 @@ class TypingMiku(QWidget):
             sprite_source_hint(),
         )
 
-    def _draw_keyboard(self, painter: QPainter, left_tap: int, right_tap: int) -> None:
+    def _draw_keyboard(self, painter: QPainter, left_tap: float, right_tap: float) -> None:
         if not self.keyboard.isNull():
             y = 168 + math.sin(self.frame / 9) * 0.8
+            painter.save()
+            painter.setOpacity(0.96)
             painter.drawPixmap(
                 QRectF(24, y, 252, 88).toRect(),
                 self.keyboard.scaled(
@@ -183,10 +413,12 @@ class TypingMiku(QWidget):
                     Qt.TransformationMode.SmoothTransformation,
                 ),
             )
+            painter.restore()
             painter.setPen(Qt.PenStyle.NoPen)
-            glow_x = 68 + (self.frame // 3 % 10) * 16
-            painter.setBrush(QColor(130, 245, 255, 88))
-            painter.drawRoundedRect(QRectF(glow_x, y + 30, 14, 9), 3, 3)
+            for offset in (0, 5):
+                glow_x = 68 + ((self.frame // 3 + offset) % 10) * 16
+                painter.setBrush(QColor(130, 245, 255, 58 if offset else 96))
+                painter.drawRoundedRect(QRectF(glow_x, y + 30 + offset * 0.8, 14, 9), 3, 3)
             return
 
         painter.setPen(QPen(QColor("#25304a"), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
@@ -264,9 +496,13 @@ class TextInputDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(560, 430)
+        self.setStyleSheet(DIALOG_STYLE)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
 
         label = QLabel(intro)
+        label.setObjectName("dialogIntro")
         label.setWordWrap(True)
         layout.addWidget(label)
 
@@ -289,9 +525,13 @@ class TaskDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("今日任务")
         self.resize(460, 360)
+        self.setStyleSheet(DIALOG_STYLE)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
         title = QLabel("今日学习计划")
+        title.setObjectName("dialogTitle")
         title.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
         title.setStyleSheet("color: #27385f;")
         layout.addWidget(title)
@@ -299,17 +539,6 @@ class TaskDialog(QDialog):
         content = QTextEdit(self)
         content.setReadOnly(True)
         content.setFont(QFont("Microsoft YaHei UI", 10))
-        content.setStyleSheet(
-            """
-            QTextEdit {
-                background: #ffffff;
-                border: 2px solid #d5def3;
-                border-radius: 14px;
-                padding: 12px;
-                color: #27385f;
-            }
-            """
-        )
         content.setPlainText(self._format(tasks, schedule))
         layout.addWidget(content)
 
@@ -354,15 +583,23 @@ class TableMiku(QWidget):
         self.bubble.setStyleSheet(
             """
             QLabel {
-                background: rgba(255, 255, 255, 238);
-                border: 2px solid #27385f;
-                border-radius: 18px;
+                background: rgba(255, 255, 255, 246);
+                border: 1px solid rgba(73, 99, 139, 210);
+                border-radius: 20px;
                 color: #27385f;
-                padding: 10px;
+                padding: 11px 13px;
                 line-height: 150%;
             }
             """
         )
+        self.bubble_effect = QGraphicsOpacityEffect(self.bubble)
+        self.bubble_effect.setOpacity(0.0)
+        self.bubble.setGraphicsEffect(self.bubble_effect)
+        self.bubble_animation = QPropertyAnimation(self.bubble_effect, b"opacity", self)
+        self.bubble_animation.setDuration(180)
+        self.bubble_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.bubble_animation.finished.connect(self._finish_bubble_animation)
+        self._bubble_hiding = False
         self.bubble.hide()
 
         self.pet = TypingMiku(self)
@@ -370,11 +607,15 @@ class TableMiku(QWidget):
 
         self.hide_timer = QTimer(self)
         self.hide_timer.setSingleShot(True)
-        self.hide_timer.timeout.connect(self.bubble.hide)
+        self.hide_timer.timeout.connect(self._hide_bubble)
 
         self.reminders = ReminderManager(self)
         self.reminders.reminder.connect(self.say)
         self.reminders.start()
+
+        self.system_monitor = SystemMonitor(self)
+        self.system_monitor.notice.connect(self._handle_system_notice)
+        self.system_monitor.start()
 
         self.say("Table Miku 已就位。我会边敲键盘边按时间提醒你。")
 
@@ -382,8 +623,24 @@ class TableMiku(QWidget):
         self.settings = load_settings()
         self.bubble.setText(self._bubble_text(text))
         self.bubble.show()
+        self._bubble_hiding = False
+        self.bubble_animation.stop()
+        self.bubble_animation.setStartValue(self.bubble_effect.opacity())
+        self.bubble_animation.setEndValue(1.0)
+        self.bubble_animation.start()
         seconds = int(self.settings.get("bubble_seconds", 7))
         self.hide_timer.start(max(seconds, 3) * 1000)
+
+    def _hide_bubble(self) -> None:
+        self._bubble_hiding = True
+        self.bubble_animation.stop()
+        self.bubble_animation.setStartValue(self.bubble_effect.opacity())
+        self.bubble_animation.setEndValue(0.0)
+        self.bubble_animation.start()
+
+    def _finish_bubble_animation(self) -> None:
+        if self._bubble_hiding:
+            self.bubble.hide()
 
     @staticmethod
     def _bubble_text(text: str) -> str:
@@ -406,7 +663,7 @@ class TableMiku(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_position = None
             if not self.was_dragged:
-                self.pet.random_expression()
+                self.pet.nudge()
                 self.say(random.choice(CHAT_LINES))
             event.accept()
 
@@ -414,12 +671,19 @@ class TableMiku(QWidget):
         self.settings = load_settings()
         menu = QMenu(self)
         menu.setFont(QFont("Microsoft YaHei UI", 9))
+        menu.setStyleSheet(MENU_STYLE)
 
         today_action = QAction("查看今日任务", self)
         add_goal_action = QAction("导入学习目标/时间表", self)
         schedule_action = QAction("编辑定时提醒", self)
         weather_action = QAction("提醒当前城市天气", self)
         city_action = QAction("设置/自动定位城市", self)
+        system_status_action = QAction("立即检测电脑/网络", self)
+        monitor_settings = self.settings.get("system_monitor") or {}
+        toggle_monitor_action = QAction(
+            "暂停系统监测" if monitor_settings.get("enabled", True) else "开启系统监测",
+            self,
+        )
         toggle_action = QAction(
             "暂停提醒" if self.settings.get("reminders_enabled", True) else "开启提醒",
             self,
@@ -431,11 +695,16 @@ class TableMiku(QWidget):
         schedule_action.triggered.connect(self.edit_schedule)
         weather_action.triggered.connect(self.show_weather)
         city_action.triggered.connect(self.set_city)
+        system_status_action.triggered.connect(self.show_system_status)
+        toggle_monitor_action.triggered.connect(self.toggle_system_monitor)
         toggle_action.triggered.connect(self.toggle_reminders)
         quit_action.triggered.connect(QApplication.instance().quit)
 
         for action in (today_action, add_goal_action, schedule_action, weather_action, city_action):
             menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction(system_status_action)
+        menu.addAction(toggle_monitor_action)
         menu.addSeparator()
         menu.addAction(toggle_action)
         menu.addSeparator()
@@ -543,6 +812,28 @@ class TableMiku(QWidget):
         except Exception:
             self.pet.set_expression("surprised")
             self.say("天气查询暂时失败了。请检查网络，或右键把城市设置为 auto / 具体城市名。")
+
+    def show_system_status(self) -> None:
+        self.pet.set_expression("focus")
+        self.say("我正在检测 CPU 和网络：百度、Google 都会试一下。")
+        self.system_monitor.check_now()
+
+    def toggle_system_monitor(self) -> None:
+        self.settings = load_settings()
+        monitor = self.settings.setdefault("system_monitor", {})
+        enabled = not monitor.get("enabled", True)
+        monitor["enabled"] = enabled
+        save_settings(self.settings)
+        self.pet.set_expression("smile" if enabled else "sleepy")
+        if enabled:
+            self.say("系统监测已开启。我会留意 CPU 和网络状态，发现异常会提醒你。")
+            self.system_monitor.check_now()
+        else:
+            self.say("系统监测已暂停。需要时右键可以立即检测。")
+
+    def _handle_system_notice(self, expression: str, message: str) -> None:
+        self.pet.set_expression(expression)
+        self.say(message)
 
     def toggle_reminders(self) -> None:
         self.settings = load_settings()
