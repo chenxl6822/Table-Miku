@@ -7,6 +7,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
+from .assistant_data import assistant_context
 from .agent_adapter import agents_sdk_status, run_personal_agent
 from .assistant_log import append_event, recent_events
 from .command_runner import WatchedCommand, parse_command_spec
@@ -127,7 +128,7 @@ class PersonalAssistant(QObject):
         assistant = settings.get("assistant") or {}
         context = self._agent_context()
         result = run_personal_agent(context, "请给我下一步工作提醒和异常摘要。", str(assistant.get("ai_model", "gpt-5-nano")))
-        append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text)
+        append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, result.metadata)
         self.notice.emit("smile" if result.ok else "focus", result.text)
 
     def _agent_context(self) -> str:
@@ -139,6 +140,7 @@ class PersonalAssistant(QObject):
                 "今日任务：" + (" | ".join(" ".join(task.splitlines()) for task in tasks[:2]) or "暂无"),
                 "系统状态：" + (snapshot or "暂无"),
                 "最近事件：" + (" | ".join(str(event.get("title", "")) for event in events) or "暂无"),
+                assistant_context(),
             ]
         )
 

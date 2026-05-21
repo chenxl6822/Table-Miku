@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import sys
+import textwrap
 from pathlib import Path
 
 from PySide6.QtCore import Q_ARG, QEasingCurve, QMetaObject, QPoint, QPropertyAnimation, QUrl, Qt, QTimer
@@ -11,21 +12,36 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QGraphicsOpacityEffect,
     QInputDialog,
     QLabel,
     QMenu,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from .assistant_data import (
+    add_application_record,
+    add_interview_review,
+    format_application_summary,
+    format_interview_summary,
+    format_timetable,
+    import_timetable_pdf,
+    load_application_records,
+    load_interview_reviews,
+    load_timetable,
+)
 from .assistant_core import PersonalAssistant
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .paths import PROJECT_ROOT, asset_path
+from .pomodoro import pomodoro_status, start_pomodoro, stop_pomodoro
 from .planner import add_goal, ensure_goal_plans, today_tasks
 from .reminders import ReminderManager
 from .sprites import export_runtime_sprite_assets
+from .startup import is_startup_enabled, set_startup_enabled
 from .storage import load_goals, load_settings, save_settings
 from .system_monitor import SystemMonitor
 from .weather import get_weather
@@ -57,6 +73,20 @@ IMPORT_EXAMPLE = """支持多种输入格式，例如：
 
 COMMAND_EXAMPLE = """cwd=D:\\code\\Table Pet
 .\\.venv\\Scripts\\python.exe -m compileall main.py table_miku
+"""
+
+APPLICATION_EXAMPLE = """公司：星河科技
+岗位：后端开发实习
+状态：已投递
+渠道：Boss 直聘
+下一步：5 月 24 日前补一版项目 README，若未回复就跟进一次
+备注：JD 强调 Python、SQL、接口设计
+"""
+
+INTERVIEW_EXAMPLE = """公司：星河科技
+轮次：一面
+复盘：项目讲清楚了，但数据库索引回答不够具体。
+下一步：整理 3 个索引失效案例，明晚用 STAR 结构重讲项目亮点。
 """
 
 DIALOG_STYLE = """
@@ -126,7 +156,7 @@ QMenu::separator {
 class QmlMiku(QQuickWidget):
     """Qt Quick renderer for the desktop pet animation surface."""
 
-    EXPRESSIONS = ["focus", "smile", "happy", "surprised", "sleepy"]
+    EXPRESSIONS = ["focus", "smile", "happy", "surprised", "sleepy", "typing", "cheer", "thinking", "alarm", "rest"]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -326,12 +356,54 @@ class TableMiku(QWidget):
         self.assistant.notice.connect(self._handle_system_notice)
         self.assistant.start()
 
+        self.tray_icon = self._setup_tray_icon()
         self.say("Table Miku 已就位。我会监测电脑、网络、命令和今日计划。")
+
+    def _setup_tray_icon(self) -> QSystemTrayIcon | None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        icon = QIcon(str(asset_path("miku.svg")))
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip("Table Miku")
+
+        menu = QMenu(self)
+        menu.setFont(QFont("Microsoft YaHei UI", 9))
+        menu.setStyleSheet(MENU_STYLE)
+        show_action = QAction("显示/隐藏 Miku", self)
+        brief_action = QAction("生成助手简报", self)
+        pomodoro_action = QAction("开始番茄钟", self)
+        quit_action = QAction("关闭 Miku", self)
+        show_action.triggered.connect(self.toggle_visible)
+        brief_action.triggered.connect(self.show_assistant_brief)
+        pomodoro_action.triggered.connect(self.toggle_pomodoro)
+        quit_action.triggered.connect(QApplication.instance().quit)
+        for action in (show_action, brief_action, pomodoro_action):
+            menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._tray_activated)
+        tray.show()
+        return tray
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.toggle_visible()
+
+    def toggle_visible(self) -> None:
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
 
     def say(self, text: str) -> None:
         self.settings = load_settings()
         seconds = int(self.settings.get("bubble_seconds", 7))
-        self.bubble.setText(self._bubble_text(text))
+        bubble_text = self._bubble_text(text)
+        lines = max(1, bubble_text.count("\n") + 1)
+        self.bubble.setGeometry(10, 8, 300, min(132, max(86, 46 + lines * 19)))
+        self.bubble.setText(bubble_text)
         self.bubble.show()
         self.bubble.raise_()
         self._bubble_hiding = False
@@ -339,7 +411,7 @@ class TableMiku(QWidget):
         self.bubble_animation.setStartValue(self.bubble_effect.opacity())
         self.bubble_animation.setEndValue(1.0)
         self.bubble_animation.start()
-        self.hide_timer.start(max(seconds, 3) * 1000)
+        self.hide_timer.start(max(seconds, 10 if len(bubble_text) > 96 else 3) * 1000)
 
     def _hide_bubble(self) -> None:
         self._bubble_hiding = True
@@ -355,7 +427,17 @@ class TableMiku(QWidget):
     @staticmethod
     def _bubble_text(text: str) -> str:
         compact = " ".join(line.strip() for line in text.splitlines() if line.strip())
-        return compact if len(compact) <= 72 else compact[:69] + "..."
+        if len(compact) <= 42:
+            return compact
+        wrapped = textwrap.wrap(
+            compact,
+            width=24,
+            max_lines=5,
+            placeholder="...",
+            break_long_words=True,
+            replace_whitespace=False,
+        )
+        return "\n".join(wrapped)
 
     def _on_pet_pressed(self, x: float, y: float) -> None:
         del x, y
@@ -391,6 +473,16 @@ class TableMiku(QWidget):
         weather_report_action = QAction("立即天气汇报", self)
         watch_command_action = QAction("运行并监视命令", self)
         ai_plan_action = QAction("AI 规划/汇报（可选）", self)
+        toggle_ai_action = QAction(
+            "关闭 AI 助理" if (self.settings.get("assistant") or {}).get("ai_agent_enabled", False) else "开启 AI 助理",
+            self,
+        )
+        pomodoro_action = QAction("番茄钟：开始/暂停", self)
+        timetable_pdf_action = QAction("导入课程表 PDF", self)
+        application_action = QAction("新增投递记录", self)
+        interview_action = QAction("新增面试复盘", self)
+        records_action = QAction("查看助理记录", self)
+        startup_action = QAction("关闭开机自启" if is_startup_enabled() else "开启开机自启", self)
         monitor_settings = self.settings.get("system_monitor") or {}
         toggle_monitor_action = QAction(
             "暂停系统监测" if monitor_settings.get("enabled", True) else "开启系统监测",
@@ -412,6 +504,13 @@ class TableMiku(QWidget):
         weather_report_action.triggered.connect(self.show_weather_report)
         watch_command_action.triggered.connect(self.watch_command)
         ai_plan_action.triggered.connect(self.show_ai_plan)
+        toggle_ai_action.triggered.connect(self.toggle_ai_agent)
+        pomodoro_action.triggered.connect(self.toggle_pomodoro)
+        timetable_pdf_action.triggered.connect(self.import_timetable_pdf)
+        application_action.triggered.connect(self.add_application)
+        interview_action.triggered.connect(self.add_interview_review)
+        records_action.triggered.connect(self.show_assistant_records)
+        startup_action.triggered.connect(self.toggle_startup)
         toggle_monitor_action.triggered.connect(self.toggle_system_monitor)
         toggle_action.triggered.connect(self.toggle_reminders)
         quit_action.triggered.connect(QApplication.instance().quit)
@@ -424,6 +523,12 @@ class TableMiku(QWidget):
         menu.addAction(weather_report_action)
         menu.addAction(watch_command_action)
         menu.addAction(ai_plan_action)
+        menu.addAction(toggle_ai_action)
+        menu.addSeparator()
+        for action in (pomodoro_action, timetable_pdf_action, application_action, interview_action, records_action):
+            menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction(startup_action)
         menu.addAction(toggle_monitor_action)
         menu.addSeparator()
         menu.addAction(toggle_action)
@@ -564,6 +669,95 @@ class TableMiku(QWidget):
         self.pet.set_expression("focus")
         self.assistant.ai_plan_now()
 
+    def toggle_ai_agent(self) -> None:
+        self.settings = load_settings()
+        assistant = self.settings.setdefault("assistant", {})
+        enabled = not assistant.get("ai_agent_enabled", False)
+        assistant["ai_agent_enabled"] = enabled
+        save_settings(self.settings)
+        self.pet.set_expression("thinking" if enabled else "sleepy")
+        if enabled:
+            self.say("AI 助理已开启。它会结合目标、课程表、投递和面试复盘给你更个性化的提醒。")
+            self.assistant.ai_plan_now()
+        else:
+            self.say("AI 助理已关闭，本地提醒和番茄钟仍会继续运行。")
+
+    def toggle_pomodoro(self) -> None:
+        self.settings = load_settings()
+        pomodoro = self.settings.setdefault("pomodoro", {})
+        if pomodoro.get("running", False):
+            stop_pomodoro(self.settings)
+            save_settings(self.settings)
+            self.pet.set_expression("rest")
+            self.say("番茄钟已暂停。需要继续时右键再开始。")
+            return
+
+        start_pomodoro(self.settings)
+        save_settings(self.settings)
+        self.pet.set_expression("typing")
+        work_minutes = int((self.settings.get("pomodoro") or {}).get("work_minutes", 25))
+        self.say(f"{pomodoro_status(self.settings)} 先专注 {work_minutes} 分钟，我会到点提醒你。")
+
+    def import_timetable_pdf(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(self, "导入课程表 PDF", str(PROJECT_ROOT), "PDF 文件 (*.pdf)")
+        if not file_path:
+            return
+        self.pet.set_expression("thinking")
+        try:
+            entries = import_timetable_pdf(Path(file_path))
+        except Exception as exc:
+            self.pet.set_expression("surprised")
+            self.say(f"课程表导入失败：{exc}")
+            return
+        if entries:
+            self.pet.set_expression("happy")
+            self.say(f"课程表导入完成，共识别 {len(entries)} 节课。")
+        else:
+            self.pet.set_expression("surprised")
+            self.say("PDF 已读取，但没识别到“周几 + 时间段 + 课程”的行。可以换一版可复制文本的课表 PDF。")
+
+    def add_application(self) -> None:
+        dialog = TextInputDialog("新增投递记录", "可按示例填写，也支持 JSON。Miku 会把它纳入 AI 规划上下文。", APPLICATION_EXAMPLE, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        record = add_application_record(dialog.text())
+        self.pet.set_expression("cheer")
+        self.say(f"投递记录已保存：{record.get('company')} {record.get('position')}。")
+
+    def add_interview_review(self) -> None:
+        dialog = TextInputDialog("新增面试复盘", "记录问题、表现和下一步动作。之后 AI 规划会优先参考这些复盘。", INTERVIEW_EXAMPLE, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        record = add_interview_review(dialog.text())
+        self.pet.set_expression("happy")
+        self.say(f"面试复盘已保存：{record.get('company')} {record.get('round')}。")
+
+    def show_assistant_records(self) -> None:
+        blocks = [
+            format_timetable(load_timetable(), 10),
+            format_application_summary(load_application_records(), 10),
+            format_interview_summary(load_interview_reviews(), 10),
+        ]
+        text = "\n\n".join(block for block in blocks if block) or "暂时还没有课程表、投递记录或面试复盘。"
+        dialog = TextInputDialog("助理记录", "这些记录会进入 AI 规划上下文。", text, self)
+        dialog.editor.setReadOnly(True)
+        dialog.exec()
+        self.pet.set_expression("smile")
+
+    def toggle_startup(self) -> None:
+        enabled = not is_startup_enabled()
+        try:
+            path = set_startup_enabled(enabled)
+        except OSError as exc:
+            self.pet.set_expression("surprised")
+            self.say(f"开机自启设置失败：{exc}")
+            return
+        self.settings = load_settings()
+        self.settings.setdefault("startup", {})["enabled"] = enabled
+        save_settings(self.settings)
+        self.pet.set_expression("smile" if enabled else "sleepy")
+        self.say(f"开机自启已{'开启' if enabled else '关闭'}：{path}")
+
     def toggle_system_monitor(self) -> None:
         self.settings = load_settings()
         monitor = self.settings.setdefault("system_monitor", {})
@@ -593,6 +787,7 @@ class TableMiku(QWidget):
 def run() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Table Miku")
+    app.setQuitOnLastWindowClosed(False)
     app.setFont(QFont("Microsoft YaHei UI", 9))
     icon = QIcon(str(asset_path("miku.svg")))
     if not icon.isNull():

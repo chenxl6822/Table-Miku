@@ -264,6 +264,15 @@ assets/sprites/miku_sleepy.png
 
 建议图片使用透明背景，主体接近正方形，角色朝向正面或略微俯视，这样和键盘叠加效果更自然。
 
+## 个人助理增强
+
+- 右键菜单新增番茄钟、课程表 PDF 导入、投递记录、面试复盘、助理记录查看、AI 助理开关和开机自启。
+- AI 助理会优先使用 OpenAI Agents SDK；如果未安装 `openai-agents`，会直接调用 OpenAI Responses API。
+- AI 调用会读取环境变量或项目根目录 `.env.local` / `.env` 中的 `OPENAI_API_KEY`，并把 provider、model、response id、usage 等元数据写入助理事件日志。
+- 课程表 PDF 导入需要 `pypdf` 依赖；执行 `pip install -r requirements.txt` 后可在右键菜单选择 PDF。
+- 投递记录保存到 `applications.json`，面试复盘保存到 `interviews.json`，课程表保存到 `timetable.json`；打包后这些文件位于 `%APPDATA%/TableMiku/`。
+- 开机自启通过 Windows 启动文件夹中的 `TableMiku.cmd` 实现，可在右键菜单开启或关闭。
+
 ## 常见问题
 
 ### 运行时报 `No module named PySide6`

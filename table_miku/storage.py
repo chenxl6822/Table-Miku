@@ -49,7 +49,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "startup_brief": True,
         "command_max_output_chars": 420,
         "ai_agent_enabled": False,
+        "ai_use_direct_api": True,
         "ai_model": "gpt-5-nano",
+    },
+    "pomodoro": {
+        "enabled": True,
+        "running": False,
+        "mode": "work",
+        "work_minutes": 25,
+        "break_minutes": 5,
+        "cycles_completed": 0,
+        "started_at": None,
+    },
+    "startup": {
+        "enabled": False,
     },
 }
 

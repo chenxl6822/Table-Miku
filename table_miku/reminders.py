@@ -5,6 +5,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from .pomodoro import pomodoro_tick
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings
 
@@ -41,6 +42,12 @@ class ReminderManager(QObject):
             return
 
         now = datetime.now()
+        pomodoro_message = pomodoro_tick(settings, now)
+        if pomodoro_message:
+            save_settings(settings)
+            self.reminder.emit(pomodoro_message)
+            return
+
         scheduled_message = self._scheduled_message(settings, now)
         if scheduled_message:
             save_settings(settings)

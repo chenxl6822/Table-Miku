@@ -9,3 +9,4 @@ dist/
 .pytest_cache/
 data/*.broken
 data/runtime_assets/
+data/*.jsonl

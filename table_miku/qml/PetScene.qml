@@ -29,6 +29,18 @@ Item {
         if (name === "smile") {
             return spriteMap.idle || ""
         }
+        if (name === "typing" || name === "thinking") {
+            return spriteMap.focus || spriteMap.idle || ""
+        }
+        if (name === "cheer") {
+            return spriteMap.happy || spriteMap.idle || ""
+        }
+        if (name === "alarm") {
+            return spriteMap.surprised || spriteMap.idle || ""
+        }
+        if (name === "rest") {
+            return spriteMap.sleepy || spriteMap.idle || ""
+        }
         return spriteMap[name] || spriteMap.idle || ""
     }
 
@@ -41,8 +53,12 @@ Item {
 
     function accentFor(name) {
         if (name === "happy") return "#ff7faf"
+        if (name === "cheer") return "#ff7faf"
         if (name === "surprised") return "#ffd166"
+        if (name === "alarm") return "#ffd166"
         if (name === "sleepy") return "#8ea0c4"
+        if (name === "rest") return "#8ea0c4"
+        if (name === "thinking") return "#b79cff"
         if (name === "smile") return "#4fd6c6"
         return "#43d9f5"
     }
@@ -62,11 +78,11 @@ Item {
         transition = 0
         transitionAnimation.restart()
         popAnimation.restart()
-        if (name === "happy") {
-            sparkleEmitter.burst(18)
-        } else if (name === "surprised") {
+        if (name === "happy" || name === "cheer") {
+            sparkleEmitter.burst(22)
+        } else if (name === "surprised" || name === "alarm") {
             sparkleEmitter.burst(12)
-        } else if (name === "sleepy") {
+        } else if (name === "sleepy" || name === "rest") {
             sleepyEmitter.burst(8)
         } else {
             keyEmitter.burst(7)
@@ -193,7 +209,7 @@ Item {
         y: 268
         width: 92
         height: 16
-        emitRate: root.expression === "focus" || root.expression === "smile" ? 16 : 7
+        emitRate: root.expression === "typing" ? 28 : (root.expression === "focus" || root.expression === "smile" || root.expression === "thinking" ? 16 : 7)
         lifeSpan: 820
         lifeSpanVariation: 280
         size: 5
@@ -241,7 +257,7 @@ Item {
         height: 190
         radius: 95
         color: root.accent
-        opacity: root.expression === "sleepy" ? 0.10 : 0.16
+        opacity: root.expression === "sleepy" || root.expression === "rest" ? 0.10 : 0.16
         scale: 1 + root.breath * 0.018 + root.tapPulse * 0.05
         layer.enabled: true
         layer.smooth: true
@@ -265,7 +281,8 @@ Item {
         y: 96 + root.breath * 2.4
         width: 320
         height: 260
-        scale: root.popScale + root.tapPulse * 0.04 + (root.expression === "happy" ? 0.015 : 0)
+        scale: root.popScale + root.tapPulse * 0.04 + (root.expression === "happy" || root.expression === "cheer" ? 0.015 : 0)
+        rotation: root.expression === "cheer" ? root.breath * 1.8 : (root.expression === "alarm" ? root.breath * 2.4 : 0)
         transformOrigin: Item.Center
 
         Image {
@@ -318,7 +335,7 @@ Item {
             x: 224
             y: 38 + root.breath * 4
             text: "Zzz"
-            visible: root.expression === "sleepy"
+            visible: root.expression === "sleepy" || root.expression === "rest"
             color: "#6d80a7"
             font.pixelSize: 18
             font.bold: true
@@ -333,7 +350,7 @@ Item {
                 width: 18
                 height: 18
                 radius: 9
-                visible: root.expression === "happy"
+                visible: root.expression === "happy" || root.expression === "cheer"
                 color: "#ff8cad"
                 opacity: 0.86
             }
@@ -346,7 +363,7 @@ Item {
             height: 24
             rotation: 45
             radius: 4
-            visible: root.expression === "happy"
+            visible: root.expression === "happy" || root.expression === "cheer"
             color: "#ff8cad"
             opacity: 0.86
         }
@@ -410,6 +427,10 @@ Item {
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             wrapMode: Text.WordWrap
+            maximumLineCount: 4
+            elide: Text.ElideRight
+            minimumPixelSize: 10
+            fontSizeMode: Text.Fit
             color: "#263553"
             font.family: "Microsoft YaHei"
             font.pixelSize: 13
