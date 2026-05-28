@@ -395,7 +395,10 @@ class TableMiku(QWidget):
         self.assistant.start()
 
         self.tray_icon = self._setup_tray_icon()
-        self.say("Table Miku 已就位。我会监测电脑、网络、命令和今日计划。")
+        if (self.settings.get("assistant") or {}).get("ai_agent_enabled", False):
+            self.say("Table Miku 已就位。AI 助理已自动开启，我会监测电脑、网络和今日计划。")
+        else:
+            self.say("Table Miku 已就位。我会监测电脑、网络、命令和今日计划。")
 
     def _setup_tray_icon(self) -> QSystemTrayIcon | None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -954,8 +957,43 @@ def run() -> None:
     icon = QIcon(str(asset_path("miku.svg")))
     if not icon.isNull():
         app.setWindowIcon(icon)
+
+    # 自动检测 API key 并开启 AI 助理
+    if _deepseek_key_exists() or _env_value("OPENAI_API_KEY"):
+        _auto_enable_ai()
+
     window = TableMiku()
     desktop = app.primaryScreen().availableGeometry()
     window.move(desktop.right() - window.width() - 32, desktop.bottom() - window.height() - 32)
     window.show()
     sys.exit(app.exec())
+
+
+def _auto_enable_ai() -> None:
+    """如果检测到 API Key 存在且 AI 助理尚未开启，自动启用"""
+    from .storage import load_settings, save_settings
+    settings = load_settings()
+    assistant = settings.setdefault("assistant", {})
+    if not assistant.get("ai_agent_enabled", False):
+        assistant["ai_agent_enabled"] = True
+        save_settings(settings)
+
+
+def _env_value(name: str) -> str:
+    """从环境变量或 .env 文件读取值"""
+    import os
+    key = os.environ.get(name, "").strip()
+    if key:
+        return key
+    for filename in (".env.local", ".env"):
+        path = PROJECT_ROOT / filename
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8-sig").splitlines():
+                cleaned = line.strip().lstrip("﻿")
+                if cleaned.startswith(f"{name}="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return ""
