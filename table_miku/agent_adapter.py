@@ -114,6 +114,8 @@ def _run_chat_completions_api(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         return AgentResult(False, _api_failure_message(provider_name, exc.code, detail), {"provider": provider_name, "model": model})
+    except json.JSONDecodeError:
+        return AgentResult(False, f"{provider_name} API 返回数据解析失败，请稍后重试。", {"provider": provider_name, "model": model})
     except OSError as exc:
         return AgentResult(False, f"{provider_name} API 暂时连不上：请检查联网权限、代理或防火墙。{exc}", {"provider": provider_name, "model": model})
 
@@ -172,6 +174,8 @@ def _run_responses_api(context: str, request: str, model: str) -> AgentResult:
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         return AgentResult(False, _api_failure_message("OpenAI", exc.code, detail), {"provider": "responses-api", "model": model})
+    except json.JSONDecodeError:
+        return AgentResult(False, "OpenAI API 返回数据解析失败，请稍后重试。", {"provider": "responses-api", "model": model})
     except OSError as exc:
         return AgentResult(False, f"OpenAI API 暂时连不上：请检查联网权限、代理或防火墙。{exc}", {"provider": "responses-api", "model": model})
 
