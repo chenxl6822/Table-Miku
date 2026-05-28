@@ -326,3 +326,32 @@ pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "
 - 接入 AI API，让目标规划更个性化。
 - 支持语音提醒。
 - 支持番茄钟、课程表、投递记录和面试复盘。
+
+## 开发
+
+### 环境
+- Python 3.12+
+- PySide6 >= 6.7
+
+### 安装
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install pytest  # 运行测试需要
+```
+
+### 运行
+```powershell
+.\.venv\Scripts\python.exe main.py
+```
+
+### 测试
+```powershell
+pytest tests/ -v
+```
+
+### 打包
+```powershell
+pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "data;data" --add-data "table_miku/qml;table_miku/qml" main.py
+```
