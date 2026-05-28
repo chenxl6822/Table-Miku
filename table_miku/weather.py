@@ -64,8 +64,17 @@ def _get_json(url: str, timeout: float = 8.0) -> Any:
         url,
         headers={"User-Agent": "Table-Miku/0.5 (desktop pet weather lookup)"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as ex:
+        raise RuntimeError(f"天气服务暂时不可用 (HTTP {ex.code})") from ex
+    except urllib.error.URLError as ex:
+        raise RuntimeError("天气服务连接失败，请检查网络") from ex
+    except json.JSONDecodeError as ex:
+        raise RuntimeError("天气数据解析异常") from ex
+    except OSError as ex:
+        raise RuntimeError(f"网络请求异常: {ex}") from ex
 
 
 def get_weather(location_text: str = "雨湖区,湘潭,湖南") -> str:
