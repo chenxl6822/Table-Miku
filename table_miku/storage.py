@@ -106,18 +106,25 @@ def _path(filename: str) -> Path:
 
 def read_json(filename: str, default: Any) -> Any:
     path = _path(filename)
+    # 确保父目录存在
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     if not path.exists():
         write_json(filename, default)
         return deepcopy(default)
 
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as ex:
+        # 损坏文件备份
         backup = path.with_suffix(path.suffix + ".broken")
         try:
+            if backup.exists():
+                backup = path.with_suffix(f".broken.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
             path.replace(backup)
         except OSError:
             pass
+        print(f"[storage] 读取 {filename} 失败 ({ex})，已重置为默认值。损坏文件：{backup.name}")
         write_json(filename, default)
         return deepcopy(default)
 
@@ -125,7 +132,18 @@ def read_json(filename: str, default: Any) -> Any:
 def write_json(filename: str, payload: Any) -> None:
     path = _path(filename)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 先写临时文件再 rename，防止写入中断导致文件损坏
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as ex:
+        print(f"[storage] 写入 {filename} 失败: {ex}")
+        # 尝试直接写原路径（降级）
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass  # 不再重试，至少应用还能运行
 
 
 def load_settings() -> dict[str, Any]:
