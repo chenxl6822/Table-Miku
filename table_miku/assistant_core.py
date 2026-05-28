@@ -108,6 +108,13 @@ class PersonalAssistant(QObject):
             self.brief_now()
 
     def _brief_worker(self) -> None:
+        try:
+            self._do_brief()
+        except Exception as ex:
+            print(f"[assistant] 简报生成失败: {ex}")
+            self.notice.emit("surprised", "简报生成遇到了点问题，不过不耽误学习。")
+
+    def _do_brief(self) -> None:
         settings = load_settings()
         snapshot = self._system_snapshot_provider()
         tasks = today_tasks(load_goals())
@@ -166,21 +173,26 @@ class PersonalAssistant(QObject):
             self.notice.emit("surprised", "天气汇报失败了。可能是网络、VPN 或天气服务暂时不可用。")
 
     def _agent_worker(self) -> None:
-        settings = load_settings()
-        assistant = settings.get("assistant") or {}
-        context = self._agent_context()
-        provider = str(assistant.get("ai_provider", "deepseek"))
-        model_key = "deepseek_model" if provider == "deepseek" else "ai_model"
-        default_model = "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano"
-        result = run_personal_agent(
-            context,
-            "请给我下一步工作提醒和异常摘要。",
-            str(assistant.get(model_key, default_model)),
-            provider,
-            str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
-        )
-        append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, result.metadata)
-        self.notice.emit("smile" if result.ok else "focus", result.text)
+        try:
+            settings = load_settings()
+            assistant = settings.get("assistant") or {}
+            context = self._agent_context()
+            provider = str(assistant.get("ai_provider", "deepseek"))
+            model_key = "deepseek_model" if provider == "deepseek" else "ai_model"
+            default_model = "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano"
+            result = run_personal_agent(
+                context,
+                "请给我下一步工作提醒和异常摘要。",
+                str(assistant.get(model_key, default_model)),
+                provider,
+                str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
+            )
+            append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, result.metadata)
+            self.notice.emit("smile" if result.ok else "focus", result.text)
+        except Exception as ex:
+            print(f"[assistant] AI Agent 执行失败: {ex}")
+            append_event("ai_agent", "AI Agent 异常", str(ex))
+            self.notice.emit("surprised", "AI 助理暂时无法连接，稍后会自动重试。")
 
     def _agent_context(self) -> str:
         tasks = today_tasks(load_goals())
