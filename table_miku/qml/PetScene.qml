@@ -97,8 +97,9 @@ Item {
 
     function showBubble(message, seconds) {
         bubbleText.text = message
-        var lines = Math.max(1, message.split("\n").length)
-        bubble.height = Math.min(142, Math.max(92, 48 + lines * 20))
+        bubbleText.maximumLineCount = 8
+        var lines = Math.max(1, bubbleText.lineCount)
+        bubble.height = Math.min(180, Math.max(72, 42 + lines * 19))
         bubble.y = 4
         bubble.visible = true
         bubbleHideTimer.stop()
@@ -430,7 +431,7 @@ Item {
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             wrapMode: Text.WordWrap
-            maximumLineCount: 5
+            maximumLineCount: 8
             elide: Text.ElideRight
             minimumPixelSize: 10
             fontSizeMode: Text.Fit

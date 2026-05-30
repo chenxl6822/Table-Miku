@@ -51,6 +51,7 @@ from .startup import is_startup_enabled, set_startup_enabled
 from .storage import load_goals, load_settings, save_settings
 from .system_monitor import SystemMonitor
 from .weather import get_weather
+from .weather_monitor import WeatherMonitor
 
 
 CHAT_LINES = [
@@ -299,6 +300,29 @@ class TaskDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class BubbleDetailDialog(QDialog):
+    """长文本详情查看窗口"""
+
+    def __init__(self, title: str, content: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowIcon(QIcon(str(export_menu_icon())))
+        self.resize(480, 380)
+        self.setStyleSheet(DIALOG_STYLE)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+
+        content_area = QTextEdit(self)
+        content_area.setReadOnly(True)
+        content_area.setPlainText(content)
+        content_area.setFont(QFont("Microsoft YaHei UI", 10))
+        layout.addWidget(content_area)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 def _deepseek_key_exists() -> bool:
     import os
 
@@ -378,6 +402,9 @@ class TableMiku(QWidget):
         self.bubble.hide()
         self.bubble.raise_()
 
+        # 点击气泡暂停/继续计时
+        self.bubble.mousePressEvent = self._on_bubble_clicked
+
         self.hide_timer = QTimer(self)
         self.hide_timer.setSingleShot(True)
         self.hide_timer.timeout.connect(self._hide_bubble)
@@ -389,6 +416,11 @@ class TableMiku(QWidget):
         self.system_monitor = SystemMonitor(self)
         self.system_monitor.notice.connect(self._handle_system_notice)
         self.system_monitor.start()
+
+        # 天气预警监测
+        self.weather_monitor = WeatherMonitor(self)
+        self.weather_monitor.notice.connect(self._handle_system_notice)
+        self.weather_monitor.start()
 
         self.assistant = PersonalAssistant(lambda: self.system_monitor.latest_snapshot, PROJECT_ROOT, self)
         self.assistant.notice.connect(self._handle_system_notice)
@@ -440,10 +472,41 @@ class TableMiku(QWidget):
 
     def say(self, text: str) -> None:
         self.settings = load_settings()
-        seconds = int(self.settings.get("bubble_seconds", 7))
+        seconds = self._bubble_duration(text)
         bubble_text = self._bubble_text(text)
-        self.bubble.hide()
-        self.pet.show_bubble(bubble_text, max(seconds, 10 if len(bubble_text) > 96 else 3))
+
+        # 重置气泡样式为默认（非暂停状态）
+        self.bubble.setStyleSheet(
+            """
+            QLabel {
+                background: rgba(255, 255, 255, 246);
+                border: 1px solid rgba(80, 101, 138, 210);
+                border-radius: 22px;
+                color: #263553;
+                padding: 11px 14px;
+            }
+            """
+        )
+
+        # 显示 QML 气泡
+        self.pet.show_bubble(bubble_text, seconds)
+
+        # 显示 Python 气泡用于点击交互，并启动隐藏计时器
+        self.bubble.setText(bubble_text)
+        self._bubble_hiding = False
+        self.bubble_effect.setOpacity(1.0)
+        self.bubble_animation.stop()
+        self.bubble.show()
+        self.bubble.raise_()
+        self.hide_timer.start(seconds * 1000)
+
+        # 长文本：延迟弹出详情窗口
+        if len(text) > 120:
+            QTimer.singleShot(500, lambda: self._show_detail_dialog(text))
+
+    def _show_detail_dialog(self, text: str) -> None:
+        dialog = BubbleDetailDialog("Miku 消息详情", text, self)
+        dialog.exec()
 
     def _hide_bubble(self) -> None:
         self._bubble_hiding = True
@@ -455,6 +518,36 @@ class TableMiku(QWidget):
     def _finish_bubble_animation(self) -> None:
         if self._bubble_hiding:
             self.bubble.hide()
+
+    def _on_bubble_clicked(self, event) -> None:
+        """点击气泡：暂停/继续隐藏计时"""
+        if self.hide_timer.isActive():
+            self.hide_timer.stop()
+            self.bubble.setStyleSheet(
+                """
+                QLabel {
+                    background: rgba(255, 255, 255, 246);
+                    border: 2px solid #43d9f5;
+                    border-radius: 22px;
+                    color: #263553;
+                    padding: 11px 14px;
+                }
+                """
+            )  # 蓝色边框表示已暂停
+        else:
+            self.bubble.setStyleSheet(
+                """
+                QLabel {
+                    background: rgba(255, 255, 255, 246);
+                    border: 1px solid rgba(80, 101, 138, 210);
+                    border-radius: 22px;
+                    color: #263553;
+                    padding: 11px 14px;
+                }
+                """
+            )  # 恢复默认边框
+            self._hide_bubble()
+        super(QLabel, self.bubble).mousePressEvent(event)
 
     @staticmethod
     def _bubble_text(text: str) -> str:
@@ -482,6 +575,13 @@ class TableMiku(QWidget):
         if len(summary) > 72:
             summary = summary[:69] + "..."
         return "摘要：" + summary
+
+    @staticmethod
+    def _bubble_duration(text: str) -> int:
+        """弹性时长：max(8, 字数×0.3)，上限 80 秒"""
+        raw_len = len(text)
+        seconds = max(8, int(raw_len * 0.3))
+        return min(seconds, 80)
 
     def _on_pet_pressed(self, x: float, y: float) -> None:
         del x, y
@@ -570,33 +670,55 @@ class TableMiku(QWidget):
         toggle_action.triggered.connect(self.toggle_reminders)
         quit_action.triggered.connect(QApplication.instance().quit)
 
-        for action in (today_action, add_goal_action, schedule_action, weather_action, city_action):
-            menu.addAction(action)
-        menu.addSeparator()
-        menu.addAction(system_status_action)
-        menu.addAction(brief_action)
-        menu.addAction(weather_report_action)
-        menu.addAction(watch_command_action)
-        menu.addAction(ai_plan_action)
-        menu.addAction(toggle_ai_action)
-        menu.addSeparator()
-        for action in (
-            pomodoro_action,
-            view_timetable_action,
-            timetable_pdf_action,
-            course_time_action,
-            application_action,
-            interview_action,
-            records_action,
-            knowledge_action,
-            view_knowledge_action,
-        ):
-            menu.addAction(action)
-        menu.addSeparator()
-        menu.addAction(startup_action)
-        menu.addAction(toggle_monitor_action)
-        menu.addSeparator()
-        menu.addAction(toggle_action)
+        # ── 子菜单 1：📖 学习 ──
+        study_menu = QMenu("📖 学习", menu)
+        study_menu.setStyleSheet(MENU_STYLE)
+        study_menu.addAction(today_action)
+        study_menu.addAction(add_goal_action)
+        study_menu.addAction(schedule_action)
+        study_menu.addAction(view_timetable_action)
+
+        # ── 子菜单 2：💼 求职 ──
+        job_menu = QMenu("💼 求职", menu)
+        job_menu.setStyleSheet(MENU_STYLE)
+        job_menu.addAction(application_action)
+        job_menu.addAction(interview_action)
+        job_menu.addAction(records_action)
+        job_menu.addSeparator()
+        job_menu.addAction(knowledge_action)
+        job_menu.addAction(view_knowledge_action)
+
+        # ── 子菜单 3：⚙️ 系统工具 ──
+        tools_menu = QMenu("⚙️ 系统工具", menu)
+        tools_menu.setStyleSheet(MENU_STYLE)
+        tools_menu.addAction(weather_action)
+        tools_menu.addAction(city_action)
+        tools_menu.addAction(system_status_action)
+        tools_menu.addSeparator()
+        tools_menu.addAction(brief_action)
+        tools_menu.addAction(weather_report_action)
+        tools_menu.addAction(ai_plan_action)
+        tools_menu.addAction(watch_command_action)
+        tools_menu.addSeparator()
+        tools_menu.addAction(pomodoro_action)
+        tools_menu.addAction(timetable_pdf_action)
+        tools_menu.addAction(course_time_action)
+
+        # ── 子菜单 4：🎨 设置 ──
+        settings_menu = QMenu("🎨 设置", menu)
+        settings_menu.setStyleSheet(MENU_STYLE)
+        settings_menu.addAction(toggle_ai_action)
+        settings_menu.addAction(toggle_monitor_action)
+        settings_menu.addAction(toggle_action)
+        settings_menu.addAction(startup_action)
+        settings_menu.addSeparator()
+        settings_menu.addAction(quit_action)
+
+        # ── 主菜单 ──
+        menu.addMenu(study_menu)
+        menu.addMenu(job_menu)
+        menu.addMenu(tools_menu)
+        menu.addMenu(settings_menu)
         menu.addSeparator()
         menu.addAction(quit_action)
         menu.exec(self.mapToGlobal(position))
