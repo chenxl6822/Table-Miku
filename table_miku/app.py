@@ -301,7 +301,7 @@ class TaskDialog(QDialog):
 
 
 class BubbleDetailDialog(QDialog):
-    """长文本详情查看窗口"""
+    """长文本详情查看窗口（非模态）"""
 
     def __init__(self, title: str, content: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -309,18 +309,23 @@ class BubbleDetailDialog(QDialog):
         self.setWindowIcon(QIcon(str(export_menu_icon())))
         self.resize(480, 380)
         self.setStyleSheet(DIALOG_STYLE)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
 
-        content_area = QTextEdit(self)
-        content_area.setReadOnly(True)
-        content_area.setPlainText(content)
-        content_area.setFont(QFont("Microsoft YaHei UI", 10))
-        layout.addWidget(content_area)
+        self._content_area = QTextEdit(self)
+        self._content_area.setReadOnly(True)
+        self._content_area.setPlainText(content)
+        self._content_area.setFont(QFont("Microsoft YaHei UI", 10))
+        layout.addWidget(self._content_area)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
+        buttons.rejected.connect(self.close)
         layout.addWidget(buttons)
+
+    def set_text(self, content: str) -> None:
+        """更新显示的文本内容"""
+        self._content_area.setPlainText(content)
 
 
 def _deepseek_key_exists() -> bool:
@@ -505,8 +510,11 @@ class TableMiku(QWidget):
             QTimer.singleShot(500, lambda: self._show_detail_dialog(text))
 
     def _show_detail_dialog(self, text: str) -> None:
-        dialog = BubbleDetailDialog("Miku 消息详情", text, self)
-        dialog.exec()
+        if not hasattr(self, '_detail_dialog') or self._detail_dialog is None:
+            self._detail_dialog = BubbleDetailDialog("Miku 消息详情", text, self)
+        self._detail_dialog.set_text(text)
+        self._detail_dialog.show()
+        self._detail_dialog.raise_()
 
     def _hide_bubble(self) -> None:
         self._bubble_hiding = True

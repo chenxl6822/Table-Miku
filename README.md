@@ -335,10 +335,19 @@ pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "
 
 ### 安装
 ```powershell
+git clone https://github.com/chenxl6822/Table-Miku.git
+cd Table-Miku
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 pip install pytest  # 运行测试需要
+```
+
+如果 PowerShell 禁止运行虚拟环境激活脚本，可以改用：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
 ### 运行

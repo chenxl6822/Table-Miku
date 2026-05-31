@@ -79,6 +79,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "cycles_completed": 0,
         "started_at": None,
     },
+    "weather_alerts": {
+        "enabled": True,
+        "interval_minutes": 20,
+        "cooldown_minutes": 60,
+        "lead_minutes": 30,
+    },
     "startup": {
         "enabled": False,
     },
