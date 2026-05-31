@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -69,6 +71,47 @@ def run_personal_agent(
     return AgentResult(True, text or "AI 助理已运行，但没有生成可展示内容。", {"provider": "agents-sdk", "model": model})
 
 
+def _http_post_json(endpoint: str, payload: dict, headers: dict, timeout: int = 30, max_retries: int = 2) -> bytes:
+    """发送 JSON POST 请求，SSL 错误时自动重试。"""
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            request_obj = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(request_obj, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError:
+            raise  # HTTP 错误不重试，直接抛出
+        except (ssl.SSLError, OSError) as exc:
+            last_error = exc
+            if attempt < max_retries:
+                time.sleep(1.0 + attempt)  # 递增等待：1s, 2s
+        except json.JSONDecodeError:
+            raise  # 不重试
+    raise last_error  # type: ignore[misc]
+
+
+def _ssl_friendly_message(provider_name: str, exc: Exception) -> str:
+    """将 SSL/网络错误转为用户友好提示。"""
+    msg = str(exc)
+    lowered = msg.lower()
+    if isinstance(exc, ssl.SSLError) or "ssl" in lowered:
+        return (
+            f"{provider_name} API 连接不安全（SSL 握手失败）。"
+            "常见原因：公司/校园网络拦截、代理/VPN 配置异常、防火墙阻断 HTTPS。"
+            "可尝试关闭代理后重试，或检查系统时间是否正确。"
+        )
+    if "timeout" in lowered or "timed out" in lowered:
+        return f"{provider_name} API 连接超时：请检查网络质量或稍后重试。"
+    if "getaddrinfo" in lowered or "name or service not known" in lowered:
+        return f"{provider_name} API 域名解析失败：请检查 DNS 或网络连接。"
+    return f"{provider_name} API 暂时连不上：请检查联网权限、代理或防火墙。"
+
+
 def _run_chat_completions_api(
     context: str,
     request: str,
@@ -98,26 +141,21 @@ def _run_chat_completions_api(
         "max_tokens": 260,
     }
     endpoint = base_url.rstrip("/") + "/chat/completions"
-    request_obj = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "Table-Miku/0.5",
-        },
-        method="POST",
-    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "Table-Miku/0.5",
+    }
     try:
-        with urllib.request.urlopen(request_obj, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        raw = _http_post_json(endpoint, payload, headers)
+        data = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         return AgentResult(False, _api_failure_message(provider_name, exc.code, detail), {"provider": provider_name, "model": model})
     except json.JSONDecodeError:
         return AgentResult(False, f"{provider_name} API 返回数据解析失败，请稍后重试。", {"provider": provider_name, "model": model})
-    except OSError as exc:
-        return AgentResult(False, f"{provider_name} API 暂时连不上：请检查联网权限、代理或防火墙。{exc}", {"provider": provider_name, "model": model})
+    except (ssl.SSLError, OSError) as exc:
+        return AgentResult(False, _ssl_friendly_message(provider_name, exc), {"provider": provider_name, "model": model})
 
     text = ""
     choices = data.get("choices")
@@ -158,26 +196,22 @@ def _run_responses_api(context: str, request: str, model: str) -> AgentResult:
         ],
         "max_output_tokens": 260,
     }
-    request_obj = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {_api_key()}",
-            "Content-Type": "application/json",
-            "User-Agent": "Table-Miku/0.4",
-        },
-        method="POST",
-    )
+    endpoint = "https://api.openai.com/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {_api_key()}",
+        "Content-Type": "application/json",
+        "User-Agent": "Table-Miku/0.4",
+    }
     try:
-        with urllib.request.urlopen(request_obj, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        raw = _http_post_json(endpoint, payload, headers)
+        data = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         return AgentResult(False, _api_failure_message("OpenAI", exc.code, detail), {"provider": "responses-api", "model": model})
     except json.JSONDecodeError:
         return AgentResult(False, "OpenAI API 返回数据解析失败，请稍后重试。", {"provider": "responses-api", "model": model})
-    except OSError as exc:
-        return AgentResult(False, f"OpenAI API 暂时连不上：请检查联网权限、代理或防火墙。{exc}", {"provider": "responses-api", "model": model})
+    except (ssl.SSLError, OSError) as exc:
+        return AgentResult(False, _ssl_friendly_message("OpenAI", exc), {"provider": "responses-api", "model": model})
 
     text = _extract_response_text(data)
     metadata = {

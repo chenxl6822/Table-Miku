@@ -622,7 +622,6 @@ class TableMiku(QWidget):
         city_action = QAction("设置/自动定位城市", self)
         system_status_action = QAction("立即检测电脑/网络", self)
         brief_action = QAction("生成助手简报", self)
-        weather_report_action = QAction("立即天气汇报", self)
         watch_command_action = QAction("运行并监视命令", self)
         ai_plan_action = QAction("AI 规划/汇报（可选）", self)
         toggle_ai_action = QAction(
@@ -660,7 +659,6 @@ class TableMiku(QWidget):
         city_action.triggered.connect(self.set_city)
         system_status_action.triggered.connect(self.show_system_status)
         brief_action.triggered.connect(self.show_assistant_brief)
-        weather_report_action.triggered.connect(self.show_weather_report)
         watch_command_action.triggered.connect(self.watch_command)
         ai_plan_action.triggered.connect(self.show_ai_plan)
         toggle_ai_action.triggered.connect(self.toggle_ai_agent)
@@ -704,7 +702,6 @@ class TableMiku(QWidget):
         tools_menu.addAction(system_status_action)
         tools_menu.addSeparator()
         tools_menu.addAction(brief_action)
-        tools_menu.addAction(weather_report_action)
         tools_menu.addAction(ai_plan_action)
         tools_menu.addAction(watch_command_action)
         tools_menu.addSeparator()
@@ -894,11 +891,6 @@ class TableMiku(QWidget):
         self.pet.set_expression("focus")
         self.say("我在整理今日任务、电脑状态和最近事件。")
         self.assistant.brief_now()
-
-    def show_weather_report(self) -> None:
-        self.pet.set_expression("focus")
-        self.say("我正在做天气汇报，网络慢的话会多等一会。")
-        self.assistant.weather_now()
 
     def watch_command(self) -> None:
         dialog = TextInputDialog(
