@@ -24,6 +24,9 @@ Item {
     signal petReleased(real x, real y)
     signal petClicked()
     signal petRightClicked(real x, real y)
+    signal bubbleClicked()
+
+    property bool bubblePaused: false
 
     function spriteFor(name) {
         if (name === "smile") {
@@ -96,6 +99,9 @@ Item {
     }
 
     function showBubble(message, seconds) {
+        bubblePaused = false
+        bubble.border.color = "#8094b8"
+        bubble.border.width = 1
         bubbleText.text = message
         bubbleText.maximumLineCount = 8
         var lines = Math.max(1, bubbleText.lineCount)
@@ -110,6 +116,24 @@ Item {
 
     function hideBubble() {
         bubbleOut.restart()
+    }
+
+    function pauseBubble() {
+        if (!bubblePaused && bubbleHideTimer.running) {
+            bubblePaused = true
+            bubbleHideTimer.stop()
+            bubble.border.color = "#43d9f5"
+            bubble.border.width = 2
+        }
+    }
+
+    function resumeBubble() {
+        if (bubblePaused) {
+            bubblePaused = false
+            bubbleHideTimer.start()
+            bubble.border.color = "#8094b8"
+            bubble.border.width = 1
+        }
     }
 
     NumberAnimation {
@@ -439,6 +463,19 @@ Item {
             font.family: "Microsoft YaHei"
             font.pixelSize: 13
             lineHeight: 1.18
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.LeftButton
+            onClicked: {
+                if (bubblePaused) {
+                    resumeBubble()
+                } else {
+                    pauseBubble()
+                }
+                root.bubbleClicked()
+            }
         }
     }
 

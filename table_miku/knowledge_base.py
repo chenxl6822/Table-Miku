@@ -19,7 +19,39 @@ DEFAULT_COMPUTER_TOPICS = [
     "操作系统",
     "编译原理",
     "数据库原理",
+    "软件工程",
+    "算法设计与分析",
+    "计算机安全",
+    "分布式系统",
 ]
+
+# 中文主题 → 英文 Wikipedia 页面名映射（当中文 Wikipedia 失败时回退）
+TOPIC_ALIASES: dict[str, str] = {
+    "计算机组成原理": "Computer_architecture",
+    "编译原理": "Compiler",
+    "数据库原理": "Database",
+    "数据结构": "Data_structure",
+    "操作系统": "Operating_system",
+    "计算机网络": "Computer_network",
+    "软件工程": "Software_engineering",
+    "算法设计与分析": "Analysis_of_algorithms",
+    "计算机安全": "Computer_security",
+    "分布式系统": "Distributed_computing",
+}
+
+# 主题分解：当主主题获取失败时，拆成子主题分别查询
+TOPIC_DECOMPOSITION: dict[str, list[str]] = {
+    "编译原理": ["编译器", "编译过程", "词法分析", "语法分析", "中间代码生成", "代码优化", "目标代码生成"],
+    "计算机组成原理": ["CPU", "存储器层次结构", "指令系统", "总线", "输入输出系统", "计算机体系结构"],
+    "数据库原理": ["关系数据库", "SQL", "事务", "索引", "数据库范式", "查询优化"],
+    "操作系统": ["进程管理", "内存管理", "文件系统", "死锁", "调度算法", "虚拟内存"],
+    "计算机网络": ["TCP/IP", "HTTP协议", "DNS", "路由算法", "网络分层", "拥塞控制"],
+    "数据结构": ["数组", "链表", "栈", "队列", "树", "图", "哈希表", "排序算法"],
+    "软件工程": ["软件生命周期", "设计模式", "敏捷开发", "测试驱动开发", "版本控制"],
+    "算法设计与分析": ["动态规划", "贪心算法", "分治法", "图算法", "NP完全性", "近似算法"],
+    "计算机安全": ["加密算法", "网络安全", "认证与授权", "漏洞与攻击", "安全协议"],
+    "分布式系统": ["CAP定理", "一致性算法", "分布式事务", "微服务", "消息队列"],
+}
 
 WIKIPEDIA_API = "https://zh.wikipedia.org/w/api.php"
 WIKIPEDIA_REST_SUMMARY = "https://zh.wikipedia.org/api/rest_v1/page/summary/"
@@ -134,9 +166,282 @@ FALLBACK_KNOWLEDGE: dict[str, dict[str, Any]] = {
         "examples": ["给用户表 email 字段建立唯一索引可以加速登录查询并避免重复。", "转账操作需要事务保证扣款和入账同时成功或同时失败。"],
         "review_questions": ["索引为什么会降低写入性能？", "事务 ACID 分别代表什么？", "什么情况下需要调整隔离级别？"],
     },
+    "软件工程": {
+        "overview": "软件工程是用工程化方法开发、运行和维护软件系统的学科，涵盖需求分析、设计、编码、测试、部署和维护全生命周期。核心目标是在成本、时间和质量之间取得平衡。",
+        "sections": [
+            {"heading": "软件生命周期", "content": "典型阶段包括需求分析、系统设计、编码实现、测试验证、部署上线和运维迭代，各阶段有对应的文档和评审。"},
+            {"heading": "设计模式", "content": "常用设计模式如单例、工厂、观察者、策略等，提供可复用的设计经验，解决特定上下文中的常见问题。"},
+            {"heading": "开发方法", "content": "瀑布模型强调阶段顺序推进，敏捷开发强调迭代交付和快速反馈，Scrum 和 Kanban 是常见敏捷框架。"},
+        ],
+        "key_points": ["软件生命周期覆盖从需求到运维全过程", "设计模式是可复用的设计经验", "敏捷开发注重快速迭代和持续反馈", "测试驱动开发以测试为先导编写代码", "版本控制是团队协作的基础"],
+        "glossary": [
+            {"term": "敏捷开发", "explanation": "以迭代为核心、快速响应变化的软件开发方法。"},
+            {"term": "设计模式", "explanation": "针对特定问题的可复用设计方案。"},
+            {"term": "CI/CD", "explanation": "持续集成与持续部署，自动化构建、测试与发布。"},
+            {"term": "重构", "explanation": "在不改变外部行为的前提下改善代码内部结构。"},
+            {"term": "技术债务", "explanation": "为快速交付而做出的妥协，后续需要偿还的代码质量代价。"},
+        ],
+        "examples": ["用户故事描述功能需求，驱动迭代开发计划。", "Git 分支策略如 GitFlow 规范团队协作流程。"],
+        "review_questions": ["瀑布模型和敏捷开发的核心区别是什么？", "设计模式解决了什么问题？", "持续集成为什么能降低集成风险？"],
+    },
+    "算法设计与分析": {
+        "overview": "算法设计与分析研究如何设计高效算法并分析其时间与空间复杂度。核心内容包括分治法、动态规划、贪心算法、图算法、NP 完全性理论和近似算法。",
+        "sections": [
+            {"heading": "算法设计范式", "content": "分治法将问题拆分为子问题递归求解；动态规划利用子问题重叠和最优子结构；贪心算法在每步做局部最优选择。"},
+            {"heading": "复杂度分析", "content": "用大 O 记号描述最坏情况增长趋势；P 类问题可在多项式时间内求解，NP 类问题可在多项式时间内验证。"},
+            {"heading": "经典算法", "content": "排序算法、最短路径（Dijkstra、Bellman-Ford）、最小生成树（Prim、Kruskal）、网络流等是面试和竞赛高频考点。"},
+        ],
+        "key_points": ["时间复杂度衡量算法随输入增长的成本", "分治法适合可分解且子问题独立的问题", "动态规划解决有重叠子问题的最优化问题", "贪心算法依赖贪心选择性质", "NP 完全问题目前没有多项式解法"],
+        "glossary": [
+            {"term": "大O记号", "explanation": "描述算法时间复杂度上界的数学记号。"},
+            {"term": "动态规划", "explanation": "将原问题分解为重叠子问题并保存中间结果的算法范式。"},
+            {"term": "贪心算法", "explanation": "每步做局部最优选择，期望得到全局最优的算法。"},
+            {"term": "NP完全", "explanation": "一类既属于NP又NP难的问题，目前无多项式解法。"},
+            {"term": "近似算法", "explanation": "对NP难问题在多项式时间内找到接近最优解的算法。"},
+        ],
+        "examples": ["背包问题的 0/1 版本需动态规划，分数版本可用贪心。", "Dijkstra 算法在有负权边时会失效，需改用 Bellman-Ford。"],
+        "review_questions": ["动态规划和分治法的核心区别是什么？", "什么时候贪心算法能保证全局最优？", "P 和 NP 的区别是什么？"],
+    },
+    "计算机安全": {
+        "overview": "计算机安全研究保护信息系统免受未授权访问、使用、泄露、破坏、修改或销毁的方法。核心领域包括密码学、网络安全、系统安全、应用安全和安全管理。",
+        "sections": [
+            {"heading": "密码学基础", "content": "对称加密（AES）使用相同密钥加解密；非对称加密（RSA）使用公钥加密私钥解密；哈希函数（SHA-256）用于完整性校验。"},
+            {"heading": "网络安全", "content": "防火墙过滤流量，IDS/IPS 检测入侵，TLS 保护传输安全，VPN 建立加密隧道。"},
+            {"heading": "应用安全", "content": "常见漏洞包括 SQL 注入、XSS、CSRF、缓冲区溢出，防御需要输入校验、参数化查询、输出编码等。"},
+        ],
+        "key_points": ["机密性、完整性、可用性是信息安全三要素", "对称加密速度快，非对称加密便于密钥分发", "TLS 为网络通信提供加密和身份认证", "输入校验是防御注入攻击的第一道防线", "最小权限原则限制攻击面"],
+        "glossary": [
+            {"term": "加密", "explanation": "将明文转换为密文的过程，需密钥才能解密。"},
+            {"term": "哈希", "explanation": "将任意数据映射为固定长度的摘要，不可逆。"},
+            {"term": "XSS", "explanation": "跨站脚本攻击，向网页注入恶意脚本窃取信息。"},
+            {"term": "防火墙", "explanation": "按规则过滤进出网络流量的安全设备。"},
+            {"term": "零信任", "explanation": "默认不信任任何网络内外实体，持续验证的安全模型。"},
+        ],
+        "examples": ["HTTPS 使用 TLS 加密 HTTP 流量，防止中间人攻击。", "SQL 注入可通过参数化查询有效防御。"],
+        "review_questions": ["对称加密和非对称加密各有什么优缺点？", "如何防御 XSS 攻击？", "TLS 握手的基本过程是什么？"],
+    },
+    "分布式系统": {
+        "overview": "分布式系统由多台独立计算机通过网络协作，对外表现为一个统一系统。核心挑战包括一致性、可用性、分区容错、共识算法和分布式事务。",
+        "sections": [
+            {"heading": "CAP 定理", "content": "在存在网络分区的情况下，分布式系统只能在一致性（Consistency）和可用性（Availability）之间二选一，分区容错（Partition tolerance）是必须的。"},
+            {"heading": "一致性算法", "content": "Paxos 和 Raft 是经典共识算法，保证分布式节点就某个值达成一致；ZooKeeper 和 etcd 常用于分布式协调。"},
+            {"heading": "分布式架构", "content": "微服务将应用拆分为独立可部署的服务；消息队列解耦生产者和消费者；负载均衡分发请求到多节点。"},
+        ],
+        "key_points": ["CAP 定理中分区容错是必需的", "Raft 比 Paxos 更易理解和实现", "微服务提升独立部署能力但增加运维复杂度", "幂等性确保重复请求不产生副作用", "最终一致性放松强一致性以提升性能"],
+        "glossary": [
+            {"term": "CAP", "explanation": "一致性、可用性、分区容错三者不可兼得的定理。"},
+            {"term": "Raft", "explanation": "通过领导者选举和日志复制达成共识的算法。"},
+            {"term": "微服务", "explanation": "将应用拆分为小型、独立部署的服务的架构风格。"},
+            {"term": "消息队列", "explanation": "异步传递消息的中间件，解耦生产者和消费者。"},
+            {"term": "幂等性", "explanation": "操作执行多次与执行一次效果相同。"},
+        ],
+        "examples": ["电商系统用消息队列异步处理订单，提升系统吞吐。", "Redis Sentinel 通过选举机制实现高可用。"],
+        "review_questions": ["CAP 定理对分布式系统设计有什么指导意义？", "Raft 如何保证日志一致性？", "微服务和单体架构各有什么优缺点？"],
+    },
 }
 
 FALLBACK_SUMMARIES = {topic: data["overview"] for topic, data in FALLBACK_KNOWLEDGE.items()}
+
+
+# ── 备用数据源 ──
+
+EN_WIKIPEDIA_REST = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+
+
+def _fetch_english_wikipedia(topic: str) -> dict[str, Any] | None:
+    """Try fetching from English Wikipedia when Chinese fails."""
+    alias = TOPIC_ALIASES.get(topic, topic.replace(" ", "_"))
+    try:
+        payload = _get_json(EN_WIKIPEDIA_REST + urllib.parse.quote(alias, safe=""))
+        extract = str(payload.get("extract") or "")
+        if not extract or len(extract) < 60:
+            return None
+        page_url = ((payload.get("content_urls") or {}).get("desktop") or {}).get("page", "")
+        return {
+            "extract": extract,
+            "url": str(page_url),
+            "title": str(payload.get("title", alias)),
+        }
+    except (OSError, urllib.error.HTTPError, json.JSONDecodeError, KeyError):
+        return None
+
+
+# ── 内容验证 ──
+
+
+def _verify_card_content(card: dict[str, Any]) -> bool:
+    """Verify that a knowledge card contains valid, meaningful content.
+
+    Returns True if content passes quality checks, False otherwise.
+    """
+    overview = str(card.get("overview", ""))
+    key_points = card.get("key_points") or []
+
+    # Overview must have minimum length (60 chars is ~2 substantial Chinese sentences)
+    if len(overview) < 60:
+        return False
+
+    # Must have at least 3 non-empty key points
+    valid_points = [p for p in key_points if isinstance(p, str) and len(p.strip()) >= 4]
+    if len(valid_points) < 3:
+        return False
+
+    # Overview should contain the topic or related concepts
+    topic = str(card.get("topic", ""))
+    source_name = str(card.get("source_name", ""))
+    is_english_source = "(en)" in source_name or "decomposed" in source_name
+    if not is_english_source:
+        # Basic relevance: check if topic characters appear in overview
+        topic_chars = set(topic.replace(" ", ""))
+        overview_chars = set(overview)
+        overlap = topic_chars & overview_chars
+        if len(overlap) < 2 and len(topic) >= 2:
+            return False
+
+    # For Chinese topics from Chinese sources, verify overview has Chinese content
+    if topic and any('一' <= c <= '鿿' for c in topic):
+        chinese_chars = sum(1 for c in overview if '一' <= c <= '鿿')
+        # Skip Chinese check for English Wikipedia sources
+        if chinese_chars < 20 and source_name == "Wikipedia":
+            return False
+
+    return True
+
+
+def _cross_validate_card(card: dict[str, Any]) -> dict[str, Any]:
+    """Cross-validate card content against fallback data.
+
+    Returns the card with an added validation note if discrepancies found.
+    """
+    topic = str(card.get("topic", ""))
+    fallback = FALLBACK_KNOWLEDGE.get(topic)
+    if not fallback:
+        return card
+
+    fb_key_points = set(str(p).strip() for p in fallback.get("key_points", []))
+    card_key_points = set(str(p).strip() for p in card.get("key_points", []))
+
+    # Calculate overlap ratio
+    if fb_key_points and card_key_points:
+        overlap = sum(1 for cp in card_key_points if any(
+            _text_overlap(cp, fp) > 0.3 for fp in fb_key_points
+        ))
+        overlap_ratio = overlap / max(len(card_key_points), 1)
+        if overlap_ratio < 0.2:
+            card["encoding_status"] = "low_confidence"
+            card["validation_note"] = "来源内容与知识库参考数据重叠率低"
+
+    return card
+
+
+def _text_overlap(text_a: str, text_b: str) -> float:
+    """Simple character-level overlap ratio between two strings."""
+    if not text_a or not text_b:
+        return 0.0
+    chars_a = set(text_a)
+    chars_b = set(text_b)
+    intersection = chars_a & chars_b
+    return len(intersection) / max(len(chars_a), 1)
+
+
+# ── 分解查询 ──
+
+
+def _assemble_from_parts(topic: str, sub_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Assemble a knowledge card from sub-topic query results."""
+    fallback = FALLBACK_KNOWLEDGE.get(topic, _generic_fallback(topic))
+
+    # Collect overviews from successful sub-results
+    overviews = []
+    all_key_points: list[str] = []
+    sections: list[dict[str, str]] = []
+    examples: list[str] = []
+
+    for sub in sub_results:
+        ov = str(sub.get("overview", ""))
+        if len(ov) >= 30:
+            overviews.append(ov)
+        for kp in sub.get("key_points") or []:
+            if str(kp) not in all_key_points:
+                all_key_points.append(str(kp))
+        for sec in sub.get("sections") or []:
+            if isinstance(sec, dict):
+                sections.append(sec)
+
+    # Assemble overview from sub-overviews
+    if overviews:
+        overview = f"{topic}涵盖多个核心领域。{'；'.join(overviews[:4])}"
+        if len(overview) > 520:
+            overview = overview[:517] + "..."
+    else:
+        overview = fallback["overview"]
+
+    # Merge key points (prefer extracted, fill gaps with fallback)
+    key_points = all_key_points[:8]
+    if len(key_points) < 5:
+        for kp in fallback.get("key_points", []):
+            if kp not in key_points:
+                key_points.append(kp)
+            if len(key_points) >= 6:
+                break
+
+    # Build sections from sub-topics
+    if not sections:
+        sections = fallback.get("sections", [])
+
+    # Use fallback for review questions and glossary
+    glossary = fallback.get("glossary", [])
+    review_questions = fallback.get("review_questions", [])
+    examples_list = fallback.get("examples", [])
+
+    source_url = sub_results[0].get("source_url", "") if sub_results else ""
+
+    return {
+        "id": _card_id(topic),
+        "topic": topic,
+        "title": topic,
+        "source": source_url,
+        "source_name": "Wikipedia (decomposed)",
+        "source_url": source_url,
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "offline": False,
+        "encoding_status": "ok",
+        "overview": _clip(overview, 520),
+        "summary": _clip(overview, 520),
+        "sections": sections[:6],
+        "key_points": key_points[:8],
+        "glossary": glossary,
+        "examples": examples_list,
+        "review_questions": review_questions,
+        "raw_excerpt": overview[:1200],
+    }
+
+
+def _fetch_decomposed_topic(topic: str) -> dict[str, Any] | None:
+    """Try to fetch a topic by decomposing it into sub-topics and assembling results."""
+    sub_topics = TOPIC_DECOMPOSITION.get(topic, [])
+    if not sub_topics:
+        return None
+
+    sub_results: list[dict[str, Any]] = []
+    for sub_topic in sub_topics[:6]:  # Limit to 6 sub-queries
+        try:
+            card = fetch_wikipedia_summary(sub_topic)
+            if not card.get("offline") and _verify_card_content(card):
+                sub_results.append(card)
+        except Exception:
+            continue
+
+    if not sub_results:
+        return None
+
+    assembled = _assemble_from_parts(topic, sub_results)
+    if _verify_card_content(assembled):
+        assembled = _cross_validate_card(assembled)
+        return assembled
+
+    return None
 
 
 def load_knowledge() -> list[dict[str, Any]]:
@@ -156,13 +461,33 @@ def fetch_wikipedia_summary(topic: str) -> dict[str, Any]:
     title = normalize_zh_text(topic)
     try:
         page = _fetch_mediawiki_extract(title)
-        return build_knowledge_card(title, page["extract"], page["url"], offline=False, source="Wikipedia")
+        card = build_knowledge_card(title, page["extract"], page["url"], offline=False, source="Wikipedia")
+        if _verify_card_content(card):
+            return _cross_validate_card(card)
     except (OSError, urllib.error.HTTPError, json.JSONDecodeError, UnicodeDecodeError, KeyError):
-        try:
-            page = _fetch_rest_summary(title)
-            return build_knowledge_card(title, page["extract"], page["url"], offline=False, source="Wikipedia")
-        except (OSError, urllib.error.HTTPError, json.JSONDecodeError, UnicodeDecodeError, KeyError):
-            return _fallback_card(title)
+        pass
+
+    try:
+        page = _fetch_rest_summary(title)
+        card = build_knowledge_card(title, page["extract"], page["url"], offline=False, source="Wikipedia")
+        if _verify_card_content(card):
+            return _cross_validate_card(card)
+    except (OSError, urllib.error.HTTPError, json.JSONDecodeError, UnicodeDecodeError, KeyError):
+        pass
+
+    # 尝试英文 Wikipedia
+    en_page = _fetch_english_wikipedia(topic)
+    if en_page:
+        card = build_knowledge_card(title, en_page["extract"], en_page["url"], offline=False, source="Wikipedia (en)")
+        if _verify_card_content(card):
+            return _cross_validate_card(card)
+
+    # 分解查询
+    decomposed = _fetch_decomposed_topic(topic)
+    if decomposed:
+        return decomposed
+
+    return _fallback_card(title)
 
 
 def build_knowledge_card(topic: str, raw_text: str, source_url: str, offline: bool, source: str = "Wikipedia") -> dict[str, Any]:

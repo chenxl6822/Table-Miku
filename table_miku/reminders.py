@@ -6,6 +6,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .assistant_data import load_timetable
+from .knowledge_review import due_review_items, review_summary
 from .pomodoro import pomodoro_tick
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings
@@ -35,6 +36,9 @@ class ReminderManager(QObject):
         today_courses = self._today_course_lines()
         if today_courses:
             next_tip += "\n今日课程：" + "；".join(today_courses[:3])
+        review_line = review_summary()
+        if review_line:
+            next_tip += "\n" + review_line.replace("知识复习：", "")
         if tasks:
             self.reminder.emit("今天的学习雷达启动：\n" + "\n".join(tasks[:2]) + next_tip)
 
@@ -62,6 +66,12 @@ class ReminderManager(QObject):
         if course_message:
             save_settings(settings)
             self.reminder.emit(course_message)
+            return
+
+        review_message = self._review_due_message(settings, now)
+        if review_message:
+            save_settings(settings)
+            self.reminder.emit(review_message)
             return
 
         interval = int(settings.get("reminder_interval_minutes", 60))
@@ -163,6 +173,26 @@ class ReminderManager(QObject):
                 fallback[section] = normalized
         fallback.update(slots)
         return fallback
+
+    @staticmethod
+    def _review_due_message(settings: dict[str, Any], now: datetime) -> str:
+        """Check for due knowledge reviews, with daily dedup to avoid spam."""
+        review_settings = settings.get("knowledge_review", {})
+        if not review_settings.get("enabled", True):
+            return ""
+        today_key = now.date().isoformat()
+        fired = settings.setdefault("fired_review_reminders", {})
+        if today_key in fired:
+            return ""
+        due = due_review_items(now)
+        if not due:
+            return ""
+        count = len(due)
+        fired[today_key] = True
+        for k in list(fired.keys()):
+            if k != today_key:
+                fired.pop(k, None)
+        return f"今天有 {count} 张知识卡片该复习了，先看一张最短的吧。"
 
     @staticmethod
     def _today_course_lines() -> list[str]:

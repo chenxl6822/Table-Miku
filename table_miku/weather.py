@@ -17,17 +17,45 @@ WMO_DESCRIPTIONS = {
     51: "小毛毛雨",
     53: "毛毛雨",
     55: "较强毛毛雨",
+    56: "冻毛毛雨（小）",
+    57: "冻毛毛雨（较强）",
     61: "小雨",
     63: "中雨",
     65: "大雨",
+    66: "冻雨（小）",
+    67: "冻雨（较强）",
     71: "小雪",
     73: "中雪",
     75: "大雪",
+    77: "雪粒",
     80: "阵雨",
     81: "较强阵雨",
     82: "强阵雨",
+    85: "小雪阵雨",
+    86: "大雪阵雨",
     95: "雷雨",
+    96: "雷暴伴小冰雹",
+    99: "雷暴伴大冰雹",
 }
+
+
+def _weather_severity(code: int) -> str:
+    """Return severity label for a WMO weather code."""
+    light = {51, 56, 61, 66, 71, 77, 80, 85}
+    moderate = {53, 63, 73, 81}
+    heavy = {55, 57, 65, 67, 75, 82, 86, 95, 96, 99}
+    if code in light:
+        return "轻度"
+    if code in moderate:
+        return "中等"
+    if code in heavy:
+        return "较强"
+    # Freezing drizzle codes
+    if code == 56:
+        return "轻度"
+    if code == 57:
+        return "较强"
+    return ""
 
 PROVINCE_ALIASES = {
     "安徽": "安徽省",
@@ -80,16 +108,38 @@ def _get_json(url: str, timeout: float = 8.0) -> Any:
 def get_weather(location_text: str = "雨湖区,湘潭,湖南") -> str:
     requested = (location_text or "雨湖区,湘潭,湖南").strip()
     location = resolve_location(requested)
-    weather = fetch_open_meteo(location["latitude"], location["longitude"])
+    weather = fetch_open_meteo(location["latitude"], location["longitude"], include_daily=True)
     current = weather.get("current") or {}
+    daily = weather.get("daily") or {}
 
-    description = WMO_DESCRIPTIONS.get(current.get("weather_code"), "天气情况未知")
-    source_note = "IP 自动定位可能受 VPN/代理影响，建议填写“区县,城市,省份”。" if location.get("source") == "ip" else "位置由真实地理库解析。"
-    return (
+    code = current.get("weather_code")
+    severity = _weather_severity(code) if code is not None else ""
+    description = WMO_DESCRIPTIONS.get(code, "天气情况未知")
+    if severity:
+        description = severity + description
+    source_note = "IP 自动定位可能受 VPN/代理影响，建议填写'区县,城市,省份'。" if location.get("source") == "ip" else "位置由真实地理库解析。"
+
+    trend = analyze_weather_trend(daily) if daily else ""
+
+    parts: list[str] = []
+    lines: list[str] = []
+    lines.append(
         f"{location['display_name']}：现在{description}，{current.get('temperature_2m')}°C，"
         f"体感 {current.get('apparent_temperature')}°C，湿度 {current.get('relative_humidity_2m')}%，"
-        f"风速 {current.get('wind_speed_10m')} km/h。\n{source_note}"
+        f"风速 {current.get('wind_speed_10m')} km/h。"
     )
+
+    # Add daily temperature range if available
+    daily_temp_max = daily.get("temperature_2m_max", [])
+    daily_temp_min = daily.get("temperature_2m_min", [])
+    if len(daily_temp_max) > 0 and len(daily_temp_min) > 0:
+        lines.append(f"今日温度范围 {daily_temp_min[0]}°C ~ {daily_temp_max[0]}°C。")
+
+    if trend:
+        lines.append(trend)
+
+    lines.append(source_note)
+    return "\n".join(lines)
 
 
 def resolve_location(location_text: str) -> dict[str, Any]:
@@ -110,7 +160,7 @@ def resolve_location(location_text: str) -> dict[str, Any]:
         return location
 
     hint = format_components(components)
-    raise RuntimeError(f"没有找到「{hint}」的地理位置，请尝试输入“区县,城市,省份”，例如“雨湖区,湘潭,湖南”。")
+    raise RuntimeError(f"没有找到「{hint}」的地理位置，请尝试输入'区县,城市,省份'，例如'雨湖区,湘潭,湖南'。")
 
 
 def parse_china_location(text: str) -> dict[str, str | None]:
@@ -233,16 +283,75 @@ def geocode_with_open_meteo(components: dict[str, str | None]) -> dict[str, Any]
     }
 
 
-def fetch_open_meteo(latitude: float, longitude: float) -> dict[str, Any]:
-    weather_query = urllib.parse.urlencode(
-        {
-            "latitude": latitude,
-            "longitude": longitude,
-            "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m",
-            "timezone": "auto",
-        }
-    )
+def fetch_open_meteo(latitude: float, longitude: float, include_daily: bool = False) -> dict[str, Any]:
+    current_params = "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m"
+    params: dict[str, Any] = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": current_params,
+        "timezone": "auto",
+    }
+    if include_daily:
+        params["daily"] = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        params["forecast_days"] = 3
+    weather_query = urllib.parse.urlencode(params)
     return _get_json(f"https://api.open-meteo.com/v1/forecast?{weather_query}")
+
+
+def analyze_weather_trend(daily_data: dict[str, Any]) -> str:
+    """Return a Chinese-language trend summary based on daily forecast data."""
+    if not daily_data:
+        return ""
+    time_list = daily_data.get("time", [])
+    code_list = daily_data.get("weather_code", [])
+    precip_list = daily_data.get("precipitation_probability_max", [])
+    temp_max_list = daily_data.get("temperature_2m_max", [])
+    temp_min_list = daily_data.get("temperature_2m_min", [])
+
+    if len(time_list) < 2 or len(code_list) < 2:
+        return ""
+
+    parts: list[str] = []
+
+    # Today vs tomorrow weather code change
+    today_code = code_list[0] if isinstance(code_list[0], int) else 0
+    tomorrow_code = code_list[1] if isinstance(code_list[1], int) else 0
+    today_precip = precip_list[0] if len(precip_list) > 0 else 0
+    tomorrow_precip = precip_list[1] if len(precip_list) > 1 else 0
+
+    # Rain coming or going
+    if tomorrow_code in range(51, 100) and today_code not in range(51, 100):
+        parts.append("明天可能有降水，记得带伞")
+    if tomorrow_precip >= 50 and today_precip < 30:
+        parts.append("明天降雨概率较高")
+    if today_code in range(51, 100) and tomorrow_code not in range(51, 100):
+        parts.append("今天降水预计明天转好")
+
+    # Thunderstorm warning
+    if tomorrow_code in (95, 96, 99):
+        parts.append("明天可能有雷暴天气")
+
+    # Temperature trend
+    if len(temp_max_list) >= 2 and len(temp_min_list) >= 2:
+        today_high = temp_max_list[0]
+        tomorrow_high = temp_max_list[1]
+        today_low = temp_min_list[0]
+        tomorrow_low = temp_min_list[1]
+        if tomorrow_high - today_high >= 5:
+            parts.append(f"明天明显升温，最高 {tomorrow_high}°C")
+        elif today_high - tomorrow_high >= 5:
+            parts.append(f"明天明显降温，最高 {tomorrow_high}°C")
+        if tomorrow_low <= 0 and today_low > 0:
+            parts.append("明天最低温降至零度以下，注意防冻")
+
+    # Day-after-tomorrow glance
+    if len(code_list) >= 3:
+        day3_code = code_list[2] if isinstance(code_list[2], int) else 0
+        day3_desc = WMO_DESCRIPTIONS.get(day3_code, "")
+        if day3_desc and day3_code != tomorrow_code:
+            parts.append(f"后天（{time_list[2]}）：{day3_desc}")
+
+    return "；".join(parts) if parts else ""
 
 
 def detect_ip_location() -> dict[str, Any]:

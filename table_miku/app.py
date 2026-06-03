@@ -8,7 +8,7 @@ import textwrap
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Q_ARG, QEasingCurve, QMetaObject, QPoint, QPropertyAnimation, QUrl, Qt, QTimer, Signal
+from PySide6.QtCore import Q_ARG, QEasingCurve, QMetaObject, QPoint, QUrl, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import (
@@ -16,10 +16,11 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
-    QGraphicsOpacityEffect,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QMenu,
+    QPushButton,
     QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
@@ -42,6 +43,7 @@ from .assistant_data import (
 from .assistant_core import PersonalAssistant
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import format_knowledge, load_knowledge, refresh_computer_knowledge
+from .knowledge_review import due_review_items, record_review, review_summary
 from .paths import PROJECT_ROOT, asset_path, qml_path
 from .pomodoro import pomodoro_status, start_pomodoro, stop_pomodoro
 from .planner import add_goal, ensure_goal_plans, today_tasks
@@ -328,6 +330,250 @@ class BubbleDetailDialog(QDialog):
         self._content_area.setPlainText(content)
 
 
+class ReviewDialog(QDialog):
+    """今日复习 — 显示到期知识卡片并提供掌握/模糊/不会反馈按钮"""
+
+    def __init__(self, items: list[dict], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._items = items
+        self._index = 0
+        self._showing_answer = False
+        self._last_result = ""
+        self.setWindowTitle("今日复习")
+        self.setWindowIcon(QIcon(str(export_menu_icon())))
+        self.resize(520, 560)
+        self.setStyleSheet(DIALOG_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        self._title_label = QLabel()
+        self._title_label.setObjectName("dialogTitle")
+        self._title_label.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
+        self._title_label.setStyleSheet("color: #27385f;")
+        layout.addWidget(self._title_label)
+
+        self._content_area = QTextEdit(self)
+        self._content_area.setReadOnly(True)
+        self._content_area.setFont(QFont("Microsoft YaHei UI", 10))
+        layout.addWidget(self._content_area)
+
+        btn_layout = QVBoxLayout()
+        btn_layout.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        self._known_btn = QPushButton("✓ 掌握")
+        self._fuzzy_btn = QPushButton("~ 模糊")
+        self._forgotten_btn = QPushButton("✗ 不会")
+        self._known_btn.setStyleSheet("QPushButton { color: #1b8c5e; font-weight: bold; } QPushButton:hover { background: #e0f7ec; }")
+        self._fuzzy_btn.setStyleSheet("QPushButton { color: #c78a1c; font-weight: bold; } QPushButton:hover { background: #fff8e6; }")
+        self._forgotten_btn.setStyleSheet("QPushButton { color: #c74242; font-weight: bold; } QPushButton:hover { background: #ffeaea; }")
+        self._known_btn.clicked.connect(lambda: self._answer("known"))
+        self._fuzzy_btn.clicked.connect(lambda: self._answer("fuzzy"))
+        self._forgotten_btn.clicked.connect(lambda: self._answer("forgotten"))
+        row1.addWidget(self._known_btn)
+        row1.addWidget(self._fuzzy_btn)
+        row1.addWidget(self._forgotten_btn)
+
+        self._next_btn = QPushButton("下一张 →")
+        self._next_btn.setStyleSheet("QPushButton { color: #27385f; font-weight: bold; min-width: 120px; } QPushButton:hover { background: #e9fbff; border-color: #7fd9e9; }")
+        self._next_btn.clicked.connect(self._go_next)
+        self._next_btn.hide()
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        row2 = QHBoxLayout()
+        row2.addWidget(self._next_btn)
+        row2.addStretch()
+        row2.addWidget(close_btn)
+
+        btn_layout.addLayout(row1)
+        btn_layout.addLayout(row2)
+        layout.addLayout(btn_layout)
+
+        self._show_current()
+
+    def _show_current(self) -> None:
+        self._showing_answer = False
+        self._known_btn.setEnabled(True)
+        self._fuzzy_btn.setEnabled(True)
+        self._forgotten_btn.setEnabled(True)
+        self._next_btn.hide()
+
+        if self._index >= len(self._items):
+            self._title_label.setText("今日复习 ✓")
+            self._content_area.setPlainText("今天到期的知识卡片已全部复习完毕！\n\nMiku 给你点赞~ 继续保持这个节奏。")
+            self._known_btn.setEnabled(False)
+            self._fuzzy_btn.setEnabled(False)
+            self._forgotten_btn.setEnabled(False)
+            return
+
+        item = self._items[self._index]
+        card = item["card"]
+        state = item["state"]
+        text = self._format_card(card, state)
+        self._title_label.setText(f"今日复习 ({self._index + 1}/{len(self._items)})")
+        self._content_area.setPlainText(text)
+
+    @staticmethod
+    def _format_card(card: dict, state: dict) -> str:
+        parts = [
+            f"主题：{card.get('topic', card.get('title', '未知'))}",
+            f"掌握度：{state.get('mastery', 0):.0%}  |  复习次数：{state.get('review_count', 0)}",
+            f"来源：{card.get('source_name', '未知')}",
+            "",
+            f"{card.get('overview', card.get('summary', ''))}",
+        ]
+
+        sections = card.get("sections") or []
+        if sections:
+            parts.append("")
+            for section in sections[:4]:
+                heading = section.get("heading", "小节") if isinstance(section, dict) else "小节"
+                content = section.get("content", "") if isinstance(section, dict) else str(section)
+                parts.append(f"■ {heading}：{content}")
+
+        key_points = card.get("key_points") or []
+        if key_points:
+            parts.append("\n关键点：")
+            parts.extend(f"  • {p}" for p in key_points[:8])
+
+        glossary = card.get("glossary") or []
+        if glossary:
+            parts.append("\n术语：")
+            for g in glossary[:5]:
+                if isinstance(g, dict):
+                    parts.append(f"  {g.get('term')}：{g.get('explanation')}")
+
+        examples = card.get("examples") or []
+        if examples:
+            parts.append("\n例子：")
+            for e in examples[:2]:
+                parts.append(f"  • {e}")
+
+        questions = card.get("review_questions") or []
+        if questions:
+            parts.append("\n复习问题：")
+            for q in questions[:5]:
+                parts.append(f"  ❓ {q}")
+
+        return "\n".join(parts)
+
+    def _answer(self, result: str) -> None:
+        if self._index >= len(self._items):
+            return
+        item = self._items[self._index]
+        card_id = item["card"].get("id", "")
+        topic = item["card"].get("topic", "未知")
+        labels = {"known": "掌握", "fuzzy": "模糊", "forgotten": "不会"}
+
+        # Walk up to find TableMiku parent for say()
+        miku_parent = self.parent()
+        while miku_parent is not None and not hasattr(miku_parent, 'say'):
+            miku_parent = miku_parent.parent()
+
+        if card_id:
+            updated = record_review(card_id, result)
+            if updated and miku_parent and hasattr(miku_parent, 'say'):
+                next_at = updated.get("next_review_at", "")
+                try:
+                    next_dt = datetime.fromisoformat(next_at)
+                    next_str = next_dt.strftime("%m月%d日 %H:%M")
+                except (TypeError, ValueError):
+                    next_str = next_at
+                miku_parent.say(f"{topic}：标记为「{labels[result]}」。下次复习：{next_str}。")
+
+        # 先展示答案卡片，而不是直接跳到下一张
+        self._showing_answer = True
+        self._last_result = result
+        self._show_answer_card(result)
+
+    def _show_answer_card(self, result: str) -> None:
+        """Show the answer/review card after user gives feedback."""
+        if self._index >= len(self._items):
+            return
+        item = self._items[self._index]
+        card = item["card"]
+        labels = {"known": "掌握", "fuzzy": "模糊", "forgotten": "不会"}
+        emoji = {"known": "✅", "fuzzy": "🔶", "forgotten": "❌"}
+
+        parts = [f"你选择了：{emoji.get(result, '')} {labels.get(result, result)}", ""]
+
+        # 核心概念
+        parts.append("📚 核心概念")
+        parts.append(card.get("overview", card.get("summary", "")))
+        parts.append("")
+
+        key_points = card.get("key_points") or []
+        if key_points:
+            parts.append("关键要点：")
+            parts.extend(f"  • {p}" for p in key_points[:6])
+            parts.append("")
+
+        # 应用场景
+        parts.append("🔧 应用场景")
+        sections = card.get("sections") or []
+        if sections:
+            for section in sections[:3]:
+                heading = section.get("heading", "") if isinstance(section, dict) else ""
+                content = section.get("content", "") if isinstance(section, dict) else str(section)
+                if heading and content:
+                    parts.append(f"  {heading}：{content}")
+
+        examples = card.get("examples") or []
+        if examples:
+            parts.append("")
+            for e in examples[:2]:
+                parts.append(f"  例：{e}")
+        parts.append("")
+
+        # 来源
+        parts.append("📖 来源")
+        source_name = card.get("source_name", "未知")
+        source_url = card.get("source_url") or card.get("source", "")
+        parts.append(f"  {source_name}")
+        if source_url:
+            parts.append(f"  {source_url}")
+        parts.append("")
+
+        # 复习提示
+        if result == "forgotten":
+            parts.append("💡 提示：这张卡片标记为「不会」，1 小时后会再次出现，建议重点回顾。")
+        elif result == "fuzzy":
+            parts.append("💡 提示：这张卡片标记为「模糊」，会按当前间隔再次安排复习。")
+
+        self._title_label.setText(f"今日复习 ({self._index + 1}/{len(self._items)}) — 答案")
+        self._content_area.setPlainText("\n".join(parts))
+
+        # 禁用反馈按钮，显示下一张按钮
+        self._known_btn.setEnabled(False)
+        self._fuzzy_btn.setEnabled(False)
+        self._forgotten_btn.setEnabled(False)
+        # 高亮用户选择
+        selected_btn = {"known": self._known_btn, "fuzzy": self._fuzzy_btn, "forgotten": self._forgotten_btn}.get(result)
+        if selected_btn:
+            selected_btn.setStyleSheet(
+                "QPushButton { color: #fff; font-weight: bold; background: #43d9f5; border: 2px solid #2ab8d4; border-radius: 8px; padding: 6px 12px; }"
+            )
+        self._next_btn.show()
+
+    def _go_next(self) -> None:
+        """Move to the next review card."""
+        self._showing_answer = False
+        # Reset selected button style
+        for btn in (self._known_btn, self._fuzzy_btn, self._forgotten_btn):
+            if "background: #43d9f5" in (btn.styleSheet() or ""):
+                if btn is self._known_btn:
+                    btn.setStyleSheet("QPushButton { color: #1b8c5e; font-weight: bold; } QPushButton:hover { background: #e0f7ec; }")
+                elif btn is self._fuzzy_btn:
+                    btn.setStyleSheet("QPushButton { color: #c78a1c; font-weight: bold; } QPushButton:hover { background: #fff8e6; }")
+                else:
+                    btn.setStyleSheet("QPushButton { color: #c74242; font-weight: bold; } QPushButton:hover { background: #ffeaea; }")
+        self._index += 1
+        self._show_current()
+
+
 def _deepseek_key_exists() -> bool:
     import os
 
@@ -379,41 +625,6 @@ class TableMiku(QWidget):
             lambda x, y: self.show_context_menu(QPoint(int(x), int(y)))
         )
 
-        self.bubble = QLabel(self)
-        self.bubble.setWordWrap(True)
-        self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.bubble.setGeometry(10, 8, 300, 86)
-        self.bubble.setFont(QFont("Microsoft YaHei UI", 9))
-        self.bubble.setStyleSheet(
-            """
-            QLabel {
-                background: rgba(255, 255, 255, 246);
-                border: 1px solid rgba(80, 101, 138, 210);
-                border-radius: 22px;
-                color: #263553;
-                padding: 11px 14px;
-                line-height: 150%;
-            }
-            """
-        )
-        self.bubble_effect = QGraphicsOpacityEffect(self.bubble)
-        self.bubble_effect.setOpacity(0.0)
-        self.bubble.setGraphicsEffect(self.bubble_effect)
-        self.bubble_animation = QPropertyAnimation(self.bubble_effect, b"opacity", self)
-        self.bubble_animation.setDuration(180)
-        self.bubble_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.bubble_animation.finished.connect(self._finish_bubble_animation)
-        self._bubble_hiding = False
-        self.bubble.hide()
-        self.bubble.raise_()
-
-        # 点击气泡暂停/继续计时
-        self.bubble.mousePressEvent = self._on_bubble_clicked
-
-        self.hide_timer = QTimer(self)
-        self.hide_timer.setSingleShot(True)
-        self.hide_timer.timeout.connect(self._hide_bubble)
-
         self.reminders = ReminderManager(self)
         self.reminders.reminder.connect(self.say)
         self.reminders.start()
@@ -448,14 +659,16 @@ class TableMiku(QWidget):
         menu.setFont(QFont("Microsoft YaHei UI", 9))
         menu.setStyleSheet(MENU_STYLE)
         show_action = QAction("显示/隐藏 Miku", self)
+        review_action = QAction("今日复习", self)
         brief_action = QAction("生成助手简报", self)
         pomodoro_action = QAction("开始番茄钟", self)
         quit_action = QAction("关闭 Miku", self)
         show_action.triggered.connect(self.toggle_visible)
+        review_action.triggered.connect(self.show_due_reviews)
         brief_action.triggered.connect(self.show_assistant_brief)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
         quit_action.triggered.connect(QApplication.instance().quit)
-        for action in (show_action, brief_action, pomodoro_action):
+        for action in (show_action, review_action, brief_action, pomodoro_action):
             menu.addAction(action)
         menu.addSeparator()
         menu.addAction(quit_action)
@@ -480,30 +693,8 @@ class TableMiku(QWidget):
         seconds = self._bubble_duration(text)
         bubble_text = self._bubble_text(text)
 
-        # 重置气泡样式为默认（非暂停状态）
-        self.bubble.setStyleSheet(
-            """
-            QLabel {
-                background: rgba(255, 255, 255, 246);
-                border: 1px solid rgba(80, 101, 138, 210);
-                border-radius: 22px;
-                color: #263553;
-                padding: 11px 14px;
-            }
-            """
-        )
-
-        # 显示 QML 气泡
+        # 显示 QML 气泡（自带淡入/淡出动画和点击暂停交互）
         self.pet.show_bubble(bubble_text, seconds)
-
-        # 显示 Python 气泡用于点击交互，并启动隐藏计时器
-        self.bubble.setText(bubble_text)
-        self._bubble_hiding = False
-        self.bubble_effect.setOpacity(1.0)
-        self.bubble_animation.stop()
-        self.bubble.show()
-        self.bubble.raise_()
-        self.hide_timer.start(seconds * 1000)
 
         # 长文本：延迟弹出详情窗口
         if len(text) > 120:
@@ -515,47 +706,6 @@ class TableMiku(QWidget):
         self._detail_dialog.set_text(text)
         self._detail_dialog.show()
         self._detail_dialog.raise_()
-
-    def _hide_bubble(self) -> None:
-        self._bubble_hiding = True
-        self.bubble_animation.stop()
-        self.bubble_animation.setStartValue(self.bubble_effect.opacity())
-        self.bubble_animation.setEndValue(0.0)
-        self.bubble_animation.start()
-
-    def _finish_bubble_animation(self) -> None:
-        if self._bubble_hiding:
-            self.bubble.hide()
-
-    def _on_bubble_clicked(self, event) -> None:
-        """点击气泡：暂停/继续隐藏计时"""
-        if self.hide_timer.isActive():
-            self.hide_timer.stop()
-            self.bubble.setStyleSheet(
-                """
-                QLabel {
-                    background: rgba(255, 255, 255, 246);
-                    border: 2px solid #43d9f5;
-                    border-radius: 22px;
-                    color: #263553;
-                    padding: 11px 14px;
-                }
-                """
-            )  # 蓝色边框表示已暂停
-        else:
-            self.bubble.setStyleSheet(
-                """
-                QLabel {
-                    background: rgba(255, 255, 255, 246);
-                    border: 1px solid rgba(80, 101, 138, 210);
-                    border-radius: 22px;
-                    color: #263553;
-                    padding: 11px 14px;
-                }
-                """
-            )  # 恢复默认边框
-            self._hide_bubble()
-        super(QLabel, self.bubble).mousePressEvent(event)
 
     @staticmethod
     def _bubble_text(text: str) -> str:
@@ -676,10 +826,14 @@ class TableMiku(QWidget):
         toggle_action.triggered.connect(self.toggle_reminders)
         quit_action.triggered.connect(QApplication.instance().quit)
 
+        review_action = QAction("今日复习", self)
+        review_action.triggered.connect(self.show_due_reviews)
+
         # ── 子菜单 1：📖 学习 ──
         study_menu = QMenu("📖 学习", menu)
         study_menu.setStyleSheet(MENU_STYLE)
         study_menu.addAction(today_action)
+        study_menu.addAction(review_action)
         study_menu.addAction(add_goal_action)
         study_menu.addAction(schedule_action)
         study_menu.addAction(view_timetable_action)
@@ -891,6 +1045,19 @@ class TableMiku(QWidget):
         self.pet.set_expression("focus")
         self.say("我在整理今日任务、电脑状态和最近事件。")
         self.assistant.brief_now()
+        # 简报在后台线程生成，延迟弹出对话框显示完整内容
+        QTimer.singleShot(2000, self._show_brief_dialog)
+
+    def _show_brief_dialog(self) -> None:
+        report = getattr(self.assistant, '_last_brief_report', '')
+        if not report:
+            report = self.assistant._last_brief_report if hasattr(self.assistant, '_last_brief_report') else ''
+        if not report:
+            self.say("简报还在生成中，请稍后再试。")
+            return
+        dialog = TaskDialog(report, self)
+        dialog.setWindowTitle("助手简报")
+        dialog.exec()
 
     def watch_command(self) -> None:
         dialog = TextInputDialog(
@@ -924,6 +1091,17 @@ class TableMiku(QWidget):
             self.assistant.ai_plan_now()
         else:
             self.say("AI 助理已关闭，本地提醒和番茄钟仍会继续运行。")
+
+    def show_due_reviews(self) -> None:
+        """打开今日复习对话框，显示到期知识卡片"""
+        items = due_review_items()
+        if not items:
+            self.pet.set_expression("smile")
+            self.say("今天没有到期的知识卡片，休息一下也没关系~")
+            return
+        self.pet.set_expression("thinking")
+        dialog = ReviewDialog(items, self)
+        dialog.exec()
 
     def toggle_pomodoro(self) -> None:
         self.settings = load_settings()

@@ -19,6 +19,7 @@ from .agent_adapter import agents_sdk_status, run_personal_agent
 from .assistant_log import append_event, recent_events
 from .command_runner import WatchedCommand, parse_command_spec
 from .knowledge_base import knowledge_context
+from .knowledge_review import review_summary
 from .pomodoro import pomodoro_status
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings
@@ -34,6 +35,9 @@ class PersonalAssistant(QObject):
         self._system_snapshot_provider = system_snapshot_provider
         self._default_cwd = default_cwd
         self._commands: list[WatchedCommand] = []
+        self._last_brief_report: str = ""
+        self._agent_running = False
+        self._last_agent_run_at: datetime | None = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(60_000)
@@ -44,7 +48,20 @@ class PersonalAssistant(QObject):
         settings = load_settings()
         assistant = settings.get("assistant") or {}
         if assistant.get("enabled", True) and assistant.get("startup_brief", True):
-            QTimer.singleShot(7_000, self.brief_now)
+            # 如果当前时间接近 daily_brief_time（3分钟内），跳过启动简报
+            # 避免与 tick 触发的定时简报重叠
+            brief_time_str = str(assistant.get("daily_brief_time", "08:20"))
+            try:
+                brief_h, brief_m = map(int, brief_time_str.split(":"))
+                now = datetime.now()
+                brief_today = now.replace(hour=brief_h, minute=brief_m, second=0, microsecond=0)
+                diff_seconds = abs((now - brief_today).total_seconds())
+                if diff_seconds < 180:
+                    print(f"[assistant] 距 daily_brief_time 不足3分钟，跳过启动简报")
+                else:
+                    QTimer.singleShot(7_000, self.brief_now)
+            except (ValueError, TypeError):
+                QTimer.singleShot(7_000, self.brief_now)
 
     def brief_now(self) -> None:
         self._run_thread(self._brief_worker)
@@ -109,9 +126,10 @@ class PersonalAssistant(QObject):
 
     def _brief_worker(self) -> None:
         try:
-            self._do_brief()
+            self._last_brief_report = self._do_brief()
         except Exception as ex:
             print(f"[assistant] 简报生成失败: {ex}")
+            self._last_brief_report = ""
             self.notice.emit("surprised", "简报生成遇到了点问题，不过不耽误学习。")
 
     def _do_brief(self) -> None:
@@ -138,6 +156,11 @@ class PersonalAssistant(QObject):
             full_parts.append(system_line)
         if knowledge:
             full_parts.append(knowledge)
+
+        review_line = review_summary()
+        if review_line:
+            full_parts.append(review_line)
+
         full_report = "\n\n".join(full_parts)
         append_event("brief", "生成今日简报", full_report)
 
@@ -159,8 +182,11 @@ class PersonalAssistant(QObject):
         bubble = "今日简报：\n" + "\n".join(bubble_lines[:5])
         self.notice.emit("smile", bubble)
 
+        # 简报和 AI Agent 解耦：延迟触发避免并发重复
         if (settings.get("assistant") or {}).get("ai_agent_enabled", False):
-            self._agent_worker()
+            QTimer.singleShot(5000, self.ai_plan_now)
+
+        return full_report
 
     def _weather_worker(self) -> None:
         settings = load_settings()
@@ -173,6 +199,16 @@ class PersonalAssistant(QObject):
             self.notice.emit("surprised", "天气汇报失败了。可能是网络、VPN 或天气服务暂时不可用。")
 
     def _agent_worker(self) -> None:
+        # 去重守卫：防止并发重复调用
+        if self._agent_running:
+            print("[assistant] AI Agent 正在运行中，跳过重复调用")
+            return
+        now = datetime.now()
+        if self._last_agent_run_at and (now - self._last_agent_run_at).total_seconds() < 300:
+            print("[assistant] AI Agent 距上次运行不足5分钟，跳过重复调用")
+            return
+
+        self._agent_running = True
         try:
             settings = load_settings()
             assistant = settings.get("assistant") or {}
@@ -187,12 +223,15 @@ class PersonalAssistant(QObject):
                 provider,
                 str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
             )
+            self._last_agent_run_at = datetime.now()
             append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, result.metadata)
             self.notice.emit("smile" if result.ok else "focus", result.text)
         except Exception as ex:
             print(f"[assistant] AI Agent 执行失败: {ex}")
             append_event("ai_agent", "AI Agent 异常", str(ex))
             self.notice.emit("surprised", "AI 助理暂时无法连接，稍后会自动重试。")
+        finally:
+            self._agent_running = False
 
     def _agent_context(self) -> str:
         tasks = today_tasks(load_goals())

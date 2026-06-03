@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .storage import load_settings
-from .weather import fetch_open_meteo, resolve_location
+from .weather import _weather_severity, fetch_open_meteo, resolve_location
 
 logger = logging.getLogger(__name__)
 
@@ -64,15 +64,55 @@ class WeatherMonitor(QObject):
         weather_code = current.get("weather_code", 0)
         wind_speed = current.get("wind_speed_10m", 0)
 
-        # 雨雪判断（weather_code: 61-67 rain, 71-77 snow）
-        if 61 <= weather_code <= 67:
+        # 雷暴 (95, 96, 99)
+        if weather_code in (95, 96, 99) and self._can_alert("thunderstorm", now):
+            if weather_code in (96, 99):
+                alerts.append("⛈️ 当前有雷暴并伴有冰雹，请尽量避免外出！")
+            else:
+                alerts.append("⛈️ 当前有雷暴天气，注意安全~")
+            self._last_alert["thunderstorm"] = now
+
+        # 雾 (45, 48)
+        if weather_code in (45, 48) and self._can_alert("fog", now):
+            desc = "雾凇" if weather_code == 48 else "雾"
+            alerts.append(f"🌫️ 当前有{desc}，能见度较低，出行注意安全~")
+            self._last_alert["fog"] = now
+
+        # 冻毛毛雨 (56, 57)
+        if 56 <= weather_code <= 57 and self._can_alert("freeze", now):
+            severity = _weather_severity(weather_code)
+            alerts.append(f"🌧️ 当前有{severity}冻毛毛雨，路面可能结冰，注意防滑~")
+            self._last_alert["freeze"] = now
+
+        # 冻雨 (66, 67)
+        if 66 <= weather_code <= 67 and self._can_alert("freeze", now):
+            severity = _weather_severity(weather_code)
+            alerts.append(f"🌧️ 当前有{severity}冻雨，路面可能结冰，注意防滑~")
+            self._last_alert["freeze"] = now
+
+        # 雨 (61-67 排除冻雨已处理的 66-67)
+        if 61 <= weather_code <= 65:
             if self._can_alert("rain", now):
-                alerts.append("🌧️ 当前正在下雨，出门记得带伞~")
+                severity = _weather_severity(weather_code)
+                alerts.append(f"🌧️ 当前正在下{severity}雨，出门记得带伞~")
                 self._last_alert["rain"] = now
-        elif 71 <= weather_code <= 77:
+
+        # 雪 (71-77 排除冻毛毛雨 56-57 的雪粒 77)
+        if 71 <= weather_code <= 77:
             if self._can_alert("snow", now):
-                alerts.append("❄️ 当前正在下雪，注意保暖~")
+                severity = _weather_severity(weather_code)
+                alerts.append(f"❄️ 当前正在下{severity}雪，注意保暖~")
                 self._last_alert["snow"] = now
+
+        # 阵雨/阵雪 (80-86)
+        if 80 <= weather_code <= 82 and self._can_alert("rain", now):
+            severity = _weather_severity(weather_code)
+            alerts.append(f"🌧️ 当前有{severity}阵雨，出门记得带伞~")
+            self._last_alert["rain"] = now
+        if 85 <= weather_code <= 86 and self._can_alert("snow", now):
+            severity = _weather_severity(weather_code)
+            alerts.append(f"❄️ 当前有{severity}雪阵雨，注意保暖~")
+            self._last_alert["snow"] = now
 
         # 高温
         if temp >= 35 and self._can_alert("heat", now):

@@ -92,6 +92,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "enabled": True,
         "topics": ["计算机网络", "计算机组成原理", "数据结构", "操作系统", "编译原理", "数据库原理"],
     },
+    "knowledge_review": {
+        "enabled": True,
+    },
+    "fired_review_reminders": {},
 }
 
 DEFAULT_GOALS: list[dict[str, Any]] = [
