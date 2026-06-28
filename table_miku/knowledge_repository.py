@@ -357,6 +357,48 @@ def add_chunk(card_id: str, source_id: str | None, chunk: dict[str, Any]) -> str
         conn.close()
 
 
+def list_chunks(card_id: str, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+    """Return chunks for a card, oldest first."""
+    _own = conn is None
+    if _own:
+        conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM knowledge_chunks
+            WHERE card_id = ?
+            ORDER BY created_at ASC
+            """,
+            (card_id,),
+        ).fetchall()
+        return _rows_to_dicts(rows)
+    finally:
+        if _own:
+            conn.close()
+
+
+def list_sources_for_card(card_id: str, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+    """Return distinct source records linked to a card."""
+    _own = conn is None
+    if _own:
+        conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT ks.*
+            FROM knowledge_sources ks
+            JOIN knowledge_chunks kc ON kc.source_id = ks.id
+            WHERE kc.card_id = ?
+            ORDER BY ks.fetched_at DESC, ks.name ASC
+            """,
+            (card_id,),
+        ).fetchall()
+        return _rows_to_dicts(rows)
+    finally:
+        if _own:
+            conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------

@@ -18,8 +18,7 @@ from .assistant_data import (
 from .agent_adapter import agents_sdk_status, run_personal_agent
 from .assistant_log import append_event, recent_events
 from .command_runner import WatchedCommand, parse_command_spec
-from .knowledge_base import knowledge_context
-from .knowledge_review import review_summary
+from .knowledge_service import knowledge_context, review_summary
 from .pomodoro import pomodoro_status
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings
@@ -29,6 +28,7 @@ from .weather import get_weather
 
 class PersonalAssistant(QObject):
     notice = Signal(str, str)
+    delayed_ai_plan_requested = Signal(int)
 
     def __init__(self, system_snapshot_provider, default_cwd: Path, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -38,6 +38,7 @@ class PersonalAssistant(QObject):
         self._last_brief_report: str = ""
         self._agent_running = False
         self._last_agent_run_at: datetime | None = None
+        self.delayed_ai_plan_requested.connect(self._schedule_ai_plan)
 
         self._timer = QTimer(self)
         self._timer.setInterval(60_000)
@@ -184,9 +185,12 @@ class PersonalAssistant(QObject):
 
         # 简报和 AI Agent 解耦：延迟触发避免并发重复
         if (settings.get("assistant") or {}).get("ai_agent_enabled", False):
-            QTimer.singleShot(5000, self.ai_plan_now)
+            self.delayed_ai_plan_requested.emit(5000)
 
         return full_report
+
+    def _schedule_ai_plan(self, delay_ms: int) -> None:
+        QTimer.singleShot(delay_ms, self.ai_plan_now)
 
     def _weather_worker(self) -> None:
         settings = load_settings()

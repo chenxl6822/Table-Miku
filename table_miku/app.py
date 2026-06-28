@@ -19,8 +19,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QPushButton,
+    QSplitter,
     QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
@@ -42,8 +46,14 @@ from .assistant_data import (
 )
 from .assistant_core import PersonalAssistant
 from .goal_parser import ParsedGoalInput, parse_goal_input
-from .knowledge_base import format_knowledge, load_knowledge, refresh_computer_knowledge
-from .knowledge_review import due_review_items, record_review, review_summary
+from .knowledge_base import migrate_legacy_record, qa_pairs_for_card
+from .knowledge_service import (
+    due_review_items,
+    format_knowledge,
+    load_knowledge_cards,
+    record_review,
+    refresh_knowledge_repository,
+)
 from .paths import PROJECT_ROOT, asset_path, qml_path
 from .pomodoro import pomodoro_status, start_pomodoro, stop_pomodoro
 from .planner import add_goal, ensure_goal_plans, today_tasks
@@ -274,6 +284,190 @@ class TextInputDialog(QDialog):
         return self.editor.toPlainText()
 
 
+class KnowledgeLibraryDialog(QDialog):
+    """Structured knowledge browser with subject list, search, and readable details."""
+
+    def __init__(self, records: list[dict], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._records = [migrate_legacy_record(record) for record in records]
+        self._visible_indexes: list[int] = []
+        self.setWindowTitle("计算机知识库")
+        self.setWindowIcon(QIcon(str(export_menu_icon())))
+        self.resize(860, 620)
+        self.setStyleSheet(DIALOG_STYLE + """
+QLineEdit {
+    background: #ffffff;
+    border: 1px solid #c9d6ec;
+    border-radius: 8px;
+    color: #263553;
+    padding: 8px 10px;
+}
+QListWidget {
+    background: rgba(255, 255, 255, 245);
+    border: 1px solid #c9d6ec;
+    border-radius: 10px;
+    color: #263553;
+    padding: 6px;
+}
+QListWidget::item {
+    padding: 9px 8px;
+    border-radius: 7px;
+}
+QListWidget::item:selected {
+    background: #dff8ff;
+    color: #1d405f;
+}
+""")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("计算机知识库")
+        title.setObjectName("dialogTitle")
+        title.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
+        layout.addWidget(title)
+
+        self._search = QLineEdit(self)
+        self._search.setPlaceholderText("搜索学科、术语、关键点或问题")
+        self._search.textChanged.connect(self._refresh_list)
+        layout.addWidget(self._search)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self._list = QListWidget(splitter)
+        self._list.setMinimumWidth(220)
+        self._list.currentItemChanged.connect(lambda current, _previous: self._show_selected(current))
+
+        self._detail = QTextEdit(splitter)
+        self._detail.setReadOnly(True)
+        self._detail.setFont(QFont("Microsoft YaHei UI", 10))
+        self._detail.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        layout.addWidget(splitter)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._refresh_list()
+
+    def _refresh_list(self) -> None:
+        query = self._search.text().strip().lower()
+        self._list.clear()
+        self._visible_indexes = []
+        for index, record in enumerate(self._records):
+            if query and query not in self._search_text(record):
+                continue
+            self._visible_indexes.append(index)
+            topic = str(record.get("topic") or record.get("title") or "未命名主题")
+            item = QListWidgetItem(f"{topic}  ·  {self._category(record)}")
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self._list.addItem(item)
+        if self._list.count() > 0:
+            self._list.setCurrentRow(0)
+        else:
+            self._detail.setPlainText("没有匹配的知识卡片。")
+
+    def _show_selected(self, item: QListWidgetItem | None) -> None:
+        if item is None:
+            return
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(index, int) and 0 <= index < len(self._records):
+            self._detail.setPlainText(self._format_detail(self._records[index]))
+
+    @staticmethod
+    def _category(record: dict) -> str:
+        topic = str(record.get("topic") or record.get("title") or "")
+        if topic in {"Java 后端基础", "Go 后端基础", "工程实践与架构"}:
+            return "实习与工程"
+        if topic in {"软件工程", "算法设计与分析", "计算机安全", "分布式系统"}:
+            return "进阶基础"
+        return "计算机基础"
+
+    def _search_text(self, record: dict) -> str:
+        fields: list[str] = [
+            str(record.get("topic") or ""),
+            str(record.get("title") or ""),
+            str(record.get("overview") or record.get("summary") or ""),
+            self._category(record),
+        ]
+        fields.extend(str(item) for item in record.get("key_points") or [])
+        fields.extend(str(item) for item in record.get("review_questions") or [])
+        for item in record.get("glossary") or []:
+            if isinstance(item, dict):
+                fields.append(str(item.get("term") or ""))
+                fields.append(str(item.get("explanation") or ""))
+        for pair in qa_pairs_for_card(record):
+            fields.append(pair["question"])
+            fields.append(pair["answer"])
+        return " ".join(fields).lower()
+
+    def _format_detail(self, record: dict) -> str:
+        record = migrate_legacy_record(record)
+        topic = str(record.get("topic") or record.get("title") or "未命名主题")
+        parts = [
+            topic,
+            f"分类：{self._category(record)}",
+            f"来源状态：{'离线种子' if record.get('offline') else record.get('source_name', '未知')}",
+            "",
+            "概览",
+            str(record.get("overview") or record.get("summary") or "暂无概览。"),
+        ]
+
+        sections = record.get("sections") or []
+        if sections:
+            parts.extend(["", "知识结构"])
+            for section in sections[:6]:
+                if isinstance(section, dict):
+                    heading = section.get("heading") or "小节"
+                    content = section.get("content") or ""
+                else:
+                    heading = "小节"
+                    content = str(section)
+                parts.append(f"- {heading}：{content}")
+
+        key_points = record.get("key_points") or []
+        if key_points:
+            parts.extend(["", "关键点"])
+            parts.extend(f"- {point}" for point in key_points[:8])
+
+        glossary = record.get("glossary") or []
+        if glossary:
+            parts.extend(["", "术语"])
+            for item in glossary[:8]:
+                if isinstance(item, dict):
+                    parts.append(f"- {item.get('term')}：{item.get('explanation')}")
+
+        examples = record.get("examples") or []
+        if examples:
+            parts.extend(["", "例子"])
+            parts.extend(f"- {example}" for example in examples[:4])
+
+        qa_pairs = qa_pairs_for_card(record)
+        if qa_pairs:
+            parts.extend(["", "问题与参考答案"])
+            for pair in qa_pairs[:6]:
+                parts.append(f"问：{pair['question']}")
+                parts.append(f"答：{pair['answer']}")
+                parts.append("")
+
+        sources = record.get("sources") or []
+        if sources:
+            parts.append("来源")
+            for source in sources[:6]:
+                if isinstance(source, dict):
+                    name = source.get("name") or "来源"
+                    kind = source.get("kind") or ""
+                    url = source.get("url") or ""
+                    parts.append(f"- {name}{' / ' + kind if kind else ''}{' / ' + url if url else ''}")
+        else:
+            source_url = record.get("source_url") or record.get("source") or ""
+            if source_url:
+                parts.extend(["来源", f"- {source_url}"])
+        return "\n".join(part for part in parts if part is not None)
+
+
 class TaskDialog(QDialog):
     def __init__(self, report: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -499,6 +693,14 @@ class ReviewDialog(QDialog):
         emoji = {"known": "✅", "fuzzy": "🔶", "forgotten": "❌"}
 
         parts = [f"你选择了：{emoji.get(result, '')} {labels.get(result, result)}", ""]
+
+        qa_pairs = qa_pairs_for_card(card)
+        if qa_pairs:
+            parts.append("问题与参考答案")
+            for pair in qa_pairs[:6]:
+                parts.append(f"问：{pair['question']}")
+                parts.append(f"答：{pair['answer'] or '暂无可靠答案'}")
+                parts.append("")
 
         # 核心概念
         parts.append("📚 核心概念")
@@ -910,7 +1112,7 @@ class TableMiku(QWidget):
         if interviews:
             blocks.append(interviews)
 
-        knowledge = format_knowledge(load_knowledge(), 6)
+        knowledge = format_knowledge(load_knowledge_cards(6), 6)
         if knowledge:
             blocks.append("计算机知识库\n" + knowledge)
 
@@ -1194,18 +1396,23 @@ class TableMiku(QWidget):
 
     def refresh_knowledge(self) -> None:
         self.pet.set_expression("thinking")
-        self.say("我开始连接 Wikipedia 更新计算机知识库。网络不通时会使用本地备用摘要。")
+        self.say("我开始更新计算机知识库：优先使用离线种子兜底，能联网时补充 Wikipedia，并保留官方文档等来源链接。")
         threading.Thread(target=self._refresh_knowledge_worker, daemon=True).start()
 
     def _refresh_knowledge_worker(self) -> None:
         topics = (load_settings().get("knowledge") or {}).get("topics") or None
-        records = refresh_computer_knowledge(list(topics) if isinstance(topics, list) else None)
-        online = sum(1 for record in records if not record.get("offline"))
-        self.async_notice.emit("happy" if online else "focus", f"计算机知识库已更新：{online}/{len(records)} 条来自 Wikipedia。")
+        summary = refresh_knowledge_repository(list(topics) if isinstance(topics, list) else None)
+        online = int(summary.get("online", 0))
+        trusted = int(summary.get("trusted_sources", 0))
+        chunks = int(summary.get("trusted_chunks", 0))
+        self.async_notice.emit(
+            "happy" if online or trusted else "focus",
+            f"计算机知识库已更新：共 {summary.get('topics', 0)} 个主题，"
+            f"{online} 个主题使用在线摘要，新增/更新 {trusted} 个可信来源、{chunks} 个来源片段。",
+        )
 
     def show_knowledge(self) -> None:
-        dialog = TextInputDialog("计算机知识库", "这些知识会进入 Miku 的规划上下文。", format_knowledge(load_knowledge()), self)
-        dialog.editor.setReadOnly(True)
+        dialog = KnowledgeLibraryDialog(load_knowledge_cards(), self)
         dialog.exec()
         self.pet.set_expression("smile")
 

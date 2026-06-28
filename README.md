@@ -169,6 +169,41 @@ dist/TableMiku/TableMiku.exe
 
 百度能连、Google 不能连，通常表示国内网络可用但 Google/VPN/代理出口有问题；两者都不能连，通常表示断网、DNS 或代理配置异常。
 
+网络检测会分层记录 DNS、TCP、TLS、HTTP 状态和延迟；非手动检测时需要连续异常才会告警，避免一次网络抖动就误判。内存检测同时参考已用百分比和可用 MB，默认可用内存低于 `1024 MB` 也会进入压力判断。
+
+### 天气定位与预警
+
+天气查询支持三种定位方式：
+
+- 推荐：填写 `区县,城市,省份`，例如 `雨湖区,湘潭,湖南`。
+- 精确：填写坐标 `纬度,经度`，例如 `27.8563,112.9000`。
+- 兜底：填写 `auto` 使用 IP 定位；该结果会标记为低置信度，可能受 VPN、代理和运营商出口影响。
+
+地理编码结果会缓存在本地用户数据目录，减少重复联网解析。主动天气监测会读取 `weather_alerts.lead_minutes`，结合 Open-Meteo 当前天气和未来小时级预报提醒雷暴、降雨、降雪、冻雨、大风、高温和低温。
+
+### 可信知识源
+
+知识库现在优先走本地 SQLite Repository，并保留旧 `knowledge_base.json` 迁移/兜底。可信来源优先级为：
+
+```text
+官方文档 / RFC / 标准 / 论文元数据 > Obsidian 只读笔记 > Wikipedia > 离线种子
+```
+
+如需接入本地 Obsidian 知识库，可在 `data/settings.json` 中配置：
+
+```json
+{
+  "knowledge": {
+    "trusted_sources": {
+      "enabled": true,
+      "obsidian_vault": "D:\\AIWorkspace\\projects\\Obsidian Vault\\计算机知识"
+    }
+  }
+}
+```
+
+Table-Miku 只读取该目录下 Markdown 摘要并写入自己的 `knowledge.db`，不会修改、删除、移动或格式化 Obsidian Vault 文件；包含 `.env`、token、secret、password、key、密钥、凭据等敏感命名的路径会被跳过。
+
 ### 修改个人助手
 
 个人助手默认开启：启动后生成一次简报；每天 `08:10` 做天气汇报，`08:20` 做今日简报；右键“运行并监视命令”可以让 Miku 运行 PowerShell 命令，命令结束后自动提示退出码和简短输出。

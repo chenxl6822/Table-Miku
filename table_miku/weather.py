@@ -4,7 +4,10 @@ import json
 import re
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from typing import Any
+
+from .storage import read_json, write_json
 
 
 WMO_DESCRIPTIONS = {
@@ -86,6 +89,10 @@ CITY_PROVINCE_HINTS = {
     "岳阳": "湖南省",
 }
 
+LOCATION_CACHE_FILE = "weather_location_cache.json"
+LOCATION_CACHE_TTL_DAYS = 14
+AUTO_LOCATION_WORDS = {"auto", "定位", "自动定位", "当前位置"}
+
 
 def _get_json(url: str, timeout: float = 8.0) -> Any:
     request = urllib.request.Request(
@@ -108,7 +115,7 @@ def _get_json(url: str, timeout: float = 8.0) -> Any:
 def get_weather(location_text: str = "雨湖区,湘潭,湖南") -> str:
     requested = (location_text or "雨湖区,湘潭,湖南").strip()
     location = resolve_location(requested)
-    weather = fetch_open_meteo(location["latitude"], location["longitude"], include_daily=True)
+    weather = fetch_open_meteo(location["latitude"], location["longitude"], include_daily=True, include_hourly=True)
     current = weather.get("current") or {}
     daily = weather.get("daily") or {}
 
@@ -117,16 +124,16 @@ def get_weather(location_text: str = "雨湖区,湘潭,湖南") -> str:
     description = WMO_DESCRIPTIONS.get(code, "天气情况未知")
     if severity:
         description = severity + description
-    source_note = "IP 自动定位可能受 VPN/代理影响，建议填写'区县,城市,省份'。" if location.get("source") == "ip" else "位置由真实地理库解析。"
+    source_note = format_location_source_note(location)
 
     trend = analyze_weather_trend(daily) if daily else ""
+    upcoming = summarize_hourly_alerts(weather.get("hourly") or {}, lead_hours=6)
 
-    parts: list[str] = []
     lines: list[str] = []
     lines.append(
         f"{location['display_name']}：现在{description}，{current.get('temperature_2m')}°C，"
         f"体感 {current.get('apparent_temperature')}°C，湿度 {current.get('relative_humidity_2m')}%，"
-        f"风速 {current.get('wind_speed_10m')} km/h。"
+        f"风速 {current.get('wind_speed_10m')} m/s。"
     )
 
     # Add daily temperature range if available
@@ -137,15 +144,26 @@ def get_weather(location_text: str = "雨湖区,湘潭,湖南") -> str:
 
     if trend:
         lines.append(trend)
+    if upcoming:
+        lines.append(upcoming)
 
     lines.append(source_note)
     return "\n".join(lines)
 
 
 def resolve_location(location_text: str) -> dict[str, Any]:
-    requested = location_text.strip()
-    if requested.lower() in {"auto", "定位", "自动定位", "当前位置"}:
-        return detect_ip_location()
+    requested = (location_text or "雨湖区,湘潭,湖南").strip()
+    coordinate_location = parse_coordinate_location(requested)
+    if coordinate_location is not None:
+        return coordinate_location
+
+    if requested.lower() in AUTO_LOCATION_WORDS:
+        location = detect_ip_location()
+        return _normalize_location_result(location, requested, confidence="low")
+
+    cached = _cached_location(requested, allow_stale=False)
+    if cached is not None:
+        return cached
 
     components = parse_china_location(requested)
     if components["city"] in CITY_PROVINCE_HINTS and not components["province"]:
@@ -153,14 +171,65 @@ def resolve_location(location_text: str) -> dict[str, Any]:
 
     location = _try_geocoder(geocode_with_nominatim, components)
     if location is not None:
+        location = _normalize_location_result(location, requested)
+        _save_cached_location(requested, location)
         return location
 
     location = _try_geocoder(geocode_with_open_meteo, components)
     if location is not None:
+        location = _normalize_location_result(location, requested)
+        _save_cached_location(requested, location)
         return location
+
+    stale = _cached_location(requested, allow_stale=True)
+    if stale is not None:
+        stale["cache_stale"] = True
+        return stale
 
     hint = format_components(components)
     raise RuntimeError(f"没有找到「{hint}」的地理位置，请尝试输入'区县,城市,省份'，例如'雨湖区,湘潭,湖南'。")
+
+
+def parse_coordinate_location(text: str) -> dict[str, Any] | None:
+    """Parse manual coordinates from ``lat,lon`` or ``lat=..., lon=...`` text."""
+    raw = text.strip()
+    if not raw:
+        return None
+
+    labeled = re.search(
+        r"(?:lat|latitude|纬度)\s*[:=]\s*(-?\d+(?:\.\d+)?)"
+        r".*?(?:lon|lng|longitude|经度)\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+        raw,
+        re.IGNORECASE,
+    )
+    if labeled:
+        latitude = float(labeled.group(1))
+        longitude = float(labeled.group(2))
+    else:
+        normalized = raw.replace("，", ",").replace("、", ",")
+        parts = [part.strip() for part in normalized.split(",")]
+        if len(parts) != 2:
+            return None
+        if not all(re.fullmatch(r"-?\d+(?:\.\d+)?", part) for part in parts):
+            return None
+        latitude = float(parts[0])
+        longitude = float(parts[1])
+
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        raise RuntimeError("坐标超出范围：纬度必须在 -90~90，经度必须在 -180~180。")
+
+    return {
+        "district": "",
+        "city": "",
+        "region": "",
+        "country": "",
+        "latitude": latitude,
+        "longitude": longitude,
+        "display_name": f"手动坐标 {latitude:.4f}, {longitude:.4f}",
+        "source": "manual-coordinates",
+        "confidence": "high",
+        "query": raw,
+    }
 
 
 def parse_china_location(text: str) -> dict[str, str | None]:
@@ -283,19 +352,92 @@ def geocode_with_open_meteo(components: dict[str, str | None]) -> dict[str, Any]
     }
 
 
-def fetch_open_meteo(latitude: float, longitude: float, include_daily: bool = False) -> dict[str, Any]:
+def fetch_open_meteo(
+    latitude: float,
+    longitude: float,
+    include_daily: bool = False,
+    include_hourly: bool = False,
+) -> dict[str, Any]:
     current_params = "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m"
     params: dict[str, Any] = {
         "latitude": latitude,
         "longitude": longitude,
         "current": current_params,
         "timezone": "auto",
+        "wind_speed_unit": "ms",
     }
     if include_daily:
         params["daily"] = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
         params["forecast_days"] = 3
+    if include_hourly:
+        params["hourly"] = "weather_code,temperature_2m,precipitation_probability,wind_speed_10m"
+        params["forecast_days"] = max(int(params.get("forecast_days", 1)), 2)
     weather_query = urllib.parse.urlencode(params)
     return _get_json(f"https://api.open-meteo.com/v1/forecast?{weather_query}")
+
+
+def evaluate_weather_alerts(data: dict[str, Any], lead_hours: int = 0) -> list[dict[str, Any]]:
+    """Return current and near-future weather alerts from Open-Meteo data.
+
+    Wind speed is expected in m/s because ``fetch_open_meteo`` requests
+    ``wind_speed_unit=ms``.
+    """
+    alerts: list[dict[str, Any]] = []
+    current = data.get("current") or {}
+    alerts.extend(
+        _alerts_from_sample(
+            current.get("weather_code"),
+            current.get("temperature_2m"),
+            current.get("wind_speed_10m"),
+            source="current",
+            time_label="当前",
+        )
+    )
+
+    if lead_hours <= 0:
+        return alerts
+
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    codes = hourly.get("weather_code") or []
+    temps = hourly.get("temperature_2m") or []
+    winds = hourly.get("wind_speed_10m") or []
+    limit = min(len(codes), max(int(lead_hours), 1) + 1)
+    current_types = {alert["type"] for alert in alerts}
+    future_types: set[str] = set()
+
+    for index in range(limit):
+        time_label = _format_hour_label(times[index] if index < len(times) else "")
+        sample_alerts = _alerts_from_sample(
+            codes[index],
+            temps[index] if index < len(temps) else None,
+            winds[index] if index < len(winds) else None,
+            source="hourly",
+            time_label=time_label,
+        )
+        for alert in sample_alerts:
+            alert_type = str(alert.get("type", ""))
+            if alert_type in current_types or alert_type in future_types:
+                continue
+            alert["time"] = times[index] if index < len(times) else ""
+            alert["message"] = _future_alert_message(alert)
+            alerts.append(alert)
+            future_types.add(alert_type)
+    return alerts
+
+
+def summarize_hourly_alerts(hourly_data: dict[str, Any], lead_hours: int = 6) -> str:
+    if not hourly_data:
+        return ""
+    alerts = evaluate_weather_alerts({"hourly": hourly_data}, lead_hours=lead_hours)
+    future_messages = [
+        str(alert.get("message", ""))
+        for alert in alerts
+        if alert.get("source") == "hourly" and alert.get("message")
+    ]
+    if not future_messages:
+        return ""
+    return "未来几小时提醒：" + "；".join(future_messages[:3])
 
 
 def analyze_weather_trend(daily_data: dict[str, Any]) -> str:
@@ -354,6 +496,24 @@ def analyze_weather_trend(daily_data: dict[str, Any]) -> str:
     return "；".join(parts) if parts else ""
 
 
+def format_location_source_note(location: dict[str, Any]) -> str:
+    source = str(location.get("source") or "")
+    confidence = str(location.get("confidence") or "medium")
+    cached = bool(location.get("cached"))
+    stale = bool(location.get("cache_stale"))
+    if source == "ip":
+        return "位置来自 IP 自动定位，置信度较低，可能受 VPN/代理/运营商出口影响；建议填写“区县,城市,省份”或手动坐标。"
+    if source == "manual-coordinates":
+        return "位置来自手动坐标，精度取决于你输入的坐标。"
+    if stale:
+        return "天气位置来自旧缓存，因为实时地理解析失败；如位置不准，请重新设置城市或坐标。"
+    if cached:
+        return "天气位置来自本地地理编码缓存，避免重复联网解析。"
+    if confidence == "high":
+        return "位置由地理库解析，匹配到区县级信息。"
+    return "位置由地理库解析，可能是城市级匹配；如需更准可填写“区县,城市,省份”或坐标。"
+
+
 def detect_ip_location() -> dict[str, Any]:
     data = _get_json("http://ip-api.com/json/?lang=zh-CN")
     if data.get("status") != "success":
@@ -369,6 +529,7 @@ def detect_ip_location() -> dict[str, Any]:
         "longitude": float(data["lon"]),
         "display_name": "，".join([part for part in [region, city, data.get("country")] if part]),
         "source": "ip",
+        "confidence": "low",
     }
 
 
@@ -382,7 +543,167 @@ def format_components(components: dict[str, str | None], include_country: bool =
 def _try_geocoder(func, components: dict[str, str | None]) -> dict[str, Any] | None:
     try:
         return func(components)
-    except OSError:
+    except (OSError, RuntimeError, urllib.error.URLError, TimeoutError):
+        return None
+
+
+def _alerts_from_sample(
+    weather_code: Any,
+    temperature: Any,
+    wind_speed: Any,
+    *,
+    source: str,
+    time_label: str,
+) -> list[dict[str, Any]]:
+    code = _as_int(weather_code)
+    temp = _as_float(temperature)
+    wind = _as_float(wind_speed)
+    alerts: list[dict[str, Any]] = []
+
+    if code in (95, 96, 99):
+        message = "当前有雷暴并伴有冰雹，请尽量避免外出！" if code in (96, 99) else "当前有雷暴天气，注意安全。"
+        alerts.append({"type": "thunderstorm", "source": source, "code": code, "time_label": time_label, "message": message})
+    elif code in (45, 48):
+        desc = "雾凇" if code == 48 else "雾"
+        alerts.append({"type": "fog", "source": source, "code": code, "time_label": time_label, "message": f"当前有{desc}，能见度较低，出行注意安全。"})
+    elif code in (56, 57):
+        severity = _weather_severity(code)
+        alerts.append({"type": "freeze", "source": source, "code": code, "time_label": time_label, "message": f"当前有{severity}冻毛毛雨，路面可能结冰，注意防滑。"})
+    elif code in (66, 67):
+        severity = _weather_severity(code)
+        alerts.append({"type": "freeze", "source": source, "code": code, "time_label": time_label, "message": f"当前有{severity}冻雨，路面可能结冰，注意防滑。"})
+    elif code is not None and 61 <= code <= 65:
+        severity = _weather_severity(code)
+        alerts.append({"type": "rain", "source": source, "code": code, "time_label": time_label, "message": f"当前正在下{severity}雨，出门记得带伞。"})
+    elif code is not None and 71 <= code <= 77:
+        severity = _weather_severity(code)
+        alerts.append({"type": "snow", "source": source, "code": code, "time_label": time_label, "message": f"当前正在下{severity}雪，注意保暖。"})
+    elif code is not None and 80 <= code <= 82:
+        severity = _weather_severity(code)
+        alerts.append({"type": "rain", "source": source, "code": code, "time_label": time_label, "message": f"当前有{severity}阵雨，出门记得带伞。"})
+    elif code is not None and 85 <= code <= 86:
+        severity = _weather_severity(code)
+        alerts.append({"type": "snow", "source": source, "code": code, "time_label": time_label, "message": f"当前有{severity}雪阵雨，注意保暖。"})
+
+    if temp is not None and temp >= 35:
+        alerts.append({"type": "heat", "source": source, "temperature": temp, "time_label": time_label, "message": f"当前 {temp:g}°C，注意防暑。"})
+    if temp is not None and temp <= -5:
+        alerts.append({"type": "cold", "source": source, "temperature": temp, "time_label": time_label, "message": f"当前 {temp:g}°C，注意保暖。"})
+    if wind is not None and wind > 12.5:
+        alerts.append({"type": "wind", "source": source, "wind_speed": wind, "time_label": time_label, "message": f"当前风力较大 ({wind:g}m/s)，注意安全。"})
+
+    return alerts
+
+
+def _future_alert_message(alert: dict[str, Any]) -> str:
+    when = str(alert.get("time_label") or "稍后")
+    alert_type = str(alert.get("type") or "")
+    if alert_type == "thunderstorm":
+        return f"{when}可能有雷暴，提前减少外出安排。"
+    if alert_type == "fog":
+        return f"{when}可能有雾，出行注意能见度。"
+    if alert_type == "freeze":
+        return f"{when}可能有冻雨或结冰风险，注意防滑。"
+    if alert_type == "rain":
+        return f"{when}可能有降雨，出门记得带伞。"
+    if alert_type == "snow":
+        return f"{when}可能有降雪，注意保暖和路面湿滑。"
+    if alert_type == "heat":
+        return f"{when}可能高温，注意补水和防晒。"
+    if alert_type == "cold":
+        return f"{when}可能低温，注意保暖。"
+    if alert_type == "wind":
+        return f"{when}可能有大风，注意收好窗边物品。"
+    return str(alert.get("message") or "")
+
+
+def _format_hour_label(raw_time: Any) -> str:
+    text = str(raw_time or "")
+    if "T" not in text:
+        return "未来几小时"
+    try:
+        return datetime.fromisoformat(text).strftime("%H:%M")
+    except ValueError:
+        return text.split("T", 1)[-1]
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_location_result(
+    location: dict[str, Any],
+    query: str,
+    confidence: str | None = None,
+) -> dict[str, Any]:
+    result = dict(location)
+    result["query"] = query
+    if confidence is not None:
+        result["confidence"] = confidence
+    elif not result.get("confidence"):
+        result["confidence"] = "high" if result.get("district") else "medium"
+    result.setdefault("cached", False)
+    result.setdefault("cache_stale", False)
+    return result
+
+
+def _location_cache_key(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _load_location_cache() -> dict[str, Any]:
+    payload = read_json(LOCATION_CACHE_FILE, {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def _cached_location(requested: str, allow_stale: bool) -> dict[str, Any] | None:
+    cache = _load_location_cache()
+    entry = cache.get(_location_cache_key(requested))
+    if not isinstance(entry, dict):
+        return None
+    location = entry.get("location")
+    if not isinstance(location, dict):
+        return None
+    cached_at = _parse_cache_time(str(entry.get("cached_at") or ""))
+    stale = cached_at is None or datetime.now() - cached_at > timedelta(days=LOCATION_CACHE_TTL_DAYS)
+    if stale and not allow_stale:
+        return None
+    result = dict(location)
+    result["cached"] = True
+    result["cache_stale"] = stale
+    return result
+
+
+def _save_cached_location(requested: str, location: dict[str, Any]) -> None:
+    if location.get("source") in {"ip", "manual-coordinates"}:
+        return
+    cache = _load_location_cache()
+    clean_location = dict(location)
+    clean_location.pop("cached", None)
+    clean_location.pop("cache_stale", None)
+    cache[_location_cache_key(requested)] = {
+        "cached_at": datetime.now().isoformat(timespec="seconds"),
+        "location": clean_location,
+    }
+    write_json(LOCATION_CACHE_FILE, cache)
+
+
+def _parse_cache_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
         return None
 
 

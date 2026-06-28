@@ -10,6 +10,23 @@ from typing import Any
 from .paths import PROJECT_ROOT, user_data_dir
 
 
+DEFAULT_KNOWLEDGE_TOPICS = [
+    "计算机网络",
+    "计算机组成原理",
+    "数据结构",
+    "操作系统",
+    "编译原理",
+    "数据库原理",
+    "软件工程",
+    "算法设计与分析",
+    "计算机安全",
+    "分布式系统",
+    "Java 后端基础",
+    "Go 后端基础",
+    "工程实践与架构",
+]
+
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "city": "雨湖区,湘潭,湖南",
     "reminders_enabled": True,
@@ -33,10 +50,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "cpu_warning_checks": 3,
         "memory_enabled": True,
         "memory_warning_percent": 88,
+        "memory_available_warning_mb": 1024,
         "memory_warning_checks": 2,
         "network_enabled": True,
         "network_check_interval_minutes": 2,
         "network_timeout_seconds": 4,
+        "network_warning_checks": 2,
         "network_healthy_report_minutes": 30,
         "network_targets": [
             {"name": "百度", "url": "https://www.baidu.com/"},
@@ -90,7 +109,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "knowledge": {
         "enabled": True,
-        "topics": ["计算机网络", "计算机组成原理", "数据结构", "操作系统", "编译原理", "数据库原理"],
+        "topics": DEFAULT_KNOWLEDGE_TOPICS,
+        "trusted_sources": {
+            "enabled": True,
+            "obsidian_vault": "",
+        },
     },
     "knowledge_review": {
         "enabled": True,
@@ -161,6 +184,7 @@ def load_settings() -> dict[str, Any]:
     merged = deepcopy(DEFAULT_SETTINGS)
     result = _deep_merge(merged, settings)
     _normalize_assistant_provider(result)
+    _normalize_knowledge_settings(result)
     return result
 
 
@@ -190,6 +214,20 @@ def _normalize_assistant_provider(settings: dict[str, Any]) -> None:
     assistant["ai_provider"] = "deepseek"
     assistant.setdefault("deepseek_model", "deepseek-v4-flash")
     assistant.setdefault("deepseek_base_url", "https://api.deepseek.com")
+
+
+def _normalize_knowledge_settings(settings: dict[str, Any]) -> None:
+    knowledge = settings.setdefault("knowledge", {})
+    if not isinstance(knowledge, dict):
+        settings["knowledge"] = {"enabled": True, "topics": list(DEFAULT_KNOWLEDGE_TOPICS)}
+        return
+    existing = knowledge.get("topics")
+    ordered: list[str] = []
+    for topic in DEFAULT_KNOWLEDGE_TOPICS + (existing if isinstance(existing, list) else []):
+        cleaned = str(topic).strip()
+        if cleaned and cleaned not in ordered:
+            ordered.append(cleaned)
+    knowledge["topics"] = ordered
 
 
 def _env_value(name: str) -> str:

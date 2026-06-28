@@ -6,7 +6,7 @@ from typing import Any
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .assistant_data import load_timetable
-from .knowledge_review import due_review_items, review_summary
+from .knowledge_service import due_review_items, review_summary
 from .pomodoro import pomodoro_tick
 from .planner import today_tasks
 from .storage import load_goals, load_settings, save_settings

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import socket
+import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -22,6 +25,13 @@ class ProbeResult:
     ok: bool
     elapsed_ms: int
     error: str = ""
+    error_kind: str = ""
+    dns_ok: bool | None = None
+    tcp_ok: bool | None = None
+    tls_ok: bool | None = None
+    http_status: int | None = None
+    host: str = ""
+    port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +139,8 @@ class SystemMonitor(QObject):
         self._last_network_report_at: datetime | None = None
         self._network_running = False
         self._last_network_check_at: datetime | None = None
+        self._network_bad_count = 0
+        self._network_alerting = False
         self.latest_snapshot = SystemSnapshot(None, None, None, [])
 
         self._timer = QTimer(self)
@@ -225,20 +237,21 @@ class SystemMonitor(QObject):
         )
         threshold = float(monitor.get("memory_warning_percent", 88))
         required_checks = int(monitor.get("memory_warning_checks", 2))
-        if used_percent >= threshold:
+        pressure_reason = memory_pressure_reason(used_percent, available_mb, monitor)
+        if pressure_reason:
             self._memory_high_count += 1
         else:
             self._memory_high_count = 0
 
         if force_report:
-            level = "surprised" if used_percent >= threshold else "smile"
+            level = "surprised" if pressure_reason else "smile"
             self.notice.emit(level, f"内存状态：已用 {used_percent:.0f}%，可用约 {available_mb} MB。")
             return
 
         if self._memory_high_count >= max(required_checks, 1) and not self._memory_alerting:
             self._memory_alerting = True
-            self.notice.emit("surprised", f"内存压力偏高：已用约 {used_percent:.0f}%，可用 {available_mb} MB。可以先关掉浏览器重标签或大程序。")
-        elif self._memory_alerting and used_percent < max(threshold - 12, 55):
+            self.notice.emit("surprised", f"内存压力偏高：{pressure_reason}。可以先关掉浏览器重标签或大程序。")
+        elif self._memory_alerting and not memory_pressure_reason(used_percent, available_mb, _memory_recovery_settings(monitor)):
             self._memory_alerting = False
             self.notice.emit("smile", f"内存已恢复：已用约 {used_percent:.0f}%，可用 {available_mb} MB。")
 
@@ -270,19 +283,30 @@ class SystemMonitor(QObject):
                 memory_available_mb=self.latest_snapshot.memory_available_mb,
                 network=results,
             )
-            state = "|".join(f"{result.name}:{int(result.ok)}" for result in results)
+            state = network_state_key(results)
             now = datetime.now()
             healthy_minutes = int(monitor.get("network_healthy_report_minutes", 30))
             report_healthy_after = timedelta(minutes=max(healthy_minutes, 5))
+            healthy = network_is_healthy(results)
+            required_checks = int(monitor.get("network_warning_checks", 2))
+            if healthy:
+                self._network_bad_count = 0
+            else:
+                self._network_bad_count += 1
+
             should_report = (
                 force_report
-                or state != self._last_network_state
-                or self._last_network_report_at is None
-                or now - self._last_network_report_at >= report_healthy_after
+                or (healthy and self._network_alerting)
+                or (not healthy and self._network_bad_count >= max(required_checks, 1) and state != self._last_network_state)
+                or (healthy and not self._network_alerting and (
+                    self._last_network_report_at is None
+                    or now - self._last_network_report_at >= report_healthy_after
+                ))
             )
             if should_report:
                 self._last_network_state = state
                 self._last_network_report_at = now
+                self._network_alerting = not healthy
                 level, message = format_network_notice(results)
                 self.notice.emit(level, message)
         finally:
@@ -291,6 +315,53 @@ class SystemMonitor(QObject):
 
 def probe_network_target(name: str, url: str, timeout: float) -> ProbeResult:
     start = time.perf_counter()
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    if not parsed.scheme or not host:
+        return ProbeResult(
+            name=name,
+            url=url,
+            ok=False,
+            elapsed_ms=0,
+            error="invalid url",
+            error_kind="invalid_url",
+            dns_ok=False,
+        )
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        return _probe_failure(name, url, start, "dns", exc, host=host, port=port, dns_ok=False)
+    except OSError as exc:
+        return _probe_failure(name, url, start, "dns", exc, host=host, port=port, dns_ok=False)
+
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except (socket.timeout, TimeoutError) as exc:
+        return _probe_failure(name, url, start, "timeout", exc, host=host, port=port, dns_ok=True, tcp_ok=False)
+    except OSError as exc:
+        return _probe_failure(name, url, start, "tcp", exc, host=host, port=port, dns_ok=True, tcp_ok=False)
+
+    tls_ok: bool | None = None
+    try:
+        if parsed.scheme == "https":
+            try:
+                context = ssl.create_default_context()
+                with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+                    tls_sock.settimeout(timeout)
+                tls_ok = True
+            except ssl.SSLError as exc:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return _probe_failure(name, url, start, "tls", exc, host=host, port=port, dns_ok=True, tcp_ok=True, tls_ok=False)
+        else:
+            sock.close()
+    except OSError:
+        pass
+
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "Table-Miku/0.6 network monitor"},
@@ -301,13 +372,55 @@ def probe_network_target(name: str, url: str, timeout: float) -> ProbeResult:
             response.read(256)
             ok = 200 <= int(response.status) < 400
             elapsed_ms = int((time.perf_counter() - start) * 1000)
-            return ProbeResult(name=name, url=url, ok=ok, elapsed_ms=elapsed_ms)
+            return ProbeResult(
+                name=name,
+                url=url,
+                ok=ok,
+                elapsed_ms=elapsed_ms,
+                error_kind="" if ok else "http_status",
+                dns_ok=True,
+                tcp_ok=True,
+                tls_ok=tls_ok,
+                http_status=int(response.status),
+                host=host,
+                port=port,
+            )
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return ProbeResult(
+            name=name,
+            url=url,
+            ok=False,
+            elapsed_ms=elapsed_ms,
+            error=str(exc),
+            error_kind="http_status",
+            dns_ok=True,
+            tcp_ok=True,
+            tls_ok=tls_ok,
+            http_status=int(exc.code),
+            host=host,
+            port=port,
+        )
     except (OSError, urllib.error.URLError, TimeoutError) as exc:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return ProbeResult(name=name, url=url, ok=False, elapsed_ms=elapsed_ms, error=str(exc))
+        return ProbeResult(
+            name=name,
+            url=url,
+            ok=False,
+            elapsed_ms=elapsed_ms,
+            error=str(exc),
+            error_kind=classify_network_error(exc),
+            dns_ok=True,
+            tcp_ok=True,
+            tls_ok=tls_ok,
+            host=host,
+            port=port,
+        )
 
 
 def format_network_notice(results: list[ProbeResult]) -> tuple[str, str]:
+    if not results:
+        return "focus", "网络检测没有配置目标。"
     by_name = {result.name.lower(): result for result in results}
     baidu = by_name.get("百度") or by_name.get("baidu")
     google = by_name.get("google") or by_name.get("谷歌")
@@ -316,14 +429,112 @@ def format_network_notice(results: list[ProbeResult]) -> tuple[str, str]:
         if baidu.ok and google.ok:
             return "smile", f"网络正常：百度 {baidu.elapsed_ms}ms，Google {google.elapsed_ms}ms，都连得上。"
         if baidu.ok and not google.ok:
-            return "surprised", "国内网络正常，但 Google 连不上。开了 VPN 的话，可能是代理或出口有问题。"
+            return "surprised", f"国内网络正常，但 Google 异常：{probe_failure_summary(google)}。开了 VPN 的话，可能是代理或出口有问题。"
         if not baidu.ok and google.ok:
-            return "surprised", "Google 能连上，但百度连不上。可能是 DNS、国内链路或代理规则异常。"
-        return "surprised", "百度和 Google 都连不上，可能断网了，或者 VPN/代理配置把流量卡住了。"
+            return "surprised", f"Google 能连上，但百度异常：{probe_failure_summary(baidu)}。可能是 DNS、国内链路或代理规则异常。"
+        return "surprised", f"百度和 Google 都异常：百度 {probe_failure_summary(baidu)}；Google {probe_failure_summary(google)}。"
 
     ok_results = [result for result in results if result.ok]
     if len(ok_results) == len(results):
-        details = "，".join(f"{result.name} {result.elapsed_ms}ms" for result in results)
+        details = "，".join(format_probe_success(result) for result in results)
         return "smile", f"网络正常：{details}。"
-    failed = "、".join(result.name for result in results if not result.ok)
-    return "surprised", f"网络异常：{failed} 暂时连不上。"
+    failed = "；".join(f"{result.name} {probe_failure_summary(result)}" for result in results if not result.ok)
+    reachable = "、".join(result.name for result in ok_results)
+    if reachable:
+        return "surprised", f"网络部分异常：{failed}。可达：{reachable}。"
+    return "surprised", f"网络异常：{failed}。"
+
+
+def memory_pressure_reason(used_percent: float, available_mb: int, monitor: dict[str, Any]) -> str:
+    percent_threshold = float(monitor.get("memory_warning_percent", 88))
+    available_threshold = int(monitor.get("memory_available_warning_mb", 1024))
+    reasons: list[str] = []
+    if used_percent >= percent_threshold:
+        reasons.append(f"已用约 {used_percent:.0f}%")
+    if available_mb <= available_threshold:
+        reasons.append(f"可用仅 {available_mb} MB")
+    return "，".join(reasons)
+
+
+def _memory_recovery_settings(monitor: dict[str, Any]) -> dict[str, Any]:
+    percent_threshold = max(float(monitor.get("memory_warning_percent", 88)) - 12, 55)
+    available_threshold = int(monitor.get("memory_available_warning_mb", 1024)) + 512
+    return {
+        **monitor,
+        "memory_warning_percent": percent_threshold,
+        "memory_available_warning_mb": available_threshold,
+    }
+
+
+def network_is_healthy(results: list[ProbeResult]) -> bool:
+    return bool(results) and all(result.ok for result in results)
+
+
+def network_state_key(results: list[ProbeResult]) -> str:
+    return "|".join(
+        f"{result.name}:{int(result.ok)}:{result.error_kind}:{result.http_status or ''}"
+        for result in results
+    )
+
+
+def classify_network_error(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", exc)
+    text = str(reason or exc).lower()
+    if isinstance(reason, socket.gaierror) or "name or service" in text or "getaddrinfo" in text:
+        return "dns"
+    if isinstance(reason, ssl.SSLError) or isinstance(exc, ssl.SSLError):
+        return "tls"
+    if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "connection refused" in text or "connection reset" in text:
+        return "tcp"
+    return "network"
+
+
+def format_probe_success(result: ProbeResult) -> str:
+    status = f" HTTP {result.http_status}" if result.http_status is not None else ""
+    return f"{result.name} {result.elapsed_ms}ms{status}"
+
+
+def probe_failure_summary(result: ProbeResult) -> str:
+    kind_labels = {
+        "invalid_url": "URL 无效",
+        "dns": "DNS 解析失败",
+        "tcp": "TCP 连接失败",
+        "tls": "TLS 握手失败",
+        "timeout": "连接超时",
+        "http_status": f"HTTP {result.http_status}",
+        "network": "网络请求失败",
+    }
+    label = kind_labels.get(result.error_kind, result.error_kind or "未知错误")
+    if result.elapsed_ms:
+        label += f"，耗时 {result.elapsed_ms}ms"
+    return label
+
+
+def _probe_failure(
+    name: str,
+    url: str,
+    start: float,
+    error_kind: str,
+    exc: BaseException,
+    *,
+    host: str,
+    port: int,
+    dns_ok: bool | None,
+    tcp_ok: bool | None = None,
+    tls_ok: bool | None = None,
+) -> ProbeResult:
+    return ProbeResult(
+        name=name,
+        url=url,
+        ok=False,
+        elapsed_ms=int((time.perf_counter() - start) * 1000),
+        error=str(exc),
+        error_kind=error_kind,
+        dns_ok=dns_ok,
+        tcp_ok=tcp_ok,
+        tls_ok=tls_ok,
+        host=host,
+        port=port,
+    )
