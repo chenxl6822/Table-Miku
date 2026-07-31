@@ -36,4 +36,4 @@ $env:TABLE_MIKU_DATA_DIR = Join-Path $env:TEMP "TableMiku-test-data"
 2. 运行 `.\.venv\Scripts\python.exe build.py`，确认 `dist\TableMiku\TableMiku.exe` 存在。
 3. 检查打包目录不含运行数据、凭据和个人记录。
 4. 在真实 Windows 桌面手动验证启动、托盘、QML 动画、AI 授权、天气查询和命令取消。
-5. 由维护者选择并加入明确的 `LICENSE` 后，才能把许可证信息写入发布说明。
+5. 发布说明须分别标明源代码采用 MIT License，以及角色图片、图标、音频等媒体资源不在 MIT 授权范围；发布前按 [ASSET_LICENSE.md](../ASSET_LICENSE.md) 逐项核对素材授权。

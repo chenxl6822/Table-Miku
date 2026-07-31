@@ -409,6 +409,8 @@ $env:TABLE_MIKU_DATA_DIR = Join-Path $env:TEMP "TableMiku-test-data"
 
 完整维护与发布检查见 [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md)。
 
-## 许可证状态
+## 许可证
 
-仓库当前尚未包含 `LICENSE`。公开发布或允许第三方复用前，需要由维护者明确选择并加入许可证；本次优化没有代替维护者作出该法律选择。
+Table Miku 源代码采用 [MIT License](LICENSE) 授权。
+
+角色图片、精灵图、图标、音频及其他媒体资源不属于 MIT 授权范围。除非资源附有单独的许可证或署名说明，否则其权利由相应权利人保留；复制、修改、分发或商用前请自行确认授权。详见 [ASSET_LICENSE.md](ASSET_LICENSE.md)。
