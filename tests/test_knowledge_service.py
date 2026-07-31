@@ -79,6 +79,28 @@ def test_refresh_repository_ingests_trusted_sources(tmp_path, monkeypatch):
     assert card["source_count"] >= 2
 
 
+def test_load_knowledge_cards_batches_related_reads(tmp_path, monkeypatch):
+    _use_tmp_db(tmp_path, monkeypatch)
+    for index in range(3):
+        repo.upsert_card(dict(_fallback_card(f"topic-{index}"), id=f"card-{index}"))
+
+    monkeypatch.setattr(knowledge_service, "ensure_knowledge_repository", lambda topics=None: None)
+    original_connect = repo._connect
+    connection_count = 0
+
+    def counted_connect():
+        nonlocal connection_count
+        connection_count += 1
+        return original_connect()
+
+    monkeypatch.setattr(repo, "_connect", counted_connect)
+
+    cards = knowledge_service.load_knowledge_cards(limit=3)
+
+    assert len(cards) == 3
+    assert connection_count == 2
+
+
 def _use_tmp_db(tmp_path, monkeypatch):
     db_path = tmp_path / "knowledge_service.db"
     monkeypatch.setattr(knowledge_db, "knowledge_db_path", lambda: db_path)

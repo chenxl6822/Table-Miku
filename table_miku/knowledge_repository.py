@@ -7,6 +7,7 @@ not need to write SQL directly.
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from datetime import datetime
 from typing import Any
@@ -45,8 +46,6 @@ def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
 
 
 def _connect() -> sqlite3.Connection:
-    import sqlite3
-
     conn = _db.connect()
     conn.row_factory = sqlite3.Row
     return conn
@@ -75,27 +74,27 @@ def upsert_card(card: dict[str, Any]) -> str:
 
         conn.execute(
             """
-            INSERT OR REPLACE INTO knowledge_cards
+            INSERT INTO knowledge_cards
                 (id, title, topic, normalized_topic, overview, difficulty,
                  tags, created_at, updated_at, archived)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                topic = excluded.topic,
+                normalized_topic = excluded.normalized_topic,
+                overview = excluded.overview,
+                difficulty = excluded.difficulty,
+                tags = excluded.tags,
+                updated_at = excluded.updated_at,
+                archived = excluded.archived
             """,
             (card_id, title, topic, normalized_topic, overview, difficulty,
              tags, created_at, updated_at, archived),
         )
 
-        # Upsert into FTS index
-        _upsert_fts(
-            conn,
-            card_id,
-            title=title,
-            topic=topic,
-            overview=overview,
-            content="",
-        )
-
         # Upsert related data from card dict
         _upsert_card_extras(conn, card_id, card)
+        _refresh_card_fts(conn, card_id)
 
         conn.commit()
         return card_id
@@ -248,6 +247,53 @@ def get_card_by_topic(topic: str) -> dict[str, Any] | None:
         conn.close()
 
 
+def get_cards(card_ids: list[str]) -> list[dict[str, Any]]:
+    """Return unarchived cards for the requested ids using one connection."""
+    unique_ids = list(dict.fromkeys(card_id for card_id in card_ids if card_id))
+    if not unique_ids:
+        return []
+    placeholders = ",".join("?" for _ in unique_ids)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM knowledge_cards WHERE archived = 0 AND id IN ({placeholders})",
+            unique_ids,
+        ).fetchall()
+        cards_by_id = {str(row["id"]): dict(row) for row in rows}
+        cards = [cards_by_id[card_id] for card_id in unique_ids if card_id in cards_by_id]
+        for card in cards:
+            card["tags"] = _parse_tags(card.get("tags"))
+        _enrich_cards(conn, cards)
+        return cards
+    finally:
+        conn.close()
+
+
+def find_card_ids_by_topics(topics: list[str]) -> dict[str, str]:
+    """Map normalized topics to existing unarchived card ids."""
+    normalized = list(dict.fromkeys(_normalize_topic(topic) for topic in topics if topic.strip()))
+    if not normalized:
+        return {}
+    placeholders = ",".join("?" for _ in normalized)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT normalized_topic, id
+            FROM knowledge_cards
+            WHERE archived = 0 AND normalized_topic IN ({placeholders})
+            ORDER BY updated_at DESC
+            """,
+            normalized,
+        ).fetchall()
+        result: dict[str, str] = {}
+        for row in rows:
+            result.setdefault(str(row["normalized_topic"]), str(row["id"]))
+        return result
+    finally:
+        conn.close()
+
+
 def list_cards(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
     """List unarchived cards, most-recently-updated first."""
     conn = _connect()
@@ -259,7 +305,7 @@ def list_cards(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         cards = _rows_to_dicts(rows)
         for c in cards:
             c["tags"] = _parse_tags(c.get("tags"))
-            _enrich_card(conn, c)
+        _enrich_cards(conn, cards)
         return cards
     finally:
         conn.close()
@@ -284,9 +330,16 @@ def add_source(source: dict[str, Any]) -> str:
 
         conn.execute(
             """
-            INSERT OR REPLACE INTO knowledge_sources
+            INSERT INTO knowledge_sources
                 (id, name, kind, url, license_note, fetched_at, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                kind = excluded.kind,
+                url = excluded.url,
+                license_note = excluded.license_note,
+                fetched_at = excluded.fetched_at,
+                status = excluded.status
             """,
             (sid, name, kind, url, license_note, fetched_at, status),
         )
@@ -335,21 +388,18 @@ def add_chunk(card_id: str, source_id: str | None, chunk: dict[str, Any]) -> str
             (cid, card_id, sid, heading, content, content_hash, quality, created_at),
         )
 
-        # Update FTS content
-        existing_content = conn.execute(
-            "SELECT content FROM knowledge_chunks WHERE card_id = ?", (card_id,)
-        ).fetchall()
-        full_content = " ".join(r[0] for r in existing_content if r[0])
-        card = conn.execute(
-            "SELECT title, topic, overview FROM knowledge_cards WHERE id = ?",
-            (card_id,),
+        existing = conn.execute(
+            """
+            SELECT id FROM knowledge_chunks
+            WHERE card_id = ? AND content_hash = ? AND heading = ?
+              AND COALESCE(source_id, '') = COALESCE(?, '')
+            """,
+            (card_id, content_hash, heading, sid),
         ).fetchone()
-        if card:
-            _upsert_fts(
-                conn, card_id,
-                title=card[0], topic=card[1], overview=card[2],
-                content=full_content,
-            )
+        if existing:
+            cid = str(existing[0])
+
+        _refresh_card_fts(conn, card_id)
 
         conn.commit()
         return cid
@@ -399,6 +449,60 @@ def list_sources_for_card(card_id: str, conn: sqlite3.Connection | None = None) 
             conn.close()
 
 
+def load_card_details(card_ids: list[str]) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """Load chunks, sources, and QA pairs for many cards with one connection."""
+    unique_ids = list(dict.fromkeys(card_id for card_id in card_ids if card_id))
+    details = {
+        card_id: {"chunks": [], "sources": [], "qa_pairs": []}
+        for card_id in unique_ids
+    }
+    if not unique_ids:
+        return details
+
+    placeholders = ",".join("?" for _ in unique_ids)
+    conn = _connect()
+    try:
+        chunk_rows = conn.execute(
+            f"""
+            SELECT * FROM knowledge_chunks
+            WHERE card_id IN ({placeholders})
+            ORDER BY created_at ASC
+            """,
+            unique_ids,
+        ).fetchall()
+        for row in chunk_rows:
+            details[str(row["card_id"])]["chunks"].append(dict(row))
+
+        source_rows = conn.execute(
+            f"""
+            SELECT DISTINCT kc.card_id, ks.*
+            FROM knowledge_chunks kc
+            JOIN knowledge_sources ks ON ks.id = kc.source_id
+            WHERE kc.card_id IN ({placeholders})
+            ORDER BY ks.fetched_at DESC, ks.name ASC
+            """,
+            unique_ids,
+        ).fetchall()
+        for row in source_rows:
+            source = dict(row)
+            card_id = str(source.pop("card_id"))
+            details[card_id]["sources"].append(source)
+
+        qa_rows = conn.execute(
+            f"""
+            SELECT * FROM knowledge_qa_pairs
+            WHERE card_id IN ({placeholders})
+            ORDER BY created_at ASC
+            """,
+            unique_ids,
+        ).fetchall()
+        for row in qa_rows:
+            details[str(row["card_id"])]["qa_pairs"].append(dict(row))
+        return details
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -440,14 +544,12 @@ def _fts_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dict[s
     if not rows:
         return _like_search(conn, query, limit)
 
-    results: list[dict[str, Any]] = []
-    for row in rows:
-        card = dict(row)
+    results = [dict(row) for row in rows]
+    _enrich_cards(conn, results)
+    for card in results:
         card.pop("rank", None)
         card["tags"] = _parse_tags(card.get("tags"))
-        _enrich_card(conn, card)
         card["snippet"] = _build_snippet(card, query)
-        results.append(card)
     return results
 
 
@@ -457,7 +559,14 @@ def _like_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dict[
         """
         SELECT * FROM knowledge_cards
         WHERE archived = 0
-          AND (title LIKE ? OR topic LIKE ? OR overview LIKE ?)
+          AND (
+              title LIKE ? OR topic LIKE ? OR overview LIKE ?
+              OR EXISTS (
+                  SELECT 1 FROM knowledge_chunks
+                  WHERE knowledge_chunks.card_id = knowledge_cards.id
+                    AND knowledge_chunks.content LIKE ?
+              )
+          )
         ORDER BY
             CASE WHEN title LIKE ? THEN 0
                  WHEN topic LIKE ? THEN 1
@@ -465,16 +574,14 @@ def _like_search(conn: sqlite3.Connection, query: str, limit: int) -> list[dict[
             updated_at DESC
         LIMIT ?
         """,
-        (pattern, pattern, pattern, pattern, pattern, limit),
+        (pattern, pattern, pattern, pattern, pattern, pattern, limit),
     ).fetchall()
 
-    results: list[dict[str, Any]] = []
-    for row in rows:
-        card = dict(row)
+    results = [dict(row) for row in rows]
+    _enrich_cards(conn, results)
+    for card in results:
         card["tags"] = _parse_tags(card.get("tags"))
-        _enrich_card(conn, card)
         card["snippet"] = _build_snippet(card, query)
-        results.append(card)
     return results
 
 
@@ -899,28 +1006,62 @@ def _parse_tags(raw: Any) -> list[str]:
 
 def _enrich_card(conn: sqlite3.Connection, card: dict[str, Any]) -> None:
     """Add computed fields to a card dict: source_count, mastery, next_review_at."""
-    card_id = card.get("id", "")
-    if not card_id:
-        return
+    _enrich_cards(conn, [card])
 
-    # Source count
-    row = conn.execute(
-        "SELECT COUNT(DISTINCT source_id) FROM knowledge_chunks WHERE card_id = ? AND source_id IS NOT NULL",
-        (card_id,),
-    ).fetchone()
-    card["source_count"] = row[0] if row else 0
 
-    # Review state
-    row = conn.execute(
-        "SELECT mastery, next_review_at FROM review_states WHERE card_id = ?",
-        (card_id,),
-    ).fetchone()
-    if row:
-        card["mastery"] = row["mastery"]
-        card["next_review_at"] = row["next_review_at"]
-    else:
+def _enrich_cards(conn: sqlite3.Connection, cards: list[dict[str, Any]]) -> None:
+    """Add source/review metadata to many cards with one aggregate query."""
+    card_by_id = {str(card.get("id")): card for card in cards if card.get("id")}
+    for card in cards:
+        card["source_count"] = 0
         card["mastery"] = 0.0
         card["next_review_at"] = None
+    if not card_by_id:
+        return
+
+    placeholders = ",".join("?" for _ in card_by_id)
+    rows = conn.execute(
+        f"""
+        SELECT kc.id,
+               COUNT(DISTINCT kch.source_id) AS source_count,
+               COALESCE(rs.mastery, 0.0) AS mastery,
+               rs.next_review_at
+        FROM knowledge_cards kc
+        LEFT JOIN knowledge_chunks kch
+               ON kch.card_id = kc.id AND kch.source_id IS NOT NULL
+        LEFT JOIN review_states rs ON rs.card_id = kc.id
+        WHERE kc.id IN ({placeholders})
+        GROUP BY kc.id, rs.mastery, rs.next_review_at
+        """,
+        list(card_by_id),
+    ).fetchall()
+    for row in rows:
+        card = card_by_id[str(row["id"])]
+        card["source_count"] = int(row["source_count"] or 0)
+        card["mastery"] = float(row["mastery"] or 0.0)
+        card["next_review_at"] = row["next_review_at"]
+
+
+def _refresh_card_fts(conn: sqlite3.Connection, card_id: str) -> None:
+    card = conn.execute(
+        "SELECT title, topic, overview FROM knowledge_cards WHERE id = ?",
+        (card_id,),
+    ).fetchone()
+    if card is None:
+        return
+    chunks = conn.execute(
+        "SELECT content FROM knowledge_chunks WHERE card_id = ? ORDER BY created_at ASC",
+        (card_id,),
+    ).fetchall()
+    full_content = " ".join(str(row[0]) for row in chunks if row[0])
+    _upsert_fts(
+        conn,
+        card_id,
+        title=str(card[0]),
+        topic=str(card[1]),
+        overview=str(card[2]),
+        content=full_content,
+    )
 
 
 def _upsert_fts(

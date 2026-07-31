@@ -107,3 +107,48 @@ class TestInitDb:
         path = knowledge_db.knowledge_db_path()
         assert path.parent == user_data_dir()
         assert path.name == "knowledge.db"
+
+    def test_v2_migration_deduplicates_related_rows(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "test_v1.db"
+        monkeypatch.setattr(knowledge_db, "knowledge_db_path", lambda: db_path)
+        conn = knowledge_db.connect()
+        try:
+            for statement in knowledge_db._SCHEMA_STATEMENTS:
+                conn.execute(statement)
+            knowledge_db._ensure_schema_version_table(conn)
+            conn.execute(
+                "INSERT INTO _schema_version(version, applied_at) VALUES(1, '2026-01-01T00:00:00')"
+            )
+            conn.execute(
+                """
+                INSERT INTO knowledge_cards
+                    (id, title, topic, normalized_topic, created_at, updated_at)
+                VALUES ('card-1', 'Card', 'Topic', 'topic', '2026-01-01', '2026-01-01')
+                """
+            )
+            for chunk_id in ("chunk-a", "chunk-b"):
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_chunks
+                        (id, card_id, heading, content, content_hash, created_at)
+                    VALUES (?, 'card-1', 'H', 'same', 'hash-1', '2026-01-01')
+                    """,
+                    (chunk_id,),
+                )
+            for qa_id, chunk_id in (("qa-a", "chunk-a"), ("qa-b", "chunk-b")):
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_qa_pairs
+                        (id, card_id, question, answer, source_chunk_id, created_at, updated_at)
+                    VALUES (?, 'card-1', 'Q', 'A', ?, '2026-01-01', '2026-01-01')
+                    """,
+                    (qa_id, chunk_id),
+                )
+
+            knowledge_db.migrate(conn)
+
+            assert knowledge_db.get_schema_version(conn) == 2
+            assert conn.execute("SELECT COUNT(*) FROM knowledge_chunks").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM knowledge_qa_pairs").fetchone()[0] == 1
+        finally:
+            conn.close()

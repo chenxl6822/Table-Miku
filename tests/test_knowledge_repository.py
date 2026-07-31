@@ -67,6 +67,27 @@ class TestUpsertCard:
         assert qa_pairs[0]["question"] == "TCP为什么需要三次握手？"
         assert len(qa_pairs[0]["answer"]) > 0
 
+    def test_repeated_upsert_does_not_duplicate_chunks(self, tmp_path, monkeypatch):
+        _use_tmp_db(tmp_path, monkeypatch)
+
+        repo.upsert_card(dict(SAMPLE_CARD))
+        first_chunks = repo.list_chunks("wiki-test-tcp")
+        repo.upsert_card(dict(SAMPLE_CARD))
+        second_chunks = repo.list_chunks("wiki-test-tcp")
+
+        assert first_chunks
+        assert len(second_chunks) == len(first_chunks)
+
+    def test_update_preserves_original_created_at(self, tmp_path, monkeypatch):
+        _use_tmp_db(tmp_path, monkeypatch)
+        repo.upsert_card(dict(SAMPLE_CARD, created_at="2024-01-02T03:04:05"))
+
+        repo.upsert_card(dict(SAMPLE_CARD, created_at="2030-01-02T03:04:05"))
+
+        card = repo.get_card("wiki-test-tcp")
+        assert card is not None
+        assert card["created_at"] == "2024-01-02T03:04:05"
+
 
 class TestGetCard:
     def test_returns_none_for_missing(self, tmp_path, monkeypatch):
@@ -119,6 +140,21 @@ class TestSearch:
         results = repo.search_cards("TCP", limit=10)
         if results:
             assert "snippet" in results[0]
+
+    def test_search_finds_content_stored_only_in_chunks(self, tmp_path, monkeypatch):
+        _use_tmp_db(tmp_path, monkeypatch)
+        card = dict(
+            SAMPLE_CARD,
+            overview="overview without the search term",
+            sections=[{"heading": "internal", "content": "uniquesectiontoken"}],
+            key_points=[],
+            glossary=[],
+        )
+        repo.upsert_card(card)
+
+        results = repo.search_cards("uniquesectiontoken", limit=10)
+
+        assert [result["id"] for result in results] == ["wiki-test-tcp"]
 
 
 class TestReviews:
@@ -251,6 +287,19 @@ class TestSources:
         _use_tmp_db(tmp_path, monkeypatch)
         assert repo.get_source("nonexistent") is None
 
+    def test_update_source_keeps_linked_chunks_valid(self, tmp_path, monkeypatch):
+        _use_tmp_db(tmp_path, monkeypatch)
+        repo.upsert_card(dict(SAMPLE_CARD))
+        source_id = repo.add_source({"id": "source-1", "name": "Old", "kind": "web"})
+        repo.add_chunk("wiki-test-tcp", source_id, {"content": "linked content"})
+
+        repo.add_source({"id": source_id, "name": "New", "kind": "web"})
+
+        source = repo.get_source(source_id)
+        assert source is not None
+        assert source["name"] == "New"
+        assert repo.get_card("wiki-test-tcp")["source_count"] == 1
+
 
 class TestChunks:
     def test_add_chunk(self, tmp_path, monkeypatch):
@@ -262,6 +311,18 @@ class TestChunks:
             "content": "这是测试内容，用于验证chunk功能。",
         })
         assert cid
+
+    def test_add_chunk_returns_existing_id_for_duplicate(self, tmp_path, monkeypatch):
+        _use_tmp_db(tmp_path, monkeypatch)
+        repo.upsert_card(dict(SAMPLE_CARD))
+        chunk = {"heading": "测试小节", "content": "相同内容"}
+
+        first_id = repo.add_chunk("wiki-test-tcp", "", chunk)
+        second_id = repo.add_chunk("wiki-test-tcp", "", chunk)
+
+        matching = [item for item in repo.list_chunks("wiki-test-tcp") if item["content"] == "相同内容"]
+        assert second_id == first_id
+        assert len(matching) == 1
 
 
 class TestIngestJobs:

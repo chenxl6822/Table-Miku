@@ -21,16 +21,27 @@ from .knowledge_migration import migrate_json_to_sqlite
 from .storage import load_settings
 
 
+_initialized_repository_keys: set[tuple[str, tuple[str, ...]]] = set()
+
+
 def ensure_knowledge_repository(topics: list[str] | None = None) -> None:
     """Initialize SQLite knowledge data and seed missing default topics."""
+    selected_topics = normalize_knowledge_topics(topics or DEFAULT_KNOWLEDGE_TOPICS)
+    cache_key = (
+        str(knowledge_db.knowledge_db_path().resolve()),
+        tuple(sorted(topic.strip().lower() for topic in selected_topics)),
+    )
+    if cache_key in _initialized_repository_keys and knowledge_db.knowledge_db_path().exists():
+        return
+
     knowledge_db.init_db()
     migrate_json_to_sqlite(force=False)
-    selected_topics = normalize_knowledge_topics(topics or DEFAULT_KNOWLEDGE_TOPICS)
+    existing_by_topic = repo.find_card_ids_by_topics(selected_topics)
     card_ids: list[str] = []
     for topic in selected_topics:
-        existing = repo.get_card_by_topic(topic)
-        if existing is not None:
-            card_ids.append(str(existing["id"]))
+        existing_id = existing_by_topic.get(topic.strip().lower())
+        if existing_id:
+            card_ids.append(existing_id)
             continue
         card_ids.append(repo.upsert_card(_fallback_card(topic)))
 
@@ -41,6 +52,7 @@ def ensure_knowledge_repository(topics: list[str] | None = None) -> None:
         conn.commit()
     finally:
         conn.close()
+    _initialized_repository_keys.add(cache_key)
 
 
 def load_knowledge_cards(limit: int = 100) -> list[dict[str, Any]]:
@@ -49,7 +61,11 @@ def load_knowledge_cards(limit: int = 100) -> list[dict[str, Any]]:
         ensure_knowledge_repository()
         cards = repo.list_cards(limit=limit)
         if cards:
-            return [_repository_card_to_legacy(card) for card in cards]
+            details = repo.load_card_details([str(card.get("id") or "") for card in cards])
+            return [
+                _repository_card_to_legacy(card, details.get(str(card.get("id") or "")))
+                for card in cards
+            ]
     except Exception:
         pass
     return legacy_load_knowledge()[:limit]
@@ -58,7 +74,12 @@ def load_knowledge_cards(limit: int = 100) -> list[dict[str, Any]]:
 def search_knowledge_cards(query: str, limit: int = 20) -> list[dict[str, Any]]:
     try:
         ensure_knowledge_repository()
-        return [_repository_card_to_legacy(card) for card in repo.search_cards(query, limit=limit)]
+        cards = repo.search_cards(query, limit=limit)
+        details = repo.load_card_details([str(card.get("id") or "") for card in cards])
+        return [
+            _repository_card_to_legacy(card, details.get(str(card.get("id") or "")))
+            for card in cards
+        ]
     except Exception:
         query_lower = query.lower()
         return [
@@ -103,12 +124,21 @@ def due_review_items(now: datetime | None = None, limit: int = 10) -> list[dict[
     try:
         ensure_knowledge_repository()
         due = repo.get_due_reviews(now=now, limit=limit)
+        card_ids = [str(state.get("card_id") or "") for state in due]
+        cards = {str(card["id"]): card for card in repo.get_cards(card_ids)}
+        details = repo.load_card_details(card_ids)
         items: list[dict[str, Any]] = []
         for state in due:
-            card = repo.get_card(str(state.get("card_id") or ""))
+            card_id = str(state.get("card_id") or "")
+            card = cards.get(card_id)
             if not card:
                 continue
-            items.append({"card": _repository_card_to_legacy(card), "state": state})
+            items.append(
+                {
+                    "card": _repository_card_to_legacy(card, details.get(card_id)),
+                    "state": state,
+                }
+            )
         return items
     except Exception:
         from .knowledge_review import due_review_items as legacy_due_review_items
@@ -142,11 +172,14 @@ def review_summary(now: datetime | None = None) -> str:
     return f"知识复习：今日待复习 {count} 个：{names}。"
 
 
-def _repository_card_to_legacy(card: dict[str, Any]) -> dict[str, Any]:
+def _repository_card_to_legacy(
+    card: dict[str, Any],
+    details: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
     card_id = str(card.get("id") or "")
-    chunks = repo.list_chunks(card_id) if card_id else []
-    sources = repo.list_sources_for_card(card_id) if card_id else []
-    qa_pairs = repo.list_qa_pairs(card_id) if card_id else []
+    chunks = details.get("chunks", []) if details is not None else repo.list_chunks(card_id) if card_id else []
+    sources = details.get("sources", []) if details is not None else repo.list_sources_for_card(card_id) if card_id else []
+    qa_pairs = details.get("qa_pairs", []) if details is not None else repo.list_qa_pairs(card_id) if card_id else []
     key_points = [chunk["content"] for chunk in chunks if str(chunk.get("heading") or "") == "关键点"]
     sections = [
         {"heading": str(chunk.get("heading") or "知识片段"), "content": str(chunk.get("content") or "")}
