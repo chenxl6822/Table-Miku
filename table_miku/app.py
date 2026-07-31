@@ -64,7 +64,6 @@ from .sprites import export_menu_icon, export_runtime_sprite_assets
 from .startup import is_startup_enabled, set_startup_enabled
 from .storage import load_goals, load_settings, save_settings
 from .system_monitor import SystemMonitor
-from .weather import get_weather
 from .weather_monitor import WeatherMonitor
 
 
@@ -1208,17 +1207,9 @@ class TableMiku(QWidget):
         self.say(f"定位设置已更新为：{self.settings['city']}")
 
     def show_weather(self) -> None:
-        self.settings = load_settings()
-        city = self.settings.get("city", "auto")
         self.pet.set_expression("focus")
         self.say("我正在定位并查询天气，稍等一下。")
-        QApplication.processEvents()
-        try:
-            self.pet.set_expression("smile")
-            self.say(get_weather(city))
-        except Exception:
-            self.pet.set_expression("surprised")
-            self.say("天气查询暂时失败了。请检查网络，或右键把城市设置为 auto / 具体城市名。")
+        self.assistant.weather_now()
 
     def show_system_status(self) -> None:
         self.pet.set_expression("focus")
