@@ -1,0 +1,44 @@
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      QT_QPA_PLATFORM: offscreen
+      TABLE_MIKU_DATA_DIR: ${{ runner.temp }}\TableMiku-ci-data
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Verify dependency consistency
+        run: python -m pip check
+      - name: Lint
+        run: python -m ruff check main.py table_miku tests
+      - name: Test with coverage
+        run: python -m pytest --cov=table_miku --cov-branch --cov-report=term-missing
+      - name: Audit production dependencies
+        run: python -m pip_audit -r requirements.txt
+      - name: Build Windows package
+        shell: pwsh
+        run: |
+          python build.py
+          if (-not (Test-Path -LiteralPath .\dist\TableMiku\TableMiku.exe)) {
+            throw "PyInstaller smoke build did not create TableMiku.exe"
+          }

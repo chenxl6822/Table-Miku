@@ -1,5 +1,8 @@
+import sqlite3
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -55,6 +58,16 @@ def test_record_review_updates_sqlite(tmp_path, monkeypatch):
     assert history[0]["note"] == "ok"
 
 
+def test_record_review_does_not_fall_back_to_json_on_sqlite_error(monkeypatch):
+    def fail_review(*args, **kwargs):
+        raise sqlite3.OperationalError("locked")
+
+    monkeypatch.setattr(repo, "record_review", fail_review)
+
+    with pytest.raises(knowledge_service.KnowledgeStorageError, match="未改写旧 JSON"):
+        knowledge_service.record_review("card-1", "known")
+
+
 def test_refresh_repository_ingests_trusted_sources(tmp_path, monkeypatch):
     _use_tmp_db(tmp_path, monkeypatch)
     vault = tmp_path / "vault"
@@ -77,6 +90,28 @@ def test_refresh_repository_ingests_trusted_sources(tmp_path, monkeypatch):
     assert summary["trusted_chunks"] >= 2
     assert card is not None
     assert card["source_count"] >= 2
+
+
+def test_load_knowledge_cards_batches_related_reads(tmp_path, monkeypatch):
+    _use_tmp_db(tmp_path, monkeypatch)
+    for index in range(3):
+        repo.upsert_card(dict(_fallback_card(f"topic-{index}"), id=f"card-{index}"))
+
+    monkeypatch.setattr(knowledge_service, "ensure_knowledge_repository", lambda topics=None: None)
+    original_connect = repo._connect
+    connection_count = 0
+
+    def counted_connect():
+        nonlocal connection_count
+        connection_count += 1
+        return original_connect()
+
+    monkeypatch.setattr(repo, "_connect", counted_connect)
+
+    cards = knowledge_service.load_knowledge_cards(limit=3)
+
+    assert len(cards) == 3
+    assert connection_count == 2
 
 
 def _use_tmp_db(tmp_path, monkeypatch):

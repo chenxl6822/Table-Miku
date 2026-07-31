@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -16,6 +17,8 @@ class WeatherMonitor(QObject):
     """主动天气监测服务，发现恶劣天气时通过 notice 信号提醒"""
 
     notice = Signal(str, str)
+    _result_ready = Signal(object, int)
+    _check_failed = Signal(str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -23,9 +26,12 @@ class WeatherMonitor(QObject):
         self._interval_minutes = 20
         self._cooldown_minutes = 60  # 同类提醒冷却
         self._last_alert: dict[str, datetime] = {}  # type → datetime 去重
+        self._running = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._check)
         self._timer.setSingleShot(False)
+        self._result_ready.connect(self._handle_result)
+        self._check_failed.connect(self._handle_failure)
 
     def start(self) -> None:
         """启动定时检查"""
@@ -49,17 +55,41 @@ class WeatherMonitor(QObject):
                 return
             self._apply_settings(weather_alerts)
             city = settings.get("city", "北京")
-            location = resolve_location(city)
-            if location.get("latitude") is None:
-                return
-            data = fetch_open_meteo(location["latitude"], location["longitude"], include_hourly=True)
-            if data is None:
+            if self._running:
                 return
             lead_minutes = int(weather_alerts.get("lead_minutes", 30))
             lead_hours = max(1, (max(lead_minutes, 0) + 59) // 60)
-            self._evaluate(data, lead_hours=lead_hours)
+            self._running = True
+            threading.Thread(
+                target=self._fetch_worker,
+                args=(str(city), lead_hours),
+                daemon=True,
+            ).start()
         except Exception as e:
             logger.error(f"WeatherMonitor check failed: {e}")
+
+    def _fetch_worker(self, city: str, lead_hours: int) -> None:
+        try:
+            location = resolve_location(city)
+            if location.get("latitude") is None:
+                raise RuntimeError("天气位置缺少坐标")
+            data = fetch_open_meteo(
+                location["latitude"],
+                location["longitude"],
+                include_hourly=True,
+            )
+            self._result_ready.emit(data, lead_hours)
+        except Exception as ex:
+            self._check_failed.emit(str(ex))
+
+    def _handle_result(self, data: dict[str, Any], lead_hours: int) -> None:
+        self._running = False
+        if data:
+            self._evaluate(data, lead_hours=lead_hours)
+
+    def _handle_failure(self, message: str) -> None:
+        self._running = False
+        logger.warning("WeatherMonitor check failed: %s", message)
 
     def _evaluate(self, data: dict[str, Any], lead_hours: int = 0) -> None:
         now = datetime.now()

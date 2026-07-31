@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .paths import PROJECT_ROOT, user_data_dir
+from .paths import PROJECT_ROOT, runtime_path
 
 
 DEFAULT_KNOWLEDGE_TOPICS = [
@@ -68,6 +68,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "weather_report_time": "08:10",
         "startup_brief": True,
         "command_max_output_chars": 420,
+        "command_timeout_seconds": 600,
         "ai_agent_enabled": False,
         "ai_use_direct_api": True,
         "ai_provider": "deepseek",
@@ -134,7 +135,7 @@ DEFAULT_GOALS: list[dict[str, Any]] = [
 
 
 def _path(filename: str) -> Path:
-    return user_data_dir() / filename
+    return runtime_path(filename)
 
 
 def read_json(filename: str, default: Any) -> Any:
@@ -183,6 +184,7 @@ def load_settings() -> dict[str, Any]:
     settings = read_json("settings.json", DEFAULT_SETTINGS)
     merged = deepcopy(DEFAULT_SETTINGS)
     result = _deep_merge(merged, settings)
+    _normalize_numeric_settings(result)
     _normalize_assistant_provider(result)
     _normalize_knowledge_settings(result)
     return result
@@ -214,6 +216,67 @@ def _normalize_assistant_provider(settings: dict[str, Any]) -> None:
     assistant["ai_provider"] = "deepseek"
     assistant.setdefault("deepseek_model", "deepseek-v4-flash")
     assistant.setdefault("deepseek_base_url", "https://api.deepseek.com")
+
+
+def _normalize_numeric_settings(settings: dict[str, Any]) -> None:
+    """Clamp user-editable numeric settings to safe runtime ranges."""
+    settings["reminder_interval_minutes"] = _coerce_int(
+        settings.get("reminder_interval_minutes"), 60, 1, 24 * 60
+    )
+    settings["bubble_seconds"] = _coerce_int(settings.get("bubble_seconds"), 7, 1, 60)
+
+    numeric_sections: dict[str, dict[str, tuple[int, int, int]]] = {
+        "quiet_hours": {
+            "start": (23, 0, 23),
+            "end": (7, 0, 23),
+        },
+        "system_monitor": {
+            "check_interval_seconds": (30, 5, 3600),
+            "cpu_warning_percent": (85, 1, 100),
+            "cpu_warning_checks": (3, 1, 100),
+            "memory_warning_percent": (88, 1, 100),
+            "memory_available_warning_mb": (1024, 1, 1024 * 1024),
+            "memory_warning_checks": (2, 1, 100),
+            "network_check_interval_minutes": (2, 1, 24 * 60),
+            "network_timeout_seconds": (4, 1, 120),
+            "network_warning_checks": (2, 1, 100),
+            "network_healthy_report_minutes": (30, 1, 7 * 24 * 60),
+        },
+        "assistant": {
+            "command_max_output_chars": (420, 120, 10_000),
+            "command_timeout_seconds": (600, 5, 24 * 60 * 60),
+        },
+        "course_reminders": {
+            "lead_minutes": (10, 0, 24 * 60),
+        },
+        "pomodoro": {
+            "work_minutes": (25, 1, 24 * 60),
+            "break_minutes": (5, 1, 24 * 60),
+            "cycles_completed": (0, 0, 1_000_000),
+        },
+        "weather_alerts": {
+            "interval_minutes": (20, 1, 24 * 60),
+            "cooldown_minutes": (60, 1, 7 * 24 * 60),
+            "lead_minutes": (30, 0, 24 * 60),
+        },
+    }
+    for section_name, fields in numeric_sections.items():
+        section = settings.get(section_name)
+        if not isinstance(section, dict):
+            section = deepcopy(DEFAULT_SETTINGS[section_name])
+            settings[section_name] = section
+        for field, (default, minimum, maximum) in fields.items():
+            section[field] = _coerce_int(section.get(field), default, minimum, maximum)
+
+
+def _coerce_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return min(max(parsed, minimum), maximum)
 
 
 def _normalize_knowledge_settings(settings: dict[str, Any]) -> None:

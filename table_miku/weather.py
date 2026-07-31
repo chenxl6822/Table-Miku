@@ -127,7 +127,11 @@ def get_weather(location_text: str = "雨湖区,湘潭,湖南") -> str:
     source_note = format_location_source_note(location)
 
     trend = analyze_weather_trend(daily) if daily else ""
-    upcoming = summarize_hourly_alerts(weather.get("hourly") or {}, lead_hours=6)
+    upcoming = summarize_hourly_alerts(
+        weather.get("hourly") or {},
+        lead_hours=6,
+        current_time=current.get("time"),
+    )
 
     lines: list[str] = []
     lines.append(
@@ -402,11 +406,17 @@ def evaluate_weather_alerts(data: dict[str, Any], lead_hours: int = 0) -> list[d
     codes = hourly.get("weather_code") or []
     temps = hourly.get("temperature_2m") or []
     winds = hourly.get("wind_speed_10m") or []
-    limit = min(len(codes), max(int(lead_hours), 1) + 1)
+    start_index = _hourly_start_index(times, current.get("time"))
+    sample_count = (
+        max(int(lead_hours), 1)
+        if current.get("time")
+        else max(int(lead_hours), 1) + 1
+    )
+    stop_index = min(len(codes), start_index + sample_count)
     current_types = {alert["type"] for alert in alerts}
     future_types: set[str] = set()
 
-    for index in range(limit):
+    for index in range(start_index, stop_index):
         time_label = _format_hour_label(times[index] if index < len(times) else "")
         sample_alerts = _alerts_from_sample(
             codes[index],
@@ -426,10 +436,17 @@ def evaluate_weather_alerts(data: dict[str, Any], lead_hours: int = 0) -> list[d
     return alerts
 
 
-def summarize_hourly_alerts(hourly_data: dict[str, Any], lead_hours: int = 6) -> str:
+def summarize_hourly_alerts(
+    hourly_data: dict[str, Any],
+    lead_hours: int = 6,
+    current_time: Any = None,
+) -> str:
     if not hourly_data:
         return ""
-    alerts = evaluate_weather_alerts({"hourly": hourly_data}, lead_hours=lead_hours)
+    alerts = evaluate_weather_alerts(
+        {"current": {"time": current_time}, "hourly": hourly_data},
+        lead_hours=lead_hours,
+    )
     future_messages = [
         str(alert.get("message", ""))
         for alert in alerts
@@ -515,18 +532,18 @@ def format_location_source_note(location: dict[str, Any]) -> str:
 
 
 def detect_ip_location() -> dict[str, Any]:
-    data = _get_json("http://ip-api.com/json/?lang=zh-CN")
-    if data.get("status") != "success":
+    data = _get_json("https://ipwho.is/")
+    if not data.get("success"):
         raise RuntimeError("IP 自动定位失败，请手动填写区县、城市和省份。")
-    city = data.get("city") or data.get("regionName") or "当前位置"
-    region = data.get("regionName") or ""
+    city = data.get("city") or data.get("region") or "当前位置"
+    region = data.get("region") or ""
     return {
         "district": "",
         "city": city,
         "region": region,
         "country": data.get("country") or "",
-        "latitude": float(data["lat"]),
-        "longitude": float(data["lon"]),
+        "latitude": float(data["latitude"]),
+        "longitude": float(data["longitude"]),
         "display_name": "，".join([part for part in [region, city, data.get("country")] if part]),
         "source": "ip",
         "confidence": "low",
@@ -625,6 +642,27 @@ def _format_hour_label(raw_time: Any) -> str:
         return datetime.fromisoformat(text).strftime("%H:%M")
     except ValueError:
         return text.split("T", 1)[-1]
+
+
+def _hourly_start_index(times: list[Any], current_time: Any) -> int:
+    """Return the first hourly sample that is not earlier than the current time."""
+    if not current_time:
+        return 0
+    try:
+        reference = datetime.fromisoformat(str(current_time))
+    except ValueError:
+        return 0
+    for index, raw_time in enumerate(times):
+        try:
+            sample_time = datetime.fromisoformat(str(raw_time))
+        except ValueError:
+            continue
+        try:
+            if sample_time >= reference:
+                return index
+        except TypeError:
+            return 0
+    return len(times)
 
 
 def _as_int(value: Any) -> int | None:

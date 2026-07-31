@@ -10,12 +10,12 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from .paths import user_data_dir
+from .paths import runtime_path
 
 # ---------------------------------------------------------------------------
 # Schema version
 # ---------------------------------------------------------------------------
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # DDL
@@ -169,7 +169,7 @@ _lock = threading.Lock()
 
 def knowledge_db_path() -> Path:
     """Return the canonical path for the SQLite knowledge database."""
-    return user_data_dir() / "knowledge.db"
+    return runtime_path("knowledge.db")
 
 
 def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
@@ -248,17 +248,81 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     ts = datetime.now().isoformat(timespec="seconds")
 
-    # Future migrations go here:
-    # if current < 2:
-    #     conn.execute("ALTER TABLE ...")
-    #     conn.execute(
-    #         "INSERT INTO _schema_version(version, applied_at) VALUES(?, ?)",
-    #         (2, ts),
-    #     )
-
-    # Seed the initial version marker.
     if current == 0:
         conn.execute(
             "INSERT OR IGNORE INTO _schema_version(version, applied_at) VALUES(?, ?)",
-            (CURRENT_SCHEMA_VERSION, ts),
+            (1, ts),
         )
+        current = 1
+
+    if current < 2:
+        _migrate_v2(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_version(version, applied_at) VALUES(?, ?)",
+            (2, ts),
+        )
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """Deduplicate related rows, add lookup indexes, and rebuild FTS content."""
+    duplicate_chunks = conn.execute(
+        """
+        SELECT id, MIN(id) OVER (
+            PARTITION BY card_id, content_hash, heading, COALESCE(source_id, '')
+        ) AS keeper_id
+        FROM knowledge_chunks
+        """
+    ).fetchall()
+    for chunk_id, keeper_id in duplicate_chunks:
+        if chunk_id == keeper_id:
+            continue
+        conn.execute(
+            "UPDATE knowledge_qa_pairs SET source_chunk_id = ? WHERE source_chunk_id = ?",
+            (keeper_id, chunk_id),
+        )
+        conn.execute("DELETE FROM knowledge_chunks WHERE id = ?", (chunk_id,))
+
+    conn.execute(
+        """
+        DELETE FROM knowledge_qa_pairs
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM knowledge_qa_pairs
+            GROUP BY card_id, question
+        )
+        """
+    )
+
+    index_statements = [
+        "CREATE INDEX IF NOT EXISTS idx_cards_topic ON knowledge_cards(normalized_topic, archived)",
+        "CREATE INDEX IF NOT EXISTS idx_cards_updated ON knowledge_cards(archived, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_sources_url ON knowledge_sources(url)",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_card ON knowledge_chunks(card_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_source ON knowledge_chunks(source_id)",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_hash ON knowledge_chunks(content_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_identity "
+        "ON knowledge_chunks(card_id, content_hash, heading, COALESCE(source_id, ''))",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_qa_card_question "
+        "ON knowledge_qa_pairs(card_id, question)",
+        "CREATE INDEX IF NOT EXISTS idx_reviews_due ON review_states(next_review_at, mastery)",
+        "CREATE INDEX IF NOT EXISTS idx_review_history_card "
+        "ON review_history(card_id, reviewed_at DESC)",
+    ]
+    for statement in index_statements:
+        conn.execute(statement)
+
+    if _check_fts5(conn):
+        try:
+            conn.execute("DELETE FROM knowledge_fts")
+            conn.execute(
+                """
+                INSERT INTO knowledge_fts(rowid, title, topic, overview, content)
+                SELECT kc.rowid, kc.title, kc.topic, kc.overview,
+                       COALESCE(GROUP_CONCAT(kch.content, ' '), '')
+                FROM knowledge_cards kc
+                LEFT JOIN knowledge_chunks kch ON kch.card_id = kc.id
+                GROUP BY kc.id
+                """
+            )
+        except sqlite3.OperationalError:
+            pass

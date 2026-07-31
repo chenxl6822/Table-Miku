@@ -77,18 +77,29 @@ class PersonalAssistant(QObject):
             self.notice.emit("surprised", "没有识别到命令。第一行可写 cwd=路径，后面写要运行的命令。")
             return False
         max_output = int((settings.get("assistant") or {}).get("command_max_output_chars", 420))
-        command = WatchedCommand(spec, max_output, self)
+        timeout_seconds = int((settings.get("assistant") or {}).get("command_timeout_seconds", 600))
+        command = WatchedCommand(spec, max_output, timeout_seconds, self)
         command.finished_notice.connect(self._command_finished)
         self._commands.append(command)
         command.start()
-        append_event("command", "开始监视命令", spec.command, {"cwd": str(spec.cwd)})
+        append_event(
+            "command",
+            "开始监视命令",
+            payload={"command_id": command.audit_id, "cwd": str(spec.cwd)},
+        )
         self.notice.emit("focus", f"我开始盯着这个命令：{_short(spec.command)}。跑完会叫你。")
         return True
 
-    def ai_plan_now(self) -> None:
+    def cancel_watched_commands(self) -> int:
+        cancelled = sum(1 for command in self._commands if command.cancel())
+        if cancelled:
+            append_event("command", "取消监视命令", payload={"count": cancelled})
+        return cancelled
+
+    def ai_plan_now(self, *, force: bool = False, authority: str = "standing") -> None:
         settings = load_settings()
         assistant = settings.get("assistant") or {}
-        if not assistant.get("ai_agent_enabled", False):
+        if not force and not assistant.get("ai_agent_enabled", False):
             status = agents_sdk_status()
             provider = assistant.get("ai_provider", "deepseek")
             if provider == "deepseek" and "DeepSeek API ready" in status:
@@ -98,7 +109,7 @@ class PersonalAssistant(QObject):
             else:
                 self.notice.emit("focus", f"AI 助理未开启：{status}")
             return
-        self._run_thread(self._agent_worker)
+        self._run_thread(lambda: self._agent_worker(authority))
 
     def _tick(self) -> None:
         settings = load_settings()
@@ -202,13 +213,17 @@ class PersonalAssistant(QObject):
         except Exception:
             self.notice.emit("surprised", "天气汇报失败了。可能是网络、VPN 或天气服务暂时不可用。")
 
-    def _agent_worker(self) -> None:
+    def _agent_worker(self, authority: str = "standing") -> None:
         # 去重守卫：防止并发重复调用
         if self._agent_running:
             print("[assistant] AI Agent 正在运行中，跳过重复调用")
             return
         now = datetime.now()
-        if self._last_agent_run_at and (now - self._last_agent_run_at).total_seconds() < 300:
+        if (
+            authority != "once"
+            and self._last_agent_run_at
+            and (now - self._last_agent_run_at).total_seconds() < 300
+        ):
             print("[assistant] AI Agent 距上次运行不足5分钟，跳过重复调用")
             return
 
@@ -228,7 +243,9 @@ class PersonalAssistant(QObject):
                 str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
             )
             self._last_agent_run_at = datetime.now()
-            append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, result.metadata)
+            metadata = dict(result.metadata or {})
+            metadata["authority"] = authority
+            append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, metadata)
             self.notice.emit("smile" if result.ok else "focus", result.text)
         except Exception as ex:
             print(f"[assistant] AI Agent 执行失败: {ex}")
@@ -252,7 +269,7 @@ class PersonalAssistant(QObject):
         )
 
     def _command_finished(self, expression: str, message: str) -> None:
-        append_event("command", "命令完成", message)
+        append_event("command", "命令完成", payload={"status": expression})
         self.notice.emit(expression, message)
         self._commands = [command for command in self._commands if command.process.state() != QProcess.ProcessState.NotRunning]
 

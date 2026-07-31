@@ -1,6 +1,7 @@
 import urllib.parse
+from datetime import datetime, timedelta
 
-from table_miku import weather
+from table_miku import weather, weather_monitor
 from table_miku.weather_monitor import WeatherMonitor
 
 
@@ -35,7 +36,7 @@ def test_resolve_location_uses_cache(monkeypatch):
         "read_json",
         lambda filename, default: {
             weather._location_cache_key("雨湖区,湘潭,湖南"): {
-                "cached_at": "2026-06-28T10:00:00",
+                "cached_at": (datetime.now() - timedelta(days=1)).isoformat(timespec="seconds"),
                 "location": cached_location,
             }
         },
@@ -83,6 +84,28 @@ def test_fetch_open_meteo_requests_hourly_and_ms_wind(monkeypatch):
     assert "weather_code" in query["daily"][0]
 
 
+def test_detect_ip_location_uses_https(monkeypatch):
+    captured = {}
+
+    def fake_get_json(url, timeout=8.0):
+        captured["url"] = url
+        return {
+            "success": True,
+            "city": "湘潭",
+            "region": "湖南",
+            "country": "中国",
+            "latitude": 27.8,
+            "longitude": 112.9,
+        }
+
+    monkeypatch.setattr(weather, "_get_json", fake_get_json)
+
+    location = weather.detect_ip_location()
+
+    assert captured["url"].startswith("https://")
+    assert location["latitude"] == 27.8
+
+
 def test_evaluate_weather_alerts_includes_hourly_forecast():
     data = {
         "current": {"weather_code": 0, "temperature_2m": 24, "wind_speed_10m": 2},
@@ -100,6 +123,32 @@ def test_evaluate_weather_alerts_includes_hourly_forecast():
     assert any("可能有雷暴" in alert["message"] for alert in alerts)
 
 
+def test_evaluate_weather_alerts_skips_past_hourly_samples():
+    times = [f"2026-07-31T{hour:02d}:00" for hour in range(24)]
+    codes = [0] * 24
+    codes[2] = 95
+    codes[18] = 65
+    data = {
+        "current": {
+            "time": "2026-07-31T17:15",
+            "weather_code": 0,
+            "temperature_2m": 24,
+            "wind_speed_10m": 2,
+        },
+        "hourly": {
+            "time": times,
+            "weather_code": codes,
+            "temperature_2m": [24] * 24,
+            "wind_speed_10m": [2] * 24,
+        },
+    }
+
+    alerts = weather.evaluate_weather_alerts(data, lead_hours=3)
+
+    assert not any(alert["type"] == "thunderstorm" for alert in alerts)
+    assert any(alert["type"] == "rain" and alert["time"] == times[18] for alert in alerts)
+
+
 def test_weather_monitor_cools_down_duplicate_alerts():
     monitor = WeatherMonitor()
     messages: list[str] = []
@@ -110,3 +159,30 @@ def test_weather_monitor_cools_down_duplicate_alerts():
     monitor._evaluate(data)
 
     assert len(messages) == 1
+
+
+def test_weather_monitor_dispatches_network_work_to_background(monkeypatch):
+    monitor = WeatherMonitor()
+    started: dict[str, object] = {}
+    monkeypatch.setattr(
+        weather_monitor,
+        "load_settings",
+        lambda: {"city": "北京", "weather_alerts": {"enabled": True}},
+    )
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            started.update(target=target, args=args, daemon=daemon)
+
+        def start(self):
+            started["started"] = True
+
+    monkeypatch.setattr(weather_monitor.threading, "Thread", FakeThread)
+
+    monitor.check_now()
+
+    assert started["target"] == monitor._fetch_worker
+    assert started["args"] == ("北京", 1)
+    assert started["daemon"] is True
+    assert started["started"] is True
+    monitor._running = False

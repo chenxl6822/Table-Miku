@@ -45,9 +45,12 @@ from .assistant_data import (
     parse_course_time_slots,
 )
 from .assistant_core import PersonalAssistant
+from .ai_consent import AIConsentChoice, request_ai_consent
+from .assistant_log import append_event
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import migrate_legacy_record, qa_pairs_for_card
 from .knowledge_service import (
+    KnowledgeStorageError,
     due_review_items,
     format_knowledge,
     load_knowledge_cards,
@@ -62,7 +65,6 @@ from .sprites import export_menu_icon, export_runtime_sprite_assets
 from .startup import is_startup_enabled, set_startup_enabled
 from .storage import load_goals, load_settings, save_settings
 from .system_monitor import SystemMonitor
-from .weather import get_weather
 from .weather_monitor import WeatherMonitor
 
 
@@ -668,7 +670,12 @@ class ReviewDialog(QDialog):
             miku_parent = miku_parent.parent()
 
         if card_id:
-            updated = record_review(card_id, result)
+            try:
+                updated = record_review(card_id, result)
+            except KnowledgeStorageError:
+                if miku_parent and hasattr(miku_parent, "say"):
+                    miku_parent.say("复习结果保存失败，当前卡片不会继续；请检查数据目录后重试。")
+                return
             if updated and miku_parent and hasattr(miku_parent, 'say'):
                 next_at = updated.get("next_review_at", "")
                 try:
@@ -774,26 +781,6 @@ class ReviewDialog(QDialog):
                     btn.setStyleSheet("QPushButton { color: #c74242; font-weight: bold; } QPushButton:hover { background: #ffeaea; }")
         self._index += 1
         self._show_current()
-
-
-def _deepseek_key_exists() -> bool:
-    import os
-
-    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if key:
-        return True
-    for filename in (".env.local", ".env"):
-        path = PROJECT_ROOT / filename
-        if not path.exists():
-            continue
-        try:
-            for line in path.read_text(encoding="utf-8-sig").splitlines():
-                cleaned = line.strip().lstrip("﻿")
-                if cleaned.startswith("DEEPSEEK_API_KEY="):
-                    return bool(line.split("=", 1)[1].strip().strip('"').strip("'"))
-        except OSError:
-            continue
-    return False
 
 
 class TableMiku(QWidget):
@@ -975,6 +962,7 @@ class TableMiku(QWidget):
         system_status_action = QAction("立即检测电脑/网络", self)
         brief_action = QAction("生成助手简报", self)
         watch_command_action = QAction("运行并监视命令", self)
+        cancel_command_action = QAction("取消正在监视的命令", self)
         ai_plan_action = QAction("AI 规划/汇报（可选）", self)
         toggle_ai_action = QAction(
             "关闭 AI 助理" if (self.settings.get("assistant") or {}).get("ai_agent_enabled", False) else "开启 AI 助理",
@@ -1012,6 +1000,7 @@ class TableMiku(QWidget):
         system_status_action.triggered.connect(self.show_system_status)
         brief_action.triggered.connect(self.show_assistant_brief)
         watch_command_action.triggered.connect(self.watch_command)
+        cancel_command_action.triggered.connect(self.cancel_watched_commands)
         ai_plan_action.triggered.connect(self.show_ai_plan)
         toggle_ai_action.triggered.connect(self.toggle_ai_agent)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
@@ -1060,6 +1049,7 @@ class TableMiku(QWidget):
         tools_menu.addAction(brief_action)
         tools_menu.addAction(ai_plan_action)
         tools_menu.addAction(watch_command_action)
+        tools_menu.addAction(cancel_command_action)
         tools_menu.addSeparator()
         tools_menu.addAction(pomodoro_action)
         tools_menu.addAction(timetable_pdf_action)
@@ -1226,17 +1216,9 @@ class TableMiku(QWidget):
         self.say(f"定位设置已更新为：{self.settings['city']}")
 
     def show_weather(self) -> None:
-        self.settings = load_settings()
-        city = self.settings.get("city", "auto")
         self.pet.set_expression("focus")
         self.say("我正在定位并查询天气，稍等一下。")
-        QApplication.processEvents()
-        try:
-            self.pet.set_expression("smile")
-            self.say(get_weather(city))
-        except Exception:
-            self.pet.set_expression("surprised")
-            self.say("天气查询暂时失败了。请检查网络，或右键把城市设置为 auto / 具体城市名。")
+        self.assistant.weather_now()
 
     def show_system_status(self) -> None:
         self.pet.set_expression("focus")
@@ -1273,6 +1255,11 @@ class TableMiku(QWidget):
         self.pet.set_expression("focus")
         self.assistant.run_watched_command(dialog.text())
 
+    def cancel_watched_commands(self) -> None:
+        cancelled = self.assistant.cancel_watched_commands()
+        self.pet.set_expression("focus" if cancelled else "smile")
+        self.say(f"已请求停止 {cancelled} 个命令。" if cancelled else "当前没有正在运行的命令。")
+
     def show_ai_plan(self) -> None:
         self.pet.set_expression("focus")
         self.assistant.ai_plan_now()
@@ -1280,19 +1267,45 @@ class TableMiku(QWidget):
     def toggle_ai_agent(self) -> None:
         self.settings = load_settings()
         assistant = self.settings.setdefault("assistant", {})
-        enabled = not assistant.get("ai_agent_enabled", False)
-        assistant["ai_agent_enabled"] = enabled
-        if enabled and assistant.get("ai_provider") == "openai" and _deepseek_key_exists():
-            assistant["ai_provider"] = "deepseek"
-            assistant.setdefault("deepseek_model", "deepseek-v4-flash")
-            assistant.setdefault("deepseek_base_url", "https://api.deepseek.com")
-        save_settings(self.settings)
-        self.pet.set_expression("thinking" if enabled else "sleepy")
-        if enabled:
-            self.say("AI 助理已开启。它会结合目标、课程表、投递和面试复盘给你更个性化的提醒。")
-            self.assistant.ai_plan_now()
-        else:
+        if assistant.get("ai_agent_enabled", False):
+            assistant["ai_agent_enabled"] = False
+            save_settings(self.settings)
+            append_event("consent", "AI 助理长期授权已撤销")
+            self.pet.set_expression("sleepy")
             self.say("AI 助理已关闭，本地提醒和番茄钟仍会继续运行。")
+            return
+
+        provider = str(assistant.get("ai_provider", "deepseek")).lower()
+        model_key = "deepseek_model" if provider == "deepseek" else "ai_model"
+        model = str(assistant.get(model_key, "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano"))
+        endpoint = (
+            str(assistant.get("deepseek_base_url", "https://api.deepseek.com")).rstrip("/") + "/chat/completions"
+            if provider == "deepseek"
+            else "https://api.openai.com/v1/responses"
+        )
+        choice = request_ai_consent(
+            provider="DeepSeek" if provider == "deepseek" else "OpenAI",
+            model=model,
+            endpoint=endpoint,
+            parent=self,
+        )
+        if choice is None:
+            self.pet.set_expression("smile")
+            self.say("没有启用 AI；本地功能保持不变。")
+            return
+
+        self.pet.set_expression("thinking")
+        if choice == AIConsentChoice.STANDING:
+            assistant["ai_agent_enabled"] = True
+            save_settings(self.settings)
+            append_event("consent", "AI 助理长期授权已启用", payload={"provider": provider, "model": model})
+            self.say("AI 助理已持续启用；右键菜单可随时关闭。")
+            self.assistant.ai_plan_now(authority="standing")
+            return
+
+        append_event("consent", "AI 助理单次授权", payload={"provider": provider, "model": model})
+        self.say("AI 助理仅运行这一次，不会保存长期授权。")
+        self.assistant.ai_plan_now(force=True, authority="once")
 
     def show_due_reviews(self) -> None:
         """打开今日复习对话框，显示到期知识卡片"""
@@ -1465,42 +1478,8 @@ def run() -> None:
     if not icon.isNull():
         app.setWindowIcon(icon)
 
-    # 自动检测 API key 并开启 AI 助理
-    if _deepseek_key_exists() or _env_value("OPENAI_API_KEY"):
-        _auto_enable_ai()
-
     window = TableMiku()
     desktop = app.primaryScreen().availableGeometry()
     window.move(desktop.right() - window.width() - 32, desktop.bottom() - window.height() - 32)
     window.show()
     sys.exit(app.exec())
-
-
-def _auto_enable_ai() -> None:
-    """如果检测到 API Key 存在且 AI 助理尚未开启，自动启用"""
-    from .storage import load_settings, save_settings
-    settings = load_settings()
-    assistant = settings.setdefault("assistant", {})
-    if not assistant.get("ai_agent_enabled", False):
-        assistant["ai_agent_enabled"] = True
-        save_settings(settings)
-
-
-def _env_value(name: str) -> str:
-    """从环境变量或 .env 文件读取值"""
-    import os
-    key = os.environ.get(name, "").strip()
-    if key:
-        return key
-    for filename in (".env.local", ".env"):
-        path = PROJECT_ROOT / filename
-        if not path.exists():
-            continue
-        try:
-            for line in path.read_text(encoding="utf-8-sig").splitlines():
-                cleaned = line.strip().lstrip("﻿")
-                if cleaned.startswith(f"{name}="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            continue
-    return ""
