@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .paths import PROJECT_ROOT, user_data_dir
+from .paths import PROJECT_ROOT, runtime_path
 
 
 DEFAULT_KNOWLEDGE_TOPICS = [
@@ -134,7 +134,7 @@ DEFAULT_GOALS: list[dict[str, Any]] = [
 
 
 def _path(filename: str) -> Path:
-    return user_data_dir() / filename
+    return runtime_path(filename)
 
 
 def read_json(filename: str, default: Any) -> Any:

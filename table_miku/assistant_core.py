@@ -85,10 +85,10 @@ class PersonalAssistant(QObject):
         self.notice.emit("focus", f"我开始盯着这个命令：{_short(spec.command)}。跑完会叫你。")
         return True
 
-    def ai_plan_now(self) -> None:
+    def ai_plan_now(self, *, force: bool = False, authority: str = "standing") -> None:
         settings = load_settings()
         assistant = settings.get("assistant") or {}
-        if not assistant.get("ai_agent_enabled", False):
+        if not force and not assistant.get("ai_agent_enabled", False):
             status = agents_sdk_status()
             provider = assistant.get("ai_provider", "deepseek")
             if provider == "deepseek" and "DeepSeek API ready" in status:
@@ -98,7 +98,7 @@ class PersonalAssistant(QObject):
             else:
                 self.notice.emit("focus", f"AI 助理未开启：{status}")
             return
-        self._run_thread(self._agent_worker)
+        self._run_thread(lambda: self._agent_worker(authority))
 
     def _tick(self) -> None:
         settings = load_settings()
@@ -202,13 +202,17 @@ class PersonalAssistant(QObject):
         except Exception:
             self.notice.emit("surprised", "天气汇报失败了。可能是网络、VPN 或天气服务暂时不可用。")
 
-    def _agent_worker(self) -> None:
+    def _agent_worker(self, authority: str = "standing") -> None:
         # 去重守卫：防止并发重复调用
         if self._agent_running:
             print("[assistant] AI Agent 正在运行中，跳过重复调用")
             return
         now = datetime.now()
-        if self._last_agent_run_at and (now - self._last_agent_run_at).total_seconds() < 300:
+        if (
+            authority != "once"
+            and self._last_agent_run_at
+            and (now - self._last_agent_run_at).total_seconds() < 300
+        ):
             print("[assistant] AI Agent 距上次运行不足5分钟，跳过重复调用")
             return
 
@@ -228,7 +232,9 @@ class PersonalAssistant(QObject):
                 str(assistant.get("deepseek_base_url", "https://api.deepseek.com")),
             )
             self._last_agent_run_at = datetime.now()
-            append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, result.metadata)
+            metadata = dict(result.metadata or {})
+            metadata["authority"] = authority
+            append_event("ai_agent", "AI Agent 汇报" if result.ok else "AI Agent 未启用", result.text, metadata)
             self.notice.emit("smile" if result.ok else "focus", result.text)
         except Exception as ex:
             print(f"[assistant] AI Agent 执行失败: {ex}")

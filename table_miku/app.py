@@ -45,6 +45,8 @@ from .assistant_data import (
     parse_course_time_slots,
 )
 from .assistant_core import PersonalAssistant
+from .ai_consent import AIConsentChoice, request_ai_consent
+from .assistant_log import append_event
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import migrate_legacy_record, qa_pairs_for_card
 from .knowledge_service import (
@@ -776,26 +778,6 @@ class ReviewDialog(QDialog):
         self._show_current()
 
 
-def _deepseek_key_exists() -> bool:
-    import os
-
-    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if key:
-        return True
-    for filename in (".env.local", ".env"):
-        path = PROJECT_ROOT / filename
-        if not path.exists():
-            continue
-        try:
-            for line in path.read_text(encoding="utf-8-sig").splitlines():
-                cleaned = line.strip().lstrip("﻿")
-                if cleaned.startswith("DEEPSEEK_API_KEY="):
-                    return bool(line.split("=", 1)[1].strip().strip('"').strip("'"))
-        except OSError:
-            continue
-    return False
-
-
 class TableMiku(QWidget):
     async_notice = Signal(str, str)
 
@@ -1280,19 +1262,45 @@ class TableMiku(QWidget):
     def toggle_ai_agent(self) -> None:
         self.settings = load_settings()
         assistant = self.settings.setdefault("assistant", {})
-        enabled = not assistant.get("ai_agent_enabled", False)
-        assistant["ai_agent_enabled"] = enabled
-        if enabled and assistant.get("ai_provider") == "openai" and _deepseek_key_exists():
-            assistant["ai_provider"] = "deepseek"
-            assistant.setdefault("deepseek_model", "deepseek-v4-flash")
-            assistant.setdefault("deepseek_base_url", "https://api.deepseek.com")
-        save_settings(self.settings)
-        self.pet.set_expression("thinking" if enabled else "sleepy")
-        if enabled:
-            self.say("AI 助理已开启。它会结合目标、课程表、投递和面试复盘给你更个性化的提醒。")
-            self.assistant.ai_plan_now()
-        else:
+        if assistant.get("ai_agent_enabled", False):
+            assistant["ai_agent_enabled"] = False
+            save_settings(self.settings)
+            append_event("consent", "AI 助理长期授权已撤销")
+            self.pet.set_expression("sleepy")
             self.say("AI 助理已关闭，本地提醒和番茄钟仍会继续运行。")
+            return
+
+        provider = str(assistant.get("ai_provider", "deepseek")).lower()
+        model_key = "deepseek_model" if provider == "deepseek" else "ai_model"
+        model = str(assistant.get(model_key, "deepseek-v4-flash" if provider == "deepseek" else "gpt-5-nano"))
+        endpoint = (
+            str(assistant.get("deepseek_base_url", "https://api.deepseek.com")).rstrip("/") + "/chat/completions"
+            if provider == "deepseek"
+            else "https://api.openai.com/v1/responses"
+        )
+        choice = request_ai_consent(
+            provider="DeepSeek" if provider == "deepseek" else "OpenAI",
+            model=model,
+            endpoint=endpoint,
+            parent=self,
+        )
+        if choice is None:
+            self.pet.set_expression("smile")
+            self.say("没有启用 AI；本地功能保持不变。")
+            return
+
+        self.pet.set_expression("thinking")
+        if choice == AIConsentChoice.STANDING:
+            assistant["ai_agent_enabled"] = True
+            save_settings(self.settings)
+            append_event("consent", "AI 助理长期授权已启用", payload={"provider": provider, "model": model})
+            self.say("AI 助理已持续启用；右键菜单可随时关闭。")
+            self.assistant.ai_plan_now(authority="standing")
+            return
+
+        append_event("consent", "AI 助理单次授权", payload={"provider": provider, "model": model})
+        self.say("AI 助理仅运行这一次，不会保存长期授权。")
+        self.assistant.ai_plan_now(force=True, authority="once")
 
     def show_due_reviews(self) -> None:
         """打开今日复习对话框，显示到期知识卡片"""
@@ -1465,42 +1473,8 @@ def run() -> None:
     if not icon.isNull():
         app.setWindowIcon(icon)
 
-    # 自动检测 API key 并开启 AI 助理
-    if _deepseek_key_exists() or _env_value("OPENAI_API_KEY"):
-        _auto_enable_ai()
-
     window = TableMiku()
     desktop = app.primaryScreen().availableGeometry()
     window.move(desktop.right() - window.width() - 32, desktop.bottom() - window.height() - 32)
     window.show()
     sys.exit(app.exec())
-
-
-def _auto_enable_ai() -> None:
-    """如果检测到 API Key 存在且 AI 助理尚未开启，自动启用"""
-    from .storage import load_settings, save_settings
-    settings = load_settings()
-    assistant = settings.setdefault("assistant", {})
-    if not assistant.get("ai_agent_enabled", False):
-        assistant["ai_agent_enabled"] = True
-        save_settings(settings)
-
-
-def _env_value(name: str) -> str:
-    """从环境变量或 .env 文件读取值"""
-    import os
-    key = os.environ.get(name, "").strip()
-    if key:
-        return key
-    for filename in (".env.local", ".env"):
-        path = PROJECT_ROOT / filename
-        if not path.exists():
-            continue
-        try:
-            for line in path.read_text(encoding="utf-8-sig").splitlines():
-                cleaned = line.strip().lstrip("﻿")
-                if cleaned.startswith(f"{name}="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            continue
-    return ""

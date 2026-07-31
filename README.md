@@ -2,7 +2,7 @@
 
 Table Miku 是一个 Windows 桌面 Miku 桌宠：可以透明置顶、自由拖动、点击互动、提醒学习计划，也可以查询当前城市天气。
 
-这个项目的 v1 目标是先做成一个稳定、能本地运行、能打包转发的桌宠。默认使用本地规则模板；如果安装 OpenAI Agents SDK 并配置 API Key，可以升级为 AI Agent 规划和汇报。
+这个项目的 v1 目标是先做成一个稳定、能本地运行、能打包转发的桌宠。默认使用本地规则模板；配置 API Key 后，仍需在应用内明确选择单次或持续授权，才会调用 AI 规划和汇报。
 
 ## 功能
 
@@ -87,7 +87,7 @@ python main.py
 安装依赖后执行：
 
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "data;data" --add-data "table_miku/qml;table_miku/qml" main.py
+pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "table_miku/qml;table_miku/qml" main.py
 ```
 
 打包成功后，可执行文件会出现在：
@@ -100,16 +100,16 @@ dist/TableMiku/TableMiku.exe
 
 ## 配置说明
 
-配置文件在源码运行时位于 `data/` 目录：
-
-- `data/settings.json`：城市、提醒开关、提醒间隔、免打扰时间、系统监测配置。
-- `data/goals.json`：学习目标和学习计划。
-
-打包成 `.exe` 后，用户数据会保存到：
+配置和运行数据统一保存在：
 
 ```text
 %APPDATA%/TableMiku/
 ```
+
+首次使用新版源码运行时，程序会把项目旧 `data/` 目录中的同名运行文件复制到上述目录，旧文件不会被删除。主要文件包括：
+
+- `settings.json`：城市、提醒开关、提醒间隔、免打扰时间、系统监测配置。
+- `goals.json`：学习目标和学习计划。
 
 ### 修改城市
 
@@ -229,7 +229,7 @@ cwd=D:\code\Table Pet
 .\.venv\Scripts\python.exe -m compileall main.py table_miku
 ```
 
-`AI 规划/汇报（可选）` 默认不会调用云端模型。要启用真正的 OpenAI Agents SDK，需要安装可选依赖 `openai-agents` 并配置 `OPENAI_API_KEY`，然后把 `assistant.ai_agent_enabled` 改为 `true`。
+`AI 规划/汇报（可选）` 默认不会调用云端模型。配置 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY` 后，还需要在右键菜单选择“开启 AI 助理”，查看将发送的数据范围，并选择“仅运行这一次”或“持续启用”。持续授权可随时从同一菜单撤销。未安装 `openai-agents` 时，OpenAI 提供商会使用 Responses API。
 
 ## 导入学习目标格式
 
@@ -349,7 +349,7 @@ pip install pyinstaller
 然后重新执行打包命令：
 
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "data;data" --add-data "table_miku/qml;table_miku/qml" main.py
+pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "table_miku/qml;table_miku/qml" main.py
 ```
 
 如果仍然失败，可以先用源码运行方式使用项目。
@@ -397,5 +397,5 @@ pytest tests/ -v
 
 ### 打包
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "data;data" --add-data "table_miku/qml;table_miku/qml" main.py
+pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "table_miku/qml;table_miku/qml" main.py
 ```

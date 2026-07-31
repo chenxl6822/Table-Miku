@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from .paths import user_data_dir
+from .paths import runtime_path
 
 # ---------------------------------------------------------------------------
 # Schema version
@@ -169,7 +169,7 @@ _lock = threading.Lock()
 
 def knowledge_db_path() -> Path:
     """Return the canonical path for the SQLite knowledge database."""
-    return user_data_dir() / "knowledge.db"
+    return runtime_path("knowledge.db")
 
 
 def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
