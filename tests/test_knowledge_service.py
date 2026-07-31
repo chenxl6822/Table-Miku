@@ -1,5 +1,8 @@
+import sqlite3
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -53,6 +56,16 @@ def test_record_review_updates_sqlite(tmp_path, monkeypatch):
     assert updated is not None
     assert updated["review_stage"] == 1
     assert history[0]["note"] == "ok"
+
+
+def test_record_review_does_not_fall_back_to_json_on_sqlite_error(monkeypatch):
+    def fail_review(*args, **kwargs):
+        raise sqlite3.OperationalError("locked")
+
+    monkeypatch.setattr(repo, "record_review", fail_review)
+
+    with pytest.raises(knowledge_service.KnowledgeStorageError, match="未改写旧 JSON"):
+        knowledge_service.record_review("card-1", "known")
 
 
 def test_refresh_repository_ingests_trusted_sources(tmp_path, monkeypatch):

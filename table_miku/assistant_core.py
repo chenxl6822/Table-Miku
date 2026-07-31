@@ -77,13 +77,24 @@ class PersonalAssistant(QObject):
             self.notice.emit("surprised", "没有识别到命令。第一行可写 cwd=路径，后面写要运行的命令。")
             return False
         max_output = int((settings.get("assistant") or {}).get("command_max_output_chars", 420))
-        command = WatchedCommand(spec, max_output, self)
+        timeout_seconds = int((settings.get("assistant") or {}).get("command_timeout_seconds", 600))
+        command = WatchedCommand(spec, max_output, timeout_seconds, self)
         command.finished_notice.connect(self._command_finished)
         self._commands.append(command)
         command.start()
-        append_event("command", "开始监视命令", spec.command, {"cwd": str(spec.cwd)})
+        append_event(
+            "command",
+            "开始监视命令",
+            payload={"command_id": command.audit_id, "cwd": str(spec.cwd)},
+        )
         self.notice.emit("focus", f"我开始盯着这个命令：{_short(spec.command)}。跑完会叫你。")
         return True
+
+    def cancel_watched_commands(self) -> int:
+        cancelled = sum(1 for command in self._commands if command.cancel())
+        if cancelled:
+            append_event("command", "取消监视命令", payload={"count": cancelled})
+        return cancelled
 
     def ai_plan_now(self, *, force: bool = False, authority: str = "standing") -> None:
         settings = load_settings()
@@ -258,7 +269,7 @@ class PersonalAssistant(QObject):
         )
 
     def _command_finished(self, expression: str, message: str) -> None:
-        append_event("command", "命令完成", message)
+        append_event("command", "命令完成", payload={"status": expression})
         self.notice.emit(expression, message)
         self._commands = [command for command in self._commands if command.process.state() != QProcess.ProcessState.NotRunning]
 

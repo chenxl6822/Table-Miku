@@ -50,6 +50,7 @@ from .assistant_log import append_event
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import migrate_legacy_record, qa_pairs_for_card
 from .knowledge_service import (
+    KnowledgeStorageError,
     due_review_items,
     format_knowledge,
     load_knowledge_cards,
@@ -669,7 +670,12 @@ class ReviewDialog(QDialog):
             miku_parent = miku_parent.parent()
 
         if card_id:
-            updated = record_review(card_id, result)
+            try:
+                updated = record_review(card_id, result)
+            except KnowledgeStorageError:
+                if miku_parent and hasattr(miku_parent, "say"):
+                    miku_parent.say("复习结果保存失败，当前卡片不会继续；请检查数据目录后重试。")
+                return
             if updated and miku_parent and hasattr(miku_parent, 'say'):
                 next_at = updated.get("next_review_at", "")
                 try:
@@ -956,6 +962,7 @@ class TableMiku(QWidget):
         system_status_action = QAction("立即检测电脑/网络", self)
         brief_action = QAction("生成助手简报", self)
         watch_command_action = QAction("运行并监视命令", self)
+        cancel_command_action = QAction("取消正在监视的命令", self)
         ai_plan_action = QAction("AI 规划/汇报（可选）", self)
         toggle_ai_action = QAction(
             "关闭 AI 助理" if (self.settings.get("assistant") or {}).get("ai_agent_enabled", False) else "开启 AI 助理",
@@ -993,6 +1000,7 @@ class TableMiku(QWidget):
         system_status_action.triggered.connect(self.show_system_status)
         brief_action.triggered.connect(self.show_assistant_brief)
         watch_command_action.triggered.connect(self.watch_command)
+        cancel_command_action.triggered.connect(self.cancel_watched_commands)
         ai_plan_action.triggered.connect(self.show_ai_plan)
         toggle_ai_action.triggered.connect(self.toggle_ai_agent)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
@@ -1041,6 +1049,7 @@ class TableMiku(QWidget):
         tools_menu.addAction(brief_action)
         tools_menu.addAction(ai_plan_action)
         tools_menu.addAction(watch_command_action)
+        tools_menu.addAction(cancel_command_action)
         tools_menu.addSeparator()
         tools_menu.addAction(pomodoro_action)
         tools_menu.addAction(timetable_pdf_action)
@@ -1245,6 +1254,11 @@ class TableMiku(QWidget):
             return
         self.pet.set_expression("focus")
         self.assistant.run_watched_command(dialog.text())
+
+    def cancel_watched_commands(self) -> None:
+        cancelled = self.assistant.cancel_watched_commands()
+        self.pet.set_expression("focus" if cancelled else "smile")
+        self.say(f"已请求停止 {cancelled} 个命令。" if cancelled else "当前没有正在运行的命令。")
 
     def show_ai_plan(self) -> None:
         self.pet.set_expression("focus")

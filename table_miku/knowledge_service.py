@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ from .storage import load_settings
 
 
 _initialized_repository_keys: set[tuple[str, tuple[str, ...]]] = set()
+
+
+class KnowledgeStorageError(RuntimeError):
+    """Raised when a knowledge mutation could not be persisted safely."""
 
 
 def ensure_knowledge_repository(topics: list[str] | None = None) -> None:
@@ -154,10 +159,8 @@ def record_review(
 ) -> dict[str, Any] | None:
     try:
         return repo.record_review(card_id, result, note=note, now=now)
-    except Exception:
-        from .knowledge_review import record_review as legacy_record_review
-
-        return legacy_record_review(card_id, result, note=note, now=now)
+    except (sqlite3.Error, OSError) as ex:
+        raise KnowledgeStorageError("知识复习结果未能写入 SQLite，未改写旧 JSON 数据。") from ex
 
 
 def review_summary(now: datetime | None = None) -> str:
