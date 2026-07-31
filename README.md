@@ -84,10 +84,10 @@ python main.py
 
 ## 打包为 exe
 
-安装依赖后执行：
+安装依赖后执行项目构建脚本；该入口不依赖 PowerShell 脚本执行策略：
 
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "table_miku/qml;table_miku/qml" main.py
+.\.venv\Scripts\python.exe build.py
 ```
 
 打包成功后，可执行文件会出现在：
@@ -113,7 +113,7 @@ dist/TableMiku/TableMiku.exe
 
 ### 修改城市
 
-打开 `data/settings.json`，修改：
+打开 `%APPDATA%\TableMiku\settings.json`，修改：
 
 ```json
 {
@@ -127,7 +127,7 @@ dist/TableMiku/TableMiku.exe
 
 ### 修改定时提醒
 
-打开 `data/settings.json`，修改：
+打开 `%APPDATA%\TableMiku\settings.json`，修改：
 
 ```json
 {
@@ -150,7 +150,7 @@ dist/TableMiku/TableMiku.exe
 
 系统监测默认开启：每 30 秒采样一次 CPU 和内存；CPU 连续 3 次超过 85% 会告警，内存连续 2 次超过 88% 会告警，恢复后也会提示。网络默认每 2 分钟检测一次百度和 Google，启动时和右键“立即检测电脑/网络”会立刻汇报。
 
-打开 `data/settings.json`，可以调整：
+打开 `%APPDATA%\TableMiku\settings.json`，可以调整：
 
 ```json
 {
@@ -189,7 +189,7 @@ dist/TableMiku/TableMiku.exe
 官方文档 / RFC / 标准 / 论文元数据 > Obsidian 只读笔记 > Wikipedia > 离线种子
 ```
 
-如需接入本地 Obsidian 知识库，可在 `data/settings.json` 中配置：
+如需接入本地 Obsidian 知识库，可在 `%APPDATA%\TableMiku\settings.json` 中配置：
 
 ```json
 {
@@ -216,6 +216,7 @@ Table-Miku 只读取该目录下 Markdown 摘要并写入自己的 `knowledge.db
     "weather_report_time": "08:10",
     "startup_brief": true,
     "command_max_output_chars": 420,
+    "command_timeout_seconds": 600,
     "ai_agent_enabled": false,
     "ai_model": "gpt-5-nano"
   }
@@ -228,6 +229,8 @@ Table-Miku 只读取该目录下 Markdown 摘要并写入自己的 `knowledge.db
 cwd=D:\code\Table Pet
 .\.venv\Scripts\python.exe -m compileall main.py table_miku
 ```
+
+命令使用当前系统 PowerShell 执行策略，不会启用 `ExecutionPolicy Bypass`；默认 600 秒超时，可从右键菜单取消。界面只显示有限的末尾输出，事件日志不保存命令或输出全文。
 
 `AI 规划/汇报（可选）` 默认不会调用云端模型。配置 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY` 后，还需要在右键菜单选择“开启 AI 助理”，查看将发送的数据范围，并选择“仅运行这一次”或“持续启用”。持续授权可随时从同一菜单撤销。未安装 `openai-agents` 时，OpenAI 提供商会使用 Responses API。
 
@@ -302,8 +305,8 @@ assets/sprites/miku_sleepy.png
 ## 个人助理增强
 
 - 右键菜单新增番茄钟、课程表 PDF 导入、投递记录、面试复盘、助理记录查看、AI 助理开关和开机自启。
-- AI 助理会优先使用 OpenAI Agents SDK；如果未安装 `openai-agents`，会直接调用 OpenAI Responses API。
-- AI 调用会读取环境变量或项目根目录 `.env.local` / `.env` 中的 `OPENAI_API_KEY`，并把 provider、model、response id、usage 等元数据写入助理事件日志。
+- AI 助理只有在用户查看发送范围并选择单次或持续授权后才会调用外部模型；持续授权可随时撤销。
+- AI 调用会读取环境变量或项目根目录 `.env.local` / `.env` 中的 API Key；事件日志只保留脱敏后的 provider、model、response id、usage 和授权类型等元数据。
 - 课程表 PDF 导入需要 `pypdf` 依赖；执行 `pip install -r requirements.txt` 后可在右键菜单选择 PDF。
 - 投递记录保存到 `applications.json`，面试复盘保存到 `interviews.json`，课程表保存到 `timetable.json`；打包后这些文件位于 `%APPDATA%/TableMiku/`。
 - 开机自启通过 Windows 启动文件夹中的 `TableMiku.cmd` 实现，可在右键菜单开启或关闭。
@@ -332,7 +335,7 @@ pip install -r requirements.txt
 
 ### 提醒没有弹出
 
-检查 `data/settings.json`：
+检查 `%APPDATA%\TableMiku\settings.json`：
 
 - `reminders_enabled` 是否为 `true`
 - `reminder_interval_minutes` 是否太长
@@ -349,7 +352,7 @@ pip install pyinstaller
 然后重新执行打包命令：
 
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "table_miku/qml;table_miku/qml" main.py
+.\.venv\Scripts\python.exe build.py
 ```
 
 如果仍然失败，可以先用源码运行方式使用项目。
@@ -375,7 +378,7 @@ cd Table-Miku
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-pip install pytest  # 运行测试需要
+pip install -r requirements-dev.txt
 ```
 
 如果 PowerShell 禁止运行虚拟环境激活脚本，可以改用：
@@ -392,10 +395,20 @@ pip install pytest  # 运行测试需要
 
 ### 测试
 ```powershell
-pytest tests/ -v
+$env:QT_QPA_PLATFORM = "offscreen"
+$env:TABLE_MIKU_DATA_DIR = Join-Path $env:TEMP "TableMiku-test-data"
+.\.venv\Scripts\python.exe -m ruff check main.py table_miku tests
+.\.venv\Scripts\python.exe -m pytest --cov=table_miku --cov-branch --cov-report=term-missing
+.\.venv\Scripts\python.exe -m pip_audit -r requirements.txt
 ```
 
 ### 打包
 ```powershell
-pyinstaller --noconsole --name TableMiku --add-data "assets;assets" --add-data "table_miku/qml;table_miku/qml" main.py
+.\.venv\Scripts\python.exe build.py
 ```
+
+完整维护与发布检查见 [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md)。
+
+## 许可证状态
+
+仓库当前尚未包含 `LICENSE`。公开发布或允许第三方复用前，需要由维护者明确选择并加入许可证；本次优化没有代替维护者作出该法律选择。

@@ -10,6 +10,11 @@ dist/
 .env.*
 !.env.example
 .pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tmp_pytest/
 data/*.broken
 data/runtime_assets/
 data/*.jsonl

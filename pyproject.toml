@@ -1,0 +1,22 @@
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [".tmp_pytest"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+# Existing legacy modules intentionally keep unused compatibility imports for now.
+ignore = ["F401", "F541", "F841"]
+
+[tool.coverage.run]
+branch = true
+source = ["table_miku"]
+
+[tool.coverage.report]
+fail_under = 40
+show_missing = true
+skip_covered = true
