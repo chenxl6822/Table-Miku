@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from .encoding_utils import looks_mojibake, normalize_zh_text, repair_mojibake
+from .knowledge_seed import curated_pairs_for_topic
 from .storage import read_json, write_json
 
 
@@ -25,6 +26,14 @@ DEFAULT_COMPUTER_TOPICS = [
     "分布式系统",
 ]
 
+PRACTICAL_TOPICS = [
+    "Java 后端基础",
+    "Go 后端基础",
+    "工程实践与架构",
+]
+
+DEFAULT_KNOWLEDGE_TOPICS = DEFAULT_COMPUTER_TOPICS + PRACTICAL_TOPICS
+
 # 中文主题 → 英文 Wikipedia 页面名映射（当中文 Wikipedia 失败时回退）
 TOPIC_ALIASES: dict[str, str] = {
     "计算机组成原理": "Computer_architecture",
@@ -37,6 +46,9 @@ TOPIC_ALIASES: dict[str, str] = {
     "算法设计与分析": "Analysis_of_algorithms",
     "计算机安全": "Computer_security",
     "分布式系统": "Distributed_computing",
+    "Java 后端基础": "Java_(programming_language)",
+    "Go 后端基础": "Go_(programming_language)",
+    "工程实践与架构": "Software_architecture",
 }
 
 # 主题分解：当主主题获取失败时，拆成子主题分别查询
@@ -51,6 +63,34 @@ TOPIC_DECOMPOSITION: dict[str, list[str]] = {
     "算法设计与分析": ["动态规划", "贪心算法", "分治法", "图算法", "NP完全性", "近似算法"],
     "计算机安全": ["加密算法", "网络安全", "认证与授权", "漏洞与攻击", "安全协议"],
     "分布式系统": ["CAP定理", "一致性算法", "分布式事务", "微服务", "消息队列"],
+    "Java 后端基础": ["Java", "JVM", "Spring Framework", "Spring Boot", "Java concurrency", "MyBatis"],
+    "Go 后端基础": ["Go programming language", "Goroutine", "Go modules", "Gin framework", "Go concurrency"],
+    "工程实践与架构": ["Software architecture", "Clean architecture", "Microservices", "REST API", "CI/CD"],
+}
+
+SOURCE_HINTS: dict[str, list[dict[str, str]]] = {
+    "Java 后端基础": [
+        {"name": "Oracle Java Documentation", "kind": "official", "url": "https://docs.oracle.com/en/java/"},
+        {"name": "Spring Framework Documentation", "kind": "official", "url": "https://docs.spring.io/spring-framework/reference/"},
+        {"name": "Spring Boot Documentation", "kind": "official", "url": "https://docs.spring.io/spring-boot/"},
+    ],
+    "Go 后端基础": [
+        {"name": "The Go Programming Language", "kind": "official", "url": "https://go.dev/doc/"},
+        {"name": "Effective Go", "kind": "official", "url": "https://go.dev/doc/effective_go"},
+        {"name": "Go Packages", "kind": "official", "url": "https://pkg.go.dev/"},
+    ],
+    "工程实践与架构": [
+        {"name": "MDN HTTP Documentation", "kind": "official", "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP"},
+        {"name": "12factor App", "kind": "practice", "url": "https://12factor.net/"},
+        {"name": "Martin Fowler Architecture Articles", "kind": "blog-summary-link", "url": "https://martinfowler.com/architecture/"},
+    ],
+    "数据库原理": [
+        {"name": "PostgreSQL Documentation", "kind": "official", "url": "https://www.postgresql.org/docs/"},
+        {"name": "MySQL Documentation", "kind": "official", "url": "https://dev.mysql.com/doc/"},
+    ],
+    "计算机网络": [
+        {"name": "MDN HTTP Documentation", "kind": "official", "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP"},
+    ],
 }
 
 WIKIPEDIA_API = "https://zh.wikipedia.org/w/api.php"
@@ -238,9 +278,110 @@ FALLBACK_KNOWLEDGE: dict[str, dict[str, Any]] = {
         "examples": ["电商系统用消息队列异步处理订单，提升系统吞吐。", "Redis Sentinel 通过选举机制实现高可用。"],
         "review_questions": ["CAP 定理对分布式系统设计有什么指导意义？", "Raft 如何保证日志一致性？", "微服务和单体架构各有什么优缺点？"],
     },
+    "Java 后端基础": {
+        "overview": "Java 后端基础面向实习和面试中的服务端开发能力，重点包括 Java 语言特性、集合、异常、泛型、JVM、并发、Spring/Spring Boot、数据库访问、接口设计和线上排查。学习目标不是背完整语法百科，而是能解释常见工程问题并写出稳定的后端代码。",
+        "sections": [
+            {"heading": "语言与集合", "content": "掌握对象模型、接口、泛型、异常、常用集合和 Stream，能说明 ArrayList、LinkedList、HashMap、ConcurrentHashMap 的使用场景与取舍。"},
+            {"heading": "JVM 与并发", "content": "理解类加载、内存区域、垃圾回收、线程池、锁、volatile、synchronized 和并发容器，能定位内存、线程和性能问题。"},
+            {"heading": "后端框架", "content": "Spring Boot 负责快速构建服务，IoC/AOP 降低耦合；常见项目会结合 MVC、MyBatis/JPA、事务、缓存、消息队列和日志监控。"},
+        ],
+        "key_points": ["HashMap 关注哈希、扩容和冲突处理", "JVM 知识用于解释内存、GC 和类加载问题", "线程池要控制核心线程数、队列和拒绝策略", "Spring IoC 负责对象创建与依赖注入", "事务边界和异常回滚是后端常见易错点"],
+        "glossary": [
+            {"term": "JVM", "explanation": "运行 Java 字节码的虚拟机，提供内存管理、类加载和运行时环境。"},
+            {"term": "GC", "explanation": "垃圾回收，自动回收不再使用的对象内存。"},
+            {"term": "IoC", "explanation": "控制反转，由容器创建和管理对象依赖。"},
+            {"term": "AOP", "explanation": "面向切面编程，常用于日志、事务、权限等横切逻辑。"},
+            {"term": "线程池", "explanation": "复用线程并限制并发资源消耗的组件。"},
+        ],
+        "examples": ["接口响应变慢时，可以从 SQL、索引、线程池、外部依赖和 GC 日志逐层排查。", "面试中解释 HashMap 时应覆盖数组、链表/红黑树、哈希扰动、扩容和线程安全边界。"],
+        "review_questions": ["HashMap 为什么不是线程安全的？", "Spring IoC 解决了什么问题？", "Java 线程池参数应该如何理解？"],
+    },
+    "Go 后端基础": {
+        "overview": "Go 后端基础面向云原生和高并发服务开发，重点包括语法、接口、错误处理、goroutine、channel、context、标准库、HTTP 服务、工程组织和性能排查。学习时应把语法特性和服务端场景结合起来，而不是只记关键字。",
+        "sections": [
+            {"heading": "语言模型", "content": "Go 以简洁语法、组合、接口和显式错误处理为核心，强调可读性、编译速度和工程一致性。"},
+            {"heading": "并发模型", "content": "goroutine 是轻量级执行单元，channel 用于通信，context 用于取消、超时和请求级数据传递。"},
+            {"heading": "服务端实践", "content": "常见后端项目会使用 net/http、Gin、数据库驱动、日志、配置、测试、pprof 和模块化目录组织。"},
+        ],
+        "key_points": ["Go 接口是隐式实现的", "error 是普通返回值，需要显式处理", "goroutine 很轻量但不能无限创建", "context 用于取消和超时传播", "defer 常用于资源释放但要注意循环和性能"],
+        "glossary": [
+            {"term": "goroutine", "explanation": "Go 运行时调度的轻量级并发执行单元。"},
+            {"term": "channel", "explanation": "goroutine 之间传递数据和同步的管道。"},
+            {"term": "context", "explanation": "传递取消信号、超时和请求范围值的标准机制。"},
+            {"term": "interface", "explanation": "定义行为集合，类型只要实现方法集合就满足接口。"},
+            {"term": "pprof", "explanation": "Go 标准性能分析工具，可分析 CPU、内存和阻塞等问题。"},
+        ],
+        "examples": ["HTTP 请求处理函数中把 request.Context() 传给数据库调用，能在客户端断开或超时时及时取消工作。", "生产者消费者模型可以用 channel 做任务分发，但需要设计关闭和退出机制。"],
+        "review_questions": ["goroutine 和线程有什么区别？", "Go 为什么推荐显式返回 error？", "context 在后端服务里解决什么问题？"],
+    },
+    "工程实践与架构": {
+        "overview": "工程实践与架构关注如何把代码长期稳定地运行在真实环境中，覆盖需求拆解、模块边界、接口设计、分层架构、测试、CI/CD、可观测性、性能、故障恢复和团队协作。实习和面试中常用它来判断候选人是否具备项目落地能力。",
+        "sections": [
+            {"heading": "架构边界", "content": "通过分层、模块化、领域边界和接口契约控制复杂度，避免业务逻辑、数据访问和展示逻辑互相缠绕。"},
+            {"heading": "交付质量", "content": "单元测试、集成测试、代码评审、CI/CD 和灰度发布可以降低变更风险，让功能更稳定地进入生产环境。"},
+            {"heading": "线上意识", "content": "日志、指标、追踪、告警、限流、降级、重试和幂等设计用于发现问题、控制影响并恢复服务。"},
+        ],
+        "key_points": ["好的架构首先要边界清楚", "接口设计要关注语义、错误码和兼容性", "测试覆盖风险高的逻辑比追求数字更重要", "可观测性包括日志、指标和链路追踪", "限流、降级、熔断和重试要配合幂等设计"],
+        "glossary": [
+            {"term": "分层架构", "explanation": "按职责拆分表示层、业务层、数据访问层等结构。"},
+            {"term": "CI/CD", "explanation": "持续集成和持续交付，用自动化流程降低发布风险。"},
+            {"term": "可观测性", "explanation": "通过日志、指标和追踪理解系统运行状态。"},
+            {"term": "幂等", "explanation": "同一操作执行多次和执行一次效果一致。"},
+            {"term": "熔断", "explanation": "当依赖持续失败时快速失败，避免故障扩散。"},
+        ],
+        "examples": ["订单创建接口要考虑重复提交、库存扣减、支付回调、事务边界和失败补偿。", "一次线上故障复盘应包含影响范围、时间线、根因、临时修复和长期改进项。"],
+        "review_questions": ["为什么架构设计要先划清模块边界？", "接口幂等性在真实项目中为什么重要？", "日志、指标和追踪分别解决什么问题？"],
+    },
 }
 
 FALLBACK_SUMMARIES = {topic: data["overview"] for topic, data in FALLBACK_KNOWLEDGE.items()}
+
+
+def normalize_knowledge_topics(topics: list[str] | None = None) -> list[str]:
+    """Return required long-term topics plus user-defined extras, preserving order."""
+    normalized: list[str] = []
+    for topic in DEFAULT_KNOWLEDGE_TOPICS + (topics or []):
+        cleaned = normalize_zh_text(str(topic)).strip()
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+    return normalized
+
+
+def _sources_for_topic(topic: str, source_name: str = "", source_url: str = "") -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    if source_name or source_url:
+        kind = "offline-seed" if source_name == "offline" else "wikipedia"
+        sources.append({"name": source_name or "Wikipedia", "kind": kind, "url": source_url or ""})
+    for item in SOURCE_HINTS.get(topic, []):
+        if item not in sources:
+            sources.append(dict(item))
+    return sources
+
+
+def qa_pairs_for_card(card: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only explicit or curated question-answer pairs.
+
+    A card overview is learning material and must not be reused as the answer
+    to unrelated questions.  Cards without a reliable answer therefore remain
+    searchable but do not enter the review queue.
+    """
+    existing = card.get("qa_pairs") or []
+    pairs: list[dict[str, Any]] = []
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if question and answer:
+            pair = dict(item)
+            pair["question"] = question
+            pair["answer"] = answer
+            pairs.append(pair)
+    if pairs:
+        return pairs
+
+    topic = str(card.get("topic") or card.get("title") or "知识点")
+    return curated_pairs_for_topic(topic)
 
 
 # ── 备用数据源 ──
@@ -414,6 +555,14 @@ def _assemble_from_parts(topic: str, sub_results: list[dict[str, Any]]) -> dict[
         "glossary": glossary,
         "examples": examples_list,
         "review_questions": review_questions,
+        "qa_pairs": qa_pairs_for_card({
+            "topic": topic,
+            "sections": sections,
+            "key_points": key_points,
+            "overview": overview,
+            "review_questions": review_questions,
+        }),
+        "sources": _sources_for_topic(topic, "Wikipedia (decomposed)", source_url),
         "raw_excerpt": overview[:1200],
     }
 
@@ -447,12 +596,18 @@ def _fetch_decomposed_topic(topic: str) -> dict[str, Any] | None:
 def load_knowledge() -> list[dict[str, Any]]:
     payload = read_json("knowledge_base.json", [])
     if not isinstance(payload, list):
-        return []
-    return [migrate_legacy_record(record) for record in payload if isinstance(record, dict)]
+        payload = []
+    records = [migrate_legacy_record(record) for record in payload if isinstance(record, dict)]
+    existing_topics = {str(record.get("topic") or record.get("title") or "") for record in records}
+    for topic in DEFAULT_KNOWLEDGE_TOPICS:
+        if topic not in existing_topics:
+            records.append(_fallback_card(topic))
+            existing_topics.add(topic)
+    return records
 
 
 def refresh_computer_knowledge(topics: list[str] | None = None) -> list[dict[str, Any]]:
-    records = [fetch_wikipedia_summary(topic) for topic in topics or DEFAULT_COMPUTER_TOPICS]
+    records = [fetch_wikipedia_summary(topic) for topic in normalize_knowledge_topics(topics)]
     write_json("knowledge_base.json", records)
     return records
 
@@ -526,6 +681,14 @@ def build_knowledge_card(topic: str, raw_text: str, source_url: str, offline: bo
         "glossary": glossary,
         "examples": examples,
         "review_questions": review_questions,
+        "qa_pairs": qa_pairs_for_card({
+            "topic": topic,
+            "sections": sections,
+            "key_points": key_points,
+            "overview": overview,
+            "review_questions": review_questions,
+        }),
+        "sources": _sources_for_topic(topic, source, source_url),
         "raw_excerpt": _clip(cleaned, 1200),
     }
 
@@ -537,6 +700,14 @@ def migrate_legacy_record(record: dict[str, Any]) -> dict[str, Any]:
         migrated.setdefault("source_url", migrated.get("source", ""))
         migrated.setdefault("source_name", "Wikipedia" if not migrated.get("offline") else "offline")
         migrated.setdefault("encoding_status", "suspicious" if looks_mojibake(str(migrated.get("overview", ""))) else "ok")
+        if not migrated.get("qa_pairs"):
+            migrated["qa_pairs"] = qa_pairs_for_card(migrated)
+        if not migrated.get("sources"):
+            migrated["sources"] = _sources_for_topic(
+                str(migrated.get("topic") or migrated.get("title") or ""),
+                str(migrated.get("source_name") or ""),
+                str(migrated.get("source_url") or migrated.get("source") or ""),
+            )
         return migrated
 
     topic = normalize_zh_text(str(record.get("topic") or "知识点"))
@@ -555,7 +726,7 @@ def compact_card_for_context(card: dict[str, Any]) -> str:
 def knowledge_context(limit: int = 6) -> str:
     records = load_knowledge()
     if not records:
-        records = [_fallback_card(topic) for topic in DEFAULT_COMPUTER_TOPICS]
+        records = [_fallback_card(topic) for topic in DEFAULT_KNOWLEDGE_TOPICS]
     lines = [compact_card_for_context(record) for record in records[:limit]]
     return "计算机知识参考：\n" + "\n".join(lines)
 
@@ -601,9 +772,27 @@ def format_knowledge(records: list[dict[str, Any]] | None = None, limit: int = 1
         if questions:
             lines.append("复习问题：" + "；".join(str(question) for question in questions[:3]))
 
-        source_url = record.get("source_url") or record.get("source")
-        if source_url:
-            lines.append(f"来源：{source_url}")
+        qa_pairs = qa_pairs_for_card(record)
+        if qa_pairs:
+            lines.append("问题与答案：")
+            for pair in qa_pairs[:3]:
+                lines.append(f"- 问：{pair['question']}")
+                lines.append(f"  答：{pair['answer']}")
+
+        sources = record.get("sources") or []
+        if sources:
+            lines.append("来源：")
+            for source in sources[:4]:
+                if isinstance(source, dict):
+                    name = source.get("name", "来源")
+                    url = source.get("url", "")
+                    kind = source.get("kind", "")
+                    suffix = f" ({kind})" if kind else ""
+                    lines.append(f"- {name}{suffix}{'：' + url if url else ''}")
+        else:
+            source_url = record.get("source_url") or record.get("source")
+            if source_url:
+                lines.append(f"来源：{source_url}")
         blocks.append("\n".join(line for line in lines if line))
     return "\n\n".join(blocks)
 
@@ -662,7 +851,13 @@ def _fallback_card(topic: str) -> dict[str, Any]:
     card["key_points"] = fallback["key_points"]
     card["glossary"] = fallback["glossary"]
     card["examples"] = fallback["examples"]
-    card["review_questions"] = fallback["review_questions"]
+    card["qa_pairs"] = qa_pairs_for_card(card)
+    card["review_questions"] = (
+        [pair["question"] for pair in card["qa_pairs"]]
+        if card["qa_pairs"]
+        else fallback["review_questions"]
+    )
+    card["sources"] = _sources_for_topic(topic, "offline", "")
     card["source"] = "offline"
     card["source_name"] = "offline"
     return card

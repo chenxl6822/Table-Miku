@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,12 +13,17 @@ from .encoding_utils import normalize_zh_text
 from .knowledge_base import (
     _fallback_card,
     compact_card_for_context as legacy_compact_card_for_context,
+    fetch_wikipedia_summary,
     format_knowledge as legacy_format_knowledge,
-    load_knowledge as legacy_load_knowledge,
-    refresh_computer_knowledge as legacy_refresh_computer_knowledge,
 )
-from .knowledge_ingest import ingest_trusted_topics
 from .knowledge_migration import migrate_json_to_sqlite
+from .knowledge_sync import (
+    discover_obsidian_vault,
+    knowledge_sync_status,
+    matched_key_points,
+    preview_obsidian_sync,
+    sync_obsidian_knowledge,
+)
 from .storage import DEFAULT_KNOWLEDGE_TOPICS, load_settings
 
 
@@ -38,26 +44,16 @@ def _normalize_knowledge_topics(topics: list[str] | None = None) -> list[str]:
     return normalized
 
 
-def qa_pairs_for_card(card: dict[str, Any]) -> list[dict[str, str]]:
-    """Return complete QA pairs, synthesizing answers for legacy cards."""
-    pairs: list[dict[str, str]] = []
+def qa_pairs_for_card(card: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return source-backed QA pairs; never invent an answer from an overview."""
+    pairs: list[dict[str, Any]] = []
     for item in card.get("qa_pairs") or []:
         if not isinstance(item, dict):
             continue
         question = str(item.get("question") or "").strip()
         answer = str(item.get("answer") or "").strip()
         if question and answer:
-            pairs.append({"question": question, "answer": answer})
-    if pairs:
-        return pairs
-
-    for item in card.get("review_questions") or []:
-        question = str(item).strip()
-        if not question:
-            continue
-        answer = repo._generate_fallback_answer(question, card)
-        if answer:
-            pairs.append({"question": question, "answer": answer})
+            pairs.append({**item, "question": question, "answer": answer})
     return pairs
 
 
@@ -73,14 +69,13 @@ def ensure_knowledge_repository(topics: list[str] | None = None) -> None:
 
     knowledge_db.init_db()
     migrate_json_to_sqlite(force=False)
-    existing_by_topic = repo.find_card_ids_by_topics(selected_topics)
     card_ids: list[str] = []
     for topic in selected_topics:
-        existing_id = existing_by_topic.get(topic.strip().lower())
-        if existing_id:
-            card_ids.append(existing_id)
-            continue
-        card_ids.append(repo.upsert_card(_fallback_card(topic)))
+        seed_card = _fallback_card(topic)
+        seed_id = str(seed_card.get("id") or "")
+        if seed_id:
+            repo.deactivate_unstructured_qa(seed_id)
+        card_ids.append(repo.upsert_card(seed_card))
 
     conn = repo._connect()
     try:
@@ -104,8 +99,7 @@ def load_knowledge_cards(limit: int = 100) -> list[dict[str, Any]]:
                 for card in cards
             ]
     except Exception:
-        pass
-    return legacy_load_knowledge()[:limit]
+        return []
 
 
 def search_knowledge_cards(query: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -118,31 +112,114 @@ def search_knowledge_cards(query: str, limit: int = 20) -> list[dict[str, Any]]:
             for card in cards
         ]
     except Exception:
-        query_lower = query.lower()
-        return [
-            card for card in legacy_load_knowledge()
-            if query_lower in str(card.get("topic") or card.get("title") or card.get("overview") or "").lower()
-        ][:limit]
+        return []
 
 
 def refresh_knowledge_repository(topics: list[str] | None = None) -> dict[str, Any]:
-    """Refresh legacy online cards, upsert into SQLite, then add trusted sources."""
-    selected_topics = _normalize_knowledge_topics(topics)
-    records = legacy_refresh_computer_knowledge(selected_topics)
-    ensure_knowledge_repository(selected_topics)
-    for record in records:
-        repo.upsert_card(record)
+    """Backward-compatible manual online refresh with bounded concurrency."""
+    return refresh_online_knowledge(topics)
 
-    obsidian_root = _configured_obsidian_root()
-    trusted_results = ingest_trusted_topics(selected_topics, obsidian_root=obsidian_root)
+
+def sync_local_knowledge(vault_root: str | Path | None = None) -> dict[str, Any]:
+    """Run the read-only local incremental sync; no network calls are made."""
+    ensure_knowledge_repository()
+    return sync_obsidian_knowledge(vault_root)
+
+
+def preview_local_knowledge(vault_root: str | Path | None = None) -> dict[str, Any]:
+    return preview_obsidian_sync(vault_root)
+
+
+def local_knowledge_status() -> dict[str, Any]:
+    return knowledge_sync_status()
+
+
+def refresh_online_knowledge(
+    topics: list[str] | None = None,
+    *,
+    batch_timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Fetch online summaries manually, returning partial success on timeout."""
+    selected_topics = _normalize_knowledge_topics(topics)
+    ensure_knowledge_repository(selected_topics)
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="knowledge-online")
+    future_topics = {
+        executor.submit(fetch_wikipedia_summary, topic): topic
+        for topic in selected_topics
+    }
+    done, pending = wait(future_topics, timeout=max(1.0, batch_timeout_seconds))
+    for future in done:
+        topic = future_topics[future]
+        try:
+            records.append(future.result())
+        except Exception as exc:
+            errors.append(f"{topic}: {exc}")
+    for future in pending:
+        future.cancel()
+        errors.append(f"{future_topics[future]}: 整批在线更新超时")
+    executor.shutdown(wait=False, cancel_futures=True)
+    for record in records:
+        if not record.get("offline"):
+            # Wikipedia may add useful searchable fragments, but it must not
+            # replace an existing local/curated overview for the same card.
+            existing = repo.get_card(str(record.get("id") or ""))
+            if existing and str(existing.get("overview") or "").strip():
+                record = {
+                    **record,
+                    "overview": existing["overview"],
+                    "summary": existing["overview"],
+                }
+            repo.upsert_card(record)
     online = sum(1 for record in records if not record.get("offline"))
     return {
         "topics": len(selected_topics),
         "online": online,
-        "trusted_sources": sum(item["official_sources"] + item["obsidian_sources"] for item in trusted_results),
-        "trusted_chunks": sum(item["chunks"] for item in trusted_results),
-        "obsidian_enabled": bool(obsidian_root),
+        "offline": sum(1 for record in records if record.get("offline")),
+        "completed": len(records),
+        "timed_out": len(pending),
+        "errors": errors[:20],
     }
+
+
+def due_question_items(now: datetime | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    ensure_knowledge_repository()
+    return repo.list_due_questions(now=now, limit=limit)
+
+
+def mistake_question_items(limit: int = 100) -> list[dict[str, Any]]:
+    ensure_knowledge_repository()
+    return repo.list_mistake_questions(limit=limit)
+
+
+def practice_question_items(card_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    ensure_knowledge_repository()
+    return repo.list_questions_for_card(card_id, limit=limit)
+
+
+def mark_knowledge_card_learned(card_id: str, now: datetime | None = None) -> int:
+    ensure_knowledge_repository()
+    return repo.mark_card_learned(card_id, now=now)
+
+
+def answer_key_point_hints(question: dict[str, Any], user_answer: str) -> list[str]:
+    return matched_key_points(user_answer, question.get("key_points") or [])
+
+
+def record_question_answer(
+    qa_id: str,
+    result: str,
+    user_answer: str,
+    matched_points: list[str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    try:
+        return repo.record_question_attempt(
+            qa_id, result, user_answer, matched_points=matched_points, now=now
+        )
+    except (sqlite3.Error, OSError) as ex:
+        raise KnowledgeStorageError("知识作答记录未能写入 SQLite。") from ex
 
 
 def format_knowledge(records: list[dict[str, Any]] | None = None, limit: int = 12) -> str:
@@ -239,12 +316,4 @@ def _repository_card_to_legacy(
 
 
 def _configured_obsidian_root() -> Path | None:
-    settings = load_settings()
-    trusted = ((settings.get("knowledge") or {}).get("trusted_sources") or {})
-    if not trusted.get("enabled", True):
-        return None
-    raw = str(trusted.get("obsidian_vault") or "").strip()
-    if not raw:
-        return None
-    path = Path(raw)
-    return path if path.exists() and path.is_dir() else None
+    return discover_obsidian_vault()

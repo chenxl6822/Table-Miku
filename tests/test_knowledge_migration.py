@@ -65,15 +65,15 @@ class TestMigrateJsonToSqlite:
             },
         ]
 
-        # Mock read_json
-        def mock_read_json(filename, default):
+        # Mock read-only legacy JSON loader
+        def mock_read_json(filename):
             if "knowledge_base.json" in filename:
                 return cards_json
             if "knowledge_reviews.json" in filename:
                 return reviews_json
-            return default
+            return []
 
-        monkeypatch.setattr(knowledge_migration, "read_json", mock_read_json)
+        monkeypatch.setattr(knowledge_migration, "_read_legacy_json", mock_read_json)
 
         result = knowledge_migration.migrate_json_to_sqlite(force=True)
         assert result["cards"] >= 1
@@ -96,8 +96,8 @@ class TestMigrateJsonToSqlite:
         finally:
             conn.close()
 
-    def test_migration_skips_when_already_populated(self, tmp_path, monkeypatch):
-        """When cards already exist, migration skips (unless force=True)."""
+    def test_migration_skips_after_completed_marker(self, tmp_path, monkeypatch):
+        """An explicit marker, rather than unrelated cards, makes migration idempotent."""
         db_path = tmp_path / "test_skip.db"
         monkeypatch.setattr(knowledge_db, "knowledge_db_path", lambda: db_path)
 
@@ -112,11 +112,13 @@ class TestMigrateJsonToSqlite:
         conn.close()
 
         # Mock empty JSON
-        monkeypatch.setattr(knowledge_migration, "read_json", lambda f, d: [])
+        monkeypatch.setattr(knowledge_migration, "_read_legacy_json", lambda _filename: [])
 
-        result = knowledge_migration.migrate_json_to_sqlite(force=False)
-        assert result["cards"] == 0
-        assert result["skipped"] >= 1
+        first = knowledge_migration.migrate_json_to_sqlite(force=False)
+        second = knowledge_migration.migrate_json_to_sqlite(force=False)
+        assert first["skipped"] == 0
+        assert second["cards"] == 0
+        assert second["skipped"] >= 1
 
     def test_migration_force_reimports(self, tmp_path, monkeypatch):
         db_path = tmp_path / "test_force.db"
@@ -133,7 +135,20 @@ class TestMigrateJsonToSqlite:
         conn.close()
 
         cards = [{"id": "new-card", "topic": "NewTopic", "title": "NewTopic", "overview": "Content here that is long enough for testing purposes and validation checks."}]
-        monkeypatch.setattr(knowledge_migration, "read_json", lambda f, d: cards if "base" in str(f) else [])
+        monkeypatch.setattr(
+            knowledge_migration,
+            "_read_legacy_json",
+            lambda filename: cards if "base" in str(filename) else [],
+        )
 
         result = knowledge_migration.migrate_json_to_sqlite(force=True)
         assert result["cards"] >= 1
+
+    def test_invalid_legacy_json_is_never_modified(self, tmp_path, monkeypatch):
+        source = tmp_path / "knowledge_base.json"
+        source.write_bytes(b"{invalid-json")
+        monkeypatch.setattr(knowledge_migration, "runtime_path", lambda _filename: source)
+        before = (source.read_bytes(), source.stat().st_mtime_ns)
+
+        assert knowledge_migration._read_legacy_json("knowledge_base.json") == []
+        assert (source.read_bytes(), source.stat().st_mtime_ns) == before

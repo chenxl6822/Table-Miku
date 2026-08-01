@@ -181,28 +181,32 @@ dist/TableMiku/TableMiku.exe
 
 地理编码结果会缓存在本地用户数据目录，减少重复联网解析。主动天气监测会读取 `weather_alerts.lead_minutes`，结合 Open-Meteo 当前天气和未来小时级预报提醒雷暴、降雨、降雪、冻雨、大风、高温和低温。
 
-### 可信知识源
+### 知识学习闭环与可信来源
 
-知识库现在优先走本地 SQLite Repository，并保留旧 `knowledge_base.json` 迁移/兜底。可信来源优先级为：
+知识库使用本地 SQLite Repository，并保留旧 `knowledge_base.json` 作为只读迁移来源。知识中心提供“标记已学、开始练习、今日复习、错题本和同步状态”；练习时先独立作答，再查看分层参考答案并自评为“掌握、模糊、不会”。“不会”的题进入错题本，之后连续两次选择“掌握”才会移出错题本，但仍继续参加普通间隔复习。
+
+可信来源优先级为：
 
 ```text
 官方文档 / RFC / 标准 / 论文元数据 > Obsidian 只读笔记 > Wikipedia > 离线种子
 ```
 
-如需接入本地 Obsidian 知识库，可在 `%APPDATA%\TableMiku\settings.json` 中配置：
+程序启动后会在后台执行一次本地增量同步，不联网、不阻塞桌宠。若项目同级存在 `Obsidian Vault`，会自动发现它；也可在 `%APPDATA%\TableMiku\settings.json` 中显式配置 Vault 根目录：
 
 ```json
 {
   "knowledge": {
     "trusted_sources": {
       "enabled": true,
-      "obsidian_vault": "D:\\AIWorkspace\\projects\\Obsidian Vault\\计算机知识"
+      "obsidian_vault": "D:\\AIWorkspace\\projects\\Obsidian Vault"
     }
   }
 }
 ```
 
-Table-Miku 只读取该目录下 Markdown 摘要并写入自己的 `knowledge.db`，不会修改、删除、移动或格式化 Obsidian Vault 文件；包含 `.env`、token、secret、password、key、密钥、凭据等敏感命名的路径会被跳过。
+Table-Miku 只分析 Vault 内的 `计算机知识` 和 `05-Interview` 两个白名单子目录，只导入标记为 `knowledge`、`question`、`algorithm` 或 `interview` 的 Markdown 笔记。索引采用相对路径、修改时间、大小和 SHA-256 增量判断，结果只写入 `%APPDATA%\TableMiku\knowledge.db`；不会修改、删除、移动或格式化 Vault 文件。隐藏目录、敏感命名、越界符号链接和非 Markdown 文件会被跳过。
+
+右键“同步本地知识库”可重跑只读增量同步；“更新在线来源”是单独的手动操作。在线更新最多 4 个并发请求，单请求超时 12 秒、整批超时 30 秒，失败时会保留部分成功结果。Wikipedia 只补充缺失片段，不覆盖现有本地或内置高质量概览，官方链接仅作为来源元数据。
 
 ### 修改个人助手
 

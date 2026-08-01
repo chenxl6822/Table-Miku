@@ -165,25 +165,41 @@ def _upsert_card_extras(conn: sqlite3.Connection, card_id: str, card: dict[str, 
             (chunk_id, card_id, None, f"术语：{term}", text, content_hash, 0.5, now),
         )
 
-    # Review questions → QA pairs (without answers initially)
+    # Only explicit question-answer pairs are reviewable.  A card overview is
+    # learning material, not a reliable answer to every question on the card.
     existing_qa_questions = _existing_qa_questions(conn, card_id)
-    for q in card.get("review_questions") or []:
-        question = str(q).strip()
-        if not question or question in existing_qa_questions:
+    for pair in card.get("qa_pairs") or []:
+        if not isinstance(pair, dict):
             continue
-        # Try to generate a fallback answer from card data
-        answer = _generate_fallback_answer(question, card)
-        if not answer:
+        question = str(pair.get("question") or "").strip()
+        answer = str(pair.get("answer") or "").strip()
+        if not question or not answer:
             continue
-        qa_id = _uid("qa-")
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO knowledge_qa_pairs
-                (id, card_id, question, answer, source_chunk_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (qa_id, card_id, question, answer, "", now, now),
-        )
+        if str(pair.get("canonical_key") or "").strip():
+            upsert_structured_qa(card_id, pair, quality_score=0.75, conn=conn)
+            continue
+        if question in existing_qa_questions:
+            conn.execute(
+                "UPDATE knowledge_qa_pairs SET answer = ?, updated_at = ?, active = 1 "
+                "WHERE card_id = ? AND question = ?",
+                (answer, now, card_id, question),
+            )
+        else:
+            qa_id = _uid("qa-")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO knowledge_qa_pairs
+                    (id, card_id, question, answer, source_chunk_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (qa_id, card_id, question, answer, "", now, now),
+            )
+        row = conn.execute(
+            "SELECT id FROM knowledge_qa_pairs WHERE card_id = ? AND question = ?",
+            (card_id, question),
+        ).fetchone()
+        if row is not None:
+            _ensure_question_review_state(conn, str(row["id"]), card_id, now)
 
 
 def _existing_qa_questions(conn: sqlite3.Connection, card_id: str) -> set[str]:
@@ -191,6 +207,24 @@ def _existing_qa_questions(conn: sqlite3.Connection, card_id: str) -> set[str]:
         "SELECT question FROM knowledge_qa_pairs WHERE card_id = ?", (card_id,)
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def deactivate_unstructured_qa(card_id: str) -> int:
+    """Remove legacy overview-generated questions from active review queues."""
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE knowledge_qa_pairs
+            SET active = 0, updated_at = ?
+            WHERE card_id = ? AND canonical_key = '' AND document_id = ''
+            """,
+            (_now(), card_id),
+        )
+        conn.commit()
+        return max(0, int(cursor.rowcount))
+    finally:
+        conn.close()
 
 
 def _generate_fallback_answer(question: str, card: dict[str, Any]) -> str:
@@ -800,12 +834,15 @@ def list_qa_pairs(card_id: str, conn: sqlite3.Connection | None = None) -> list[
         rows = conn.execute(
             """
             SELECT * FROM knowledge_qa_pairs
-            WHERE card_id = ?
+            WHERE card_id = ? AND active = 1
             ORDER BY created_at ASC
             """,
             (card_id,),
         ).fetchall()
-        return _rows_to_dicts(rows)
+        pairs = _rows_to_dicts(rows)
+        for pair in pairs:
+            _decode_structured_qa(pair)
+        return pairs
     finally:
         if _own:
             conn.close()
@@ -856,6 +893,369 @@ def upsert_qa_pair(
         return qa_id
     finally:
         conn.close()
+
+
+def upsert_structured_qa(
+    card_id: str,
+    pair: dict[str, Any],
+    *,
+    document_id: str = "",
+    quality_score: float = 0.5,
+    conn: sqlite3.Connection | None = None,
+) -> str:
+    """Upsert one canonical, source-backed interview question."""
+    question = str(pair.get("question") or "").strip()
+    answer = str(pair.get("answer") or pair.get("answer_detail") or "").strip()
+    canonical_key = str(pair.get("canonical_key") or "").strip()
+    if not question or not answer or not canonical_key:
+        raise ValueError("structured QA requires question, answer, and canonical_key")
+
+    own = conn is None
+    if own:
+        conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT * FROM knowledge_qa_pairs WHERE canonical_key = ?",
+            (canonical_key,),
+        ).fetchone()
+        if existing is None:
+            existing = conn.execute(
+                "SELECT * FROM knowledge_qa_pairs WHERE card_id = ? AND question = ?",
+                (card_id, question),
+            ).fetchone()
+        now = _now()
+        payload = {
+            "question": question,
+            "answer": answer,
+            "question_type": str(pair.get("question_type") or "high-frequency"),
+            "difficulty": str(pair.get("difficulty") or "normal"),
+            "answer_summary": str(pair.get("answer_summary") or "").strip(),
+            "answer_detail": str(pair.get("answer_detail") or answer).strip(),
+            "key_points": json.dumps(pair.get("key_points") or [], ensure_ascii=False),
+            "pitfalls": json.dumps(pair.get("pitfalls") or [], ensure_ascii=False),
+            "follow_ups": json.dumps(pair.get("follow_ups") or [], ensure_ascii=False),
+            "source_label": str(pair.get("source_label") or "").strip(),
+        }
+        if existing is None:
+            qa_id = f"qa-{canonical_key[:24]}"
+            conn.execute(
+                """
+                INSERT INTO knowledge_qa_pairs
+                    (id, card_id, question, answer, source_chunk_id, created_at, updated_at,
+                     canonical_key, question_type, difficulty, answer_summary,
+                     answer_detail, key_points, pitfalls, follow_ups, source_label,
+                     document_id, active)
+                VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    qa_id, card_id, payload["question"], payload["answer"], now, now,
+                    canonical_key, payload["question_type"], payload["difficulty"],
+                    payload["answer_summary"], payload["answer_detail"],
+                    payload["key_points"], payload["pitfalls"], payload["follow_ups"],
+                    payload["source_label"], document_id,
+                ),
+            )
+        else:
+            qa_id = str(existing["id"])
+            previous_quality = conn.execute(
+                "SELECT COALESCE(MAX(quality_score), 0) FROM knowledge_qa_sources WHERE qa_id = ?",
+                (qa_id,),
+            ).fetchone()[0]
+            if quality_score >= float(previous_quality or 0):
+                conn.execute(
+                    """
+                    UPDATE knowledge_qa_pairs
+                    SET card_id = ?, question = ?, answer = ?, updated_at = ?,
+                        canonical_key = ?, question_type = ?, difficulty = ?, answer_summary = ?,
+                        answer_detail = ?, key_points = ?, pitfalls = ?, follow_ups = ?,
+                        source_label = ?, document_id = ?, active = 1
+                    WHERE id = ?
+                    """,
+                    (
+                        card_id, payload["question"], payload["answer"], now,
+                        canonical_key,
+                        payload["question_type"], payload["difficulty"],
+                        payload["answer_summary"], payload["answer_detail"],
+                        payload["key_points"], payload["pitfalls"], payload["follow_ups"],
+                        payload["source_label"], document_id, qa_id,
+                    ),
+                )
+
+        if document_id:
+            conn.execute(
+                """
+                INSERT INTO knowledge_qa_sources(qa_id, document_id, source_label, quality_score)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(qa_id, document_id) DO UPDATE SET
+                    source_label = excluded.source_label,
+                    quality_score = excluded.quality_score
+                """,
+                (qa_id, document_id, payload["source_label"], quality_score),
+            )
+        _ensure_question_review_state(conn, qa_id, card_id, now)
+        if own:
+            conn.commit()
+        return qa_id
+    finally:
+        if own:
+            conn.close()
+
+
+def list_due_questions(now: datetime | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    """Return due active questions with their card and review state."""
+    now_str = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT qa.*, kc.topic, kc.title, kc.overview,
+                   qrs.mastery, qrs.review_stage, qrs.next_review_at,
+                   qrs.last_reviewed_at, qrs.review_count, qrs.correct_streak,
+                   qrs.wrong_count, qrs.in_mistake_book, qrs.last_user_answer,
+                   qrs.last_matched_points
+            FROM question_review_states qrs
+            JOIN knowledge_qa_pairs qa ON qa.id = qrs.qa_id
+            JOIN knowledge_cards kc ON kc.id = qa.card_id
+            WHERE qa.active = 1 AND kc.archived = 0 AND qrs.next_review_at <= ?
+            ORDER BY qrs.in_mistake_book DESC, qrs.next_review_at ASC,
+                     qrs.mastery ASC, qa.updated_at DESC
+            LIMIT ?
+            """,
+            (now_str, limit),
+        ).fetchall()
+        return [_question_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def list_mistake_questions(limit: int = 100) -> list[dict[str, Any]]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT qa.*, kc.topic, kc.title, kc.overview,
+                   qrs.mastery, qrs.review_stage, qrs.next_review_at,
+                   qrs.last_reviewed_at, qrs.review_count, qrs.correct_streak,
+                   qrs.wrong_count, qrs.in_mistake_book, qrs.last_user_answer,
+                   qrs.last_matched_points
+            FROM question_review_states qrs
+            JOIN knowledge_qa_pairs qa ON qa.id = qrs.qa_id
+            JOIN knowledge_cards kc ON kc.id = qa.card_id
+            WHERE qa.active = 1 AND kc.archived = 0 AND qrs.in_mistake_book = 1
+            ORDER BY qrs.next_review_at ASC, qrs.wrong_count DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [_question_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def list_questions_for_card(card_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Return every active practice question for one knowledge card."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT qa.*, kc.topic, kc.title, kc.overview,
+                   qrs.mastery, qrs.review_stage, qrs.next_review_at,
+                   qrs.last_reviewed_at, qrs.review_count, qrs.correct_streak,
+                   qrs.wrong_count, qrs.in_mistake_book, qrs.last_user_answer,
+                   qrs.last_matched_points
+            FROM knowledge_qa_pairs qa
+            JOIN knowledge_cards kc ON kc.id = qa.card_id
+            JOIN question_review_states qrs ON qrs.qa_id = qa.id
+            WHERE qa.card_id = ? AND qa.active = 1 AND kc.archived = 0
+            ORDER BY qrs.in_mistake_book DESC, qa.created_at ASC
+            LIMIT ?
+            """,
+            (card_id, limit),
+        ).fetchall()
+        return [_question_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def mark_card_learned(card_id: str, now: datetime | None = None) -> int:
+    """Make a card's questions immediately available for first review."""
+    now_str = (now or datetime.now()).isoformat(timespec="seconds")
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE question_review_states
+            SET next_review_at = ?, updated_at = ?
+            WHERE qa_id IN (
+                SELECT id FROM knowledge_qa_pairs WHERE card_id = ? AND active = 1
+            )
+            """,
+            (now_str, now_str, card_id),
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
+def record_question_attempt(
+    qa_id: str,
+    result: str,
+    user_answer: str,
+    matched_points: list[str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist an answer and apply question-level spaced repetition rules."""
+    if result not in {"known", "fuzzy", "forgotten"}:
+        raise ValueError(f"Unknown review result: {result}")
+    now = now or datetime.now()
+    now_str = now.isoformat(timespec="seconds")
+    conn = _connect()
+    try:
+        qa = conn.execute(
+            "SELECT * FROM knowledge_qa_pairs WHERE id = ? AND active = 1", (qa_id,)
+        ).fetchone()
+        if qa is None:
+            raise ValueError(f"Unknown active question: {qa_id}")
+        state = _ensure_question_review_state(conn, qa_id, str(qa["card_id"]), now_str)
+        old_stage = int(state["review_stage"])
+        old_mastery = float(state["mastery"])
+        correct_streak = int(state["correct_streak"])
+        wrong_count = int(state["wrong_count"])
+        in_mistake_book = int(state["in_mistake_book"])
+
+        if result == "known":
+            new_stage = min(old_stage + 1, MAX_STAGE)
+            new_mastery = min(old_mastery + 0.2, 1.0)
+            correct_streak += 1
+            if in_mistake_book and correct_streak >= 2:
+                in_mistake_book = 0
+            next_at = now + REVIEW_INTERVALS[new_stage]
+        elif result == "fuzzy":
+            new_stage = old_stage
+            new_mastery = min(old_mastery + 0.05, 1.0)
+            correct_streak = 0
+            next_at = now + REVIEW_INTERVALS[1]
+        else:
+            new_stage = 0
+            new_mastery = max(old_mastery - 0.15, 0.0)
+            correct_streak = 0
+            wrong_count += 1
+            in_mistake_book = 1
+            next_at = now + REVIEW_INTERVALS[0]
+
+        points_json = json.dumps(matched_points or [], ensure_ascii=False)
+        next_review_at = next_at.isoformat(timespec="seconds")
+        review_count = int(state["review_count"]) + 1
+        conn.execute(
+            """
+            UPDATE question_review_states
+            SET mastery = ?, review_stage = ?, next_review_at = ?,
+                last_reviewed_at = ?, review_count = ?, correct_streak = ?,
+                wrong_count = ?, in_mistake_book = ?, last_user_answer = ?,
+                last_matched_points = ?, updated_at = ?
+            WHERE qa_id = ?
+            """,
+            (
+                new_mastery, new_stage, next_review_at, now_str, review_count,
+                correct_streak, wrong_count, in_mistake_book, user_answer.strip(),
+                points_json, now_str, qa_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO review_attempts
+                (id, qa_id, answered_at, user_answer, result, matched_points,
+                 answer_snapshot, mastery_after, stage_after)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _uid("attempt-"), qa_id, now_str, user_answer.strip(), result,
+                points_json, str(qa["answer"]), new_mastery, new_stage,
+            ),
+        )
+        conn.commit()
+        return {
+            "qa_id": qa_id,
+            "mastery": new_mastery,
+            "review_stage": new_stage,
+            "next_review_at": next_review_at,
+            "last_reviewed_at": now_str,
+            "review_count": review_count,
+            "correct_streak": correct_streak,
+            "wrong_count": wrong_count,
+            "in_mistake_book": bool(in_mistake_book),
+            "last_user_answer": user_answer.strip(),
+            "matched_points": matched_points or [],
+        }
+    finally:
+        conn.close()
+
+
+def _ensure_question_review_state(
+    conn: sqlite3.Connection,
+    qa_id: str,
+    card_id: str,
+    now: str,
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM question_review_states WHERE qa_id = ?", (qa_id,)
+    ).fetchone()
+    if row is not None:
+        return dict(row)
+    legacy = conn.execute(
+        "SELECT * FROM review_states WHERE card_id = ?", (card_id,)
+    ).fetchone()
+    values = {
+        "qa_id": qa_id,
+        "mastery": float(legacy["mastery"]) if legacy else 0.0,
+        "review_stage": int(legacy["review_stage"]) if legacy else 0,
+        "next_review_at": str(legacy["next_review_at"] or now) if legacy else now,
+        "last_reviewed_at": legacy["last_reviewed_at"] if legacy else None,
+        "review_count": int(legacy["review_count"]) if legacy else 0,
+        "correct_streak": 0,
+        "wrong_count": 0,
+        "in_mistake_book": 0,
+        "last_user_answer": "",
+        "last_matched_points": "[]",
+        "updated_at": now,
+    }
+    conn.execute(
+        """
+        INSERT INTO question_review_states
+            (qa_id, mastery, review_stage, next_review_at, last_reviewed_at,
+             review_count, correct_streak, wrong_count, in_mistake_book,
+             last_user_answer, last_matched_points, updated_at)
+        VALUES (:qa_id, :mastery, :review_stage, :next_review_at, :last_reviewed_at,
+                :review_count, :correct_streak, :wrong_count, :in_mistake_book,
+                :last_user_answer, :last_matched_points, :updated_at)
+        """,
+        values,
+    )
+    return values
+
+
+def _decode_structured_qa(pair: dict[str, Any]) -> None:
+    for field in ("key_points", "pitfalls", "follow_ups"):
+        pair[field] = _parse_json_list(pair.get(field))
+
+
+def _question_row(row: sqlite3.Row) -> dict[str, Any]:
+    payload = dict(row)
+    _decode_structured_qa(payload)
+    payload["matched_points"] = _parse_json_list(payload.pop("last_matched_points", "[]"))
+    payload["in_mistake_book"] = bool(payload.get("in_mistake_book"))
+    return payload
+
+
+def _parse_json_list(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    try:
+        parsed = json.loads(str(raw or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
 
 
 def delete_qa_pair(qa_id: str) -> bool:

@@ -50,13 +50,22 @@ from .assistant_log import append_event
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import migrate_legacy_record
 from .knowledge_service import (
+    answer_key_point_hints,
+    due_question_items,
     KnowledgeStorageError,
     due_review_items,
     format_knowledge,
+    local_knowledge_status,
     load_knowledge_cards,
+    mark_knowledge_card_learned,
+    mistake_question_items,
+    practice_question_items,
     qa_pairs_for_card,
+    record_question_answer,
     record_review,
+    refresh_online_knowledge,
     refresh_knowledge_repository,
+    sync_local_knowledge,
 )
 from .paths import PROJECT_ROOT, asset_path, qml_path
 from .pomodoro import pomodoro_status, start_pomodoro, stop_pomodoro
@@ -331,6 +340,14 @@ QListWidget::item:selected {
         title.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
         layout.addWidget(title)
 
+        status = local_knowledge_status()
+        last_sync = status.get("last_indexed_at") or "尚未同步 Obsidian"
+        self._status_label = QLabel(
+            f"知识卡 {len(self._records)} 张 · 可复习题 {status.get('questions', 0)} 道 · 最近同步：{last_sync}"
+        )
+        self._status_label.setStyleSheet("color: #5d6b86;")
+        layout.addWidget(self._status_label)
+
         self._search = QLineEdit(self)
         self._search.setPlaceholderText("搜索学科、术语、关键点或问题")
         self._search.textChanged.connect(self._refresh_list)
@@ -348,6 +365,22 @@ QListWidget::item:selected {
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
         layout.addWidget(splitter)
+
+        action_row = QHBoxLayout()
+        self._learn_btn = QPushButton("标记已学")
+        self._practice_btn = QPushButton("开始练习")
+        self._due_btn = QPushButton("今日复习")
+        self._mistakes_btn = QPushButton("查看错题本")
+        self._learn_btn.clicked.connect(self._mark_selected_learned)
+        self._practice_btn.clicked.connect(self._practice_selected)
+        self._due_btn.clicked.connect(self._open_due_reviews)
+        self._mistakes_btn.clicked.connect(self._open_mistakes)
+        action_row.addWidget(self._learn_btn)
+        action_row.addWidget(self._practice_btn)
+        action_row.addWidget(self._due_btn)
+        action_row.addWidget(self._mistakes_btn)
+        action_row.addStretch()
+        layout.addLayout(action_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -378,6 +411,42 @@ QListWidget::item:selected {
         index = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(index, int) and 0 <= index < len(self._records):
             self._detail.setPlainText(self._format_detail(self._records[index]))
+
+    def _selected_record(self) -> dict | None:
+        item = self._list.currentItem()
+        if item is None:
+            return None
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(index, int) and 0 <= index < len(self._records):
+            return self._records[index]
+        return None
+
+    def _mark_selected_learned(self) -> None:
+        record = self._selected_record()
+        if not record:
+            return
+        count = mark_knowledge_card_learned(str(record.get("id") or ""))
+        self._status_label.setText(f"已标记「{record.get('title') or record.get('topic')}」为已学，{count} 道题进入复习队列。")
+
+    def _practice_selected(self) -> None:
+        record = self._selected_record()
+        if not record:
+            return
+        questions = practice_question_items(str(record.get("id") or ""))
+        if not questions:
+            self._status_label.setText("这张卡片没有来源可靠的问答，可先阅读知识内容。")
+            return
+        ReviewDialog(questions, self).exec()
+
+    def _open_mistakes(self) -> None:
+        MistakeBookDialog(mistake_question_items(), self).exec()
+
+    def _open_due_reviews(self) -> None:
+        questions = due_question_items(limit=50)
+        if not questions:
+            self._status_label.setText("今天没有到期题目，可以继续学习新知识卡。")
+            return
+        ReviewDialog(questions, self).exec()
 
     @staticmethod
     def _category(record: dict) -> str:
@@ -527,7 +596,7 @@ class BubbleDetailDialog(QDialog):
         self._content_area.setPlainText(content)
 
 
-class ReviewDialog(QDialog):
+class LegacyReviewDialog(QDialog):
     """今日复习 — 显示到期知识卡片并提供掌握/模糊/不会反馈按钮"""
 
     def __init__(self, items: list[dict], parent: QWidget | None = None) -> None:
@@ -784,6 +853,252 @@ class ReviewDialog(QDialog):
         self._show_current()
 
 
+class ReviewDialog(QDialog):
+    """Question-first review flow: answer, reveal, self-assess, schedule."""
+
+    def __init__(self, items: list[dict], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._items = items
+        self._index = 0
+        self._revealed = False
+        self._matched_points: list[str] = []
+        self.setWindowTitle("今日复习")
+        self.setWindowIcon(QIcon(str(export_menu_icon())))
+        self.resize(680, 720)
+        self.setStyleSheet(DIALOG_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        self._title_label = QLabel()
+        self._title_label.setObjectName("dialogTitle")
+        self._title_label.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
+        layout.addWidget(self._title_label)
+
+        self._question_area = QTextEdit(self)
+        self._question_area.setReadOnly(True)
+        self._question_area.setFont(QFont("Microsoft YaHei UI", 10))
+        layout.addWidget(self._question_area, 3)
+
+        answer_label = QLabel("你的回答（可留空直接查看答案；内容只保存在本机）")
+        answer_label.setStyleSheet("color: #5d6b86;")
+        layout.addWidget(answer_label)
+        self._answer_editor = QTextEdit(self)
+        self._answer_editor.setPlaceholderText("先用自己的话作答，再对照参考答案和要点。")
+        self._answer_editor.setMinimumHeight(110)
+        layout.addWidget(self._answer_editor, 1)
+
+        self._coverage_label = QLabel("")
+        self._coverage_label.setWordWrap(True)
+        self._coverage_label.setStyleSheet("color: #4d6280;")
+        layout.addWidget(self._coverage_label)
+
+        submit_row = QHBoxLayout()
+        self._submit_btn = QPushButton("提交并查看答案")
+        self._submit_btn.clicked.connect(self._reveal_answer)
+        submit_row.addWidget(self._submit_btn)
+        submit_row.addStretch()
+        layout.addLayout(submit_row)
+
+        grade_row = QHBoxLayout()
+        self._known_btn = QPushButton("✓ 掌握")
+        self._fuzzy_btn = QPushButton("~ 模糊")
+        self._forgotten_btn = QPushButton("✗ 不会")
+        self._known_btn.clicked.connect(lambda: self._grade("known"))
+        self._fuzzy_btn.clicked.connect(lambda: self._grade("fuzzy"))
+        self._forgotten_btn.clicked.connect(lambda: self._grade("forgotten"))
+        for button in (self._known_btn, self._fuzzy_btn, self._forgotten_btn):
+            button.setEnabled(False)
+            grade_row.addWidget(button)
+        layout.addLayout(grade_row)
+
+        footer = QHBoxLayout()
+        self._next_btn = QPushButton("下一题 →")
+        self._next_btn.clicked.connect(self._go_next)
+        self._next_btn.hide()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(self._next_btn)
+        footer.addStretch()
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+        self._show_current()
+
+    def _show_current(self) -> None:
+        self._revealed = False
+        self._matched_points = []
+        self._answer_editor.clear()
+        self._answer_editor.setReadOnly(False)
+        self._coverage_label.clear()
+        self._submit_btn.setEnabled(True)
+        self._next_btn.hide()
+        for button in (self._known_btn, self._fuzzy_btn, self._forgotten_btn):
+            button.setEnabled(False)
+
+        if self._index >= len(self._items):
+            self._title_label.setText("今日复习 ✓")
+            self._question_area.setPlainText("本轮问题已全部完成。错题会按计划再次出现。")
+            self._answer_editor.hide()
+            self._submit_btn.setEnabled(False)
+            return
+
+        item = self._items[self._index]
+        self._answer_editor.show()
+        self._title_label.setText(f"今日复习 ({self._index + 1}/{len(self._items)})")
+        source = item.get("source_label") or "本地知识库"
+        marker = "错题" if item.get("in_mistake_book") else "普通复习"
+        type_label = "面试真题" if item.get("question_type") == "interview-real" else "面试高频题型"
+        self._question_area.setPlainText(
+            f"主题：{item.get('topic') or item.get('title') or '未知'}\n"
+            f"类型：{marker} · {type_label}\n"
+            f"来源：{source}\n\n"
+            f"问题\n{item.get('question', '')}"
+        )
+
+    def _reveal_answer(self) -> None:
+        if self._index >= len(self._items) or self._revealed:
+            return
+        item = self._items[self._index]
+        user_answer = self._answer_editor.toPlainText().strip()
+        self._matched_points = answer_key_point_hints(item, user_answer)
+        points = item.get("key_points") or []
+        missing = [point for point in points if point not in self._matched_points]
+        if points:
+            self._coverage_label.setText(
+                f"要点覆盖提示：命中 {len(self._matched_points)}/{len(points)}。"
+                + (f" 可再关注：{'；'.join(missing[:3])}" if missing else " 已覆盖全部提示要点。")
+            )
+        else:
+            self._coverage_label.setText("这道题没有可机械匹配的关键词，请根据参考答案自行判断。")
+        self._question_area.setPlainText(self._format_revealed(item, user_answer))
+        self._answer_editor.setReadOnly(True)
+        self._submit_btn.setEnabled(False)
+        for button in (self._known_btn, self._fuzzy_btn, self._forgotten_btn):
+            button.setEnabled(True)
+        self._revealed = True
+
+    @staticmethod
+    def _format_revealed(item: dict, user_answer: str) -> str:
+        parts = [f"问题\n{item.get('question', '')}", f"你的回答\n{user_answer or '（未填写）'}"]
+        summary = str(item.get("answer_summary") or "").strip()
+        detail = str(item.get("answer_detail") or item.get("answer") or "").strip()
+        if summary:
+            parts.append(f"一句话结论\n{summary}")
+        if detail:
+            parts.append(f"原理拆解\n{detail}")
+        answer = str(item.get("answer") or "")
+        example_match = re.search(
+            r"(?:^|\n\n)工程示例：\s*(.+?)(?=\n\n(?:回答要点|易错点|面试追问|来源)：|\Z)",
+            answer,
+            flags=re.DOTALL,
+        )
+        if example_match:
+            parts.append(f"工程示例\n{example_match.group(1).strip()}")
+        points = item.get("key_points") or []
+        if points:
+            parts.append("回答要点\n" + "\n".join(f"- {point}" for point in points))
+        pitfalls = item.get("pitfalls") or []
+        if pitfalls:
+            parts.append("易错点\n" + "\n".join(f"- {point}" for point in pitfalls))
+        follow_ups = item.get("follow_ups") or []
+        if follow_ups:
+            parts.append("面试追问\n" + "\n".join(f"- {question}" for question in follow_ups))
+        parts.append(f"来源\n{item.get('source_label') or '内置面试高频题型'}")
+        return "\n\n".join(parts)
+
+    def _grade(self, result: str) -> None:
+        if self._index >= len(self._items) or not self._revealed:
+            return
+        item = self._items[self._index]
+        try:
+            updated = record_question_answer(
+                str(item.get("id") or ""),
+                result,
+                self._answer_editor.toPlainText(),
+                self._matched_points,
+            )
+        except (KnowledgeStorageError, ValueError):
+            self._coverage_label.setText("复习结果保存失败，本题不会跳过；请检查本地数据目录。")
+            return
+        labels = {"known": "掌握", "fuzzy": "模糊", "forgotten": "不会"}
+        mistake_text = "，仍在错题本" if updated.get("in_mistake_book") else ""
+        self._coverage_label.setText(
+            f"已保存：{labels[result]}{mistake_text}。下次复习：{updated.get('next_review_at', '')}"
+        )
+        for button in (self._known_btn, self._fuzzy_btn, self._forgotten_btn):
+            button.setEnabled(False)
+        self._next_btn.show()
+
+    def _go_next(self) -> None:
+        self._index += 1
+        self._show_current()
+
+
+class MistakeBookDialog(QDialog):
+    def __init__(self, items: list[dict], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._items = items
+        self.setWindowTitle("错题本")
+        self.resize(760, 560)
+        self.setStyleSheet(DIALOG_STYLE)
+        layout = QVBoxLayout(self)
+        title = QLabel(f"待攻克错题 · {len(items)} 道")
+        title.setObjectName("dialogTitle")
+        title.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.Bold))
+        layout.addWidget(title)
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self._list = QListWidget(splitter)
+        self._detail = QTextEdit(splitter)
+        self._detail.setReadOnly(True)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter)
+        for index, item in enumerate(items):
+            row = QListWidgetItem(
+                f"{item.get('topic', '未知')} · 错 {item.get('wrong_count', 0)} 次\n{item.get('question', '')}"
+            )
+            row.setData(Qt.ItemDataRole.UserRole, index)
+            self._list.addItem(row)
+        self._list.currentItemChanged.connect(lambda current, _previous: self._show_item(current))
+        if self._list.count():
+            self._list.setCurrentRow(0)
+        else:
+            self._detail.setPlainText("错题本为空。连续答对两次的题会自动移出。")
+        buttons = QHBoxLayout()
+        review_btn = QPushButton("只复习错题")
+        review_btn.setEnabled(bool(items))
+        review_btn.clicked.connect(self._review_all)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(review_btn)
+        buttons.addStretch()
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    def _show_item(self, row: QListWidgetItem | None) -> None:
+        if row is None:
+            return
+        index = row.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(index, int) or not 0 <= index < len(self._items):
+            return
+        item = self._items[index]
+        matched = set(item.get("matched_points") or [])
+        missing = [point for point in item.get("key_points") or [] if point not in matched]
+        self._detail.setPlainText(
+            f"问题\n{item.get('question', '')}\n\n"
+            f"上次回答\n{item.get('last_user_answer') or '（未填写）'}\n\n"
+            f"遗漏要点\n{chr(10).join('- ' + point for point in missing) or '暂无可机械判断的遗漏要点'}\n\n"
+            f"错误次数：{item.get('wrong_count', 0)}\n"
+            f"连续答对：{item.get('correct_streak', 0)}/2\n"
+            f"下次复习：{item.get('next_review_at', '')}"
+        )
+
+    def _review_all(self) -> None:
+        if self._items:
+            ReviewDialog(self._items, self).exec()
+
+
 class TableMiku(QWidget):
     async_notice = Signal(str, str)
 
@@ -791,6 +1106,7 @@ class TableMiku(QWidget):
         super().__init__()
         ensure_goal_plans()
         self.settings = load_settings()
+        self._knowledge_sync_running = False
         self.drag_position: QPoint | None = None
         self.was_dragged = False
 
@@ -831,6 +1147,8 @@ class TableMiku(QWidget):
         self.assistant = PersonalAssistant(lambda: self.system_monitor.latest_snapshot, PROJECT_ROOT, self)
         self.assistant.notice.connect(self._handle_system_notice)
         self.assistant.start()
+        if (self.settings.get("knowledge") or {}).get("enabled", True):
+            QTimer.singleShot(1200, self._start_background_knowledge_sync)
 
         self.tray_icon = self._setup_tray_icon()
         if (self.settings.get("assistant") or {}).get("ai_agent_enabled", False):
@@ -976,8 +1294,10 @@ class TableMiku(QWidget):
         application_action = QAction("新增投递记录", self)
         interview_action = QAction("新增面试复盘", self)
         records_action = QAction("查看助理记录", self)
-        knowledge_action = QAction("更新计算机知识库", self)
-        view_knowledge_action = QAction("查看计算机知识库", self)
+        knowledge_action = QAction("同步本地知识库", self)
+        online_knowledge_action = QAction("更新在线来源", self)
+        view_knowledge_action = QAction("打开知识中心", self)
+        mistakes_action = QAction("查看错题本", self)
         startup_action = QAction("关闭开机自启" if is_startup_enabled() else "开启开机自启", self)
         menu_icon = QIcon(str(export_menu_icon()))
         if not menu_icon.isNull():
@@ -1011,8 +1331,10 @@ class TableMiku(QWidget):
         application_action.triggered.connect(self.add_application)
         interview_action.triggered.connect(self.add_interview_review)
         records_action.triggered.connect(self.show_assistant_records)
-        knowledge_action.triggered.connect(self.refresh_knowledge)
+        knowledge_action.triggered.connect(self.sync_knowledge)
+        online_knowledge_action.triggered.connect(self.refresh_knowledge)
         view_knowledge_action.triggered.connect(self.show_knowledge)
+        mistakes_action.triggered.connect(self.show_mistakes)
         startup_action.triggered.connect(self.toggle_startup)
         toggle_monitor_action.triggered.connect(self.toggle_system_monitor)
         toggle_action.triggered.connect(self.toggle_reminders)
@@ -1026,6 +1348,8 @@ class TableMiku(QWidget):
         study_menu.setStyleSheet(MENU_STYLE)
         study_menu.addAction(today_action)
         study_menu.addAction(review_action)
+        study_menu.addAction(mistakes_action)
+        study_menu.addAction(view_knowledge_action)
         study_menu.addAction(add_goal_action)
         study_menu.addAction(schedule_action)
         study_menu.addAction(view_timetable_action)
@@ -1038,7 +1362,7 @@ class TableMiku(QWidget):
         job_menu.addAction(records_action)
         job_menu.addSeparator()
         job_menu.addAction(knowledge_action)
-        job_menu.addAction(view_knowledge_action)
+        job_menu.addAction(online_knowledge_action)
 
         # ── 子菜单 3：⚙️ 系统工具 ──
         tools_menu = QMenu("⚙️ 系统工具", menu)
@@ -1309,15 +1633,19 @@ class TableMiku(QWidget):
         self.assistant.ai_plan_now(force=True, authority="once")
 
     def show_due_reviews(self) -> None:
-        """打开今日复习对话框，显示到期知识卡片"""
-        items = due_review_items()
+        """打开逐题复习对话框。"""
+        items = due_question_items()
         if not items:
             self.pet.set_expression("smile")
-            self.say("今天没有到期的知识卡片，休息一下也没关系~")
+            self.say("今天没有到期的面试复习题，休息一下也没关系~")
             return
         self.pet.set_expression("thinking")
         dialog = ReviewDialog(items, self)
         dialog.exec()
+
+    def show_mistakes(self) -> None:
+        MistakeBookDialog(mistake_question_items(), self).exec()
+        self.pet.set_expression("focus")
 
     def toggle_pomodoro(self) -> None:
         self.settings = load_settings()
@@ -1408,25 +1736,74 @@ class TableMiku(QWidget):
         dialog.exec()
         self.pet.set_expression("smile")
 
+    def _start_background_knowledge_sync(self) -> None:
+        self._start_local_knowledge_sync(manual=False)
+
+    def sync_knowledge(self) -> None:
+        self._start_local_knowledge_sync(manual=True)
+
+    def _start_local_knowledge_sync(self, *, manual: bool) -> None:
+        if self._knowledge_sync_running:
+            if manual:
+                self.say("知识库正在同步，请稍等。")
+            return
+        self._knowledge_sync_running = True
+        if manual:
+            self.pet.set_expression("thinking")
+            self.say("正在只读分析 Obsidian 的“计算机知识”和“05-Interview”。")
+        threading.Thread(target=self._sync_knowledge_worker, args=(manual,), daemon=True).start()
+
+    def _sync_knowledge_worker(self, manual: bool) -> None:
+        try:
+            summary = sync_local_knowledge()
+            changed = (
+                int(summary.get("created", 0))
+                + int(summary.get("updated", 0))
+                + int(summary.get("deleted", 0))
+            )
+            errors = summary.get("errors") or []
+            if manual or changed or errors:
+                if not summary.get("available"):
+                    message = "未找到 Obsidian Vault；可在 settings.json 中配置知识库路径。"
+                    expression = "focus"
+                else:
+                    message = (
+                        f"本地知识同步完成：扫描 {summary.get('scanned', 0)} 篇，"
+                        f"新增 {summary.get('created', 0)}、更新 {summary.get('updated', 0)}、"
+                        f"归档 {summary.get('deleted', 0)}，解析 {summary.get('questions', 0)} 道题。"
+                    )
+                    if errors:
+                        message += f" {len(errors)} 篇处理失败，可再次同步重试。"
+                    expression = "happy" if not errors else "focus"
+                self.async_notice.emit(expression, message)
+        except Exception as exc:
+            self.async_notice.emit("surprised", f"本地知识同步失败：{exc}")
+        finally:
+            self._knowledge_sync_running = False
+
     def refresh_knowledge(self) -> None:
         self.pet.set_expression("thinking")
-        self.say("我开始更新计算机知识库：优先使用离线种子兜底，能联网时补充 Wikipedia，并保留官方文档等来源链接。")
+        self.say("开始手动更新在线来源；本地 Obsidian 内容不会发送到网络。")
         threading.Thread(target=self._refresh_knowledge_worker, daemon=True).start()
 
     def _refresh_knowledge_worker(self) -> None:
         topics = (load_settings().get("knowledge") or {}).get("topics") or None
-        summary = refresh_knowledge_repository(list(topics) if isinstance(topics, list) else None)
-        online = int(summary.get("online", 0))
-        trusted = int(summary.get("trusted_sources", 0))
-        chunks = int(summary.get("trusted_chunks", 0))
-        self.async_notice.emit(
-            "happy" if online or trusted else "focus",
-            f"计算机知识库已更新：共 {summary.get('topics', 0)} 个主题，"
-            f"{online} 个主题使用在线摘要，新增/更新 {trusted} 个可信来源、{chunks} 个来源片段。",
-        )
+        try:
+            summary = refresh_online_knowledge(list(topics) if isinstance(topics, list) else None)
+            online = int(summary.get("online", 0))
+            errors = summary.get("errors") or []
+            message = (
+                f"在线来源更新完成：{summary.get('completed', 0)}/{summary.get('topics', 0)} 个主题返回，"
+                f"{online} 个主题获得在线摘要。"
+            )
+            if errors:
+                message += f" {len(errors)} 个主题失败或超时，本地知识仍可正常使用。"
+            self.async_notice.emit("happy" if online else "focus", message)
+        except Exception as exc:
+            self.async_notice.emit("surprised", f"在线来源更新失败：{exc}")
 
     def show_knowledge(self) -> None:
-        dialog = KnowledgeLibraryDialog(load_knowledge_cards(), self)
+        dialog = KnowledgeLibraryDialog(load_knowledge_cards(limit=600), self)
         dialog.exec()
         self.pet.set_expression("smile")
 
