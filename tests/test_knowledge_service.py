@@ -10,6 +10,32 @@ from table_miku import knowledge_db, knowledge_repository as repo, knowledge_ser
 from table_miku.knowledge_base import _fallback_card
 
 
+def test_normalize_topics_includes_required_defaults_and_deduplicates():
+    topics = knowledge_service._normalize_knowledge_topics(
+        [" 计算机网络 ", "自定义主题", "自定义主题", ""],
+    )
+
+    assert topics[:len(knowledge_service.DEFAULT_KNOWLEDGE_TOPICS)] == knowledge_service.DEFAULT_KNOWLEDGE_TOPICS
+    assert topics.count("计算机网络") == 1
+    assert topics[-1] == "自定义主题"
+
+
+def test_qa_pairs_for_legacy_card_synthesizes_nonempty_answers():
+    pairs = knowledge_service.qa_pairs_for_card(
+        {
+            "overview": "TCP 通过握手建立连接并协商双方的初始序列号。",
+            "review_questions": ["TCP 为什么需要握手？", ""],
+        },
+    )
+
+    assert pairs == [
+        {
+            "question": "TCP 为什么需要握手？",
+            "answer": "TCP 通过握手建立连接并协商双方的初始序列号。",
+        },
+    ]
+
+
 def test_ensure_repository_seeds_topic(tmp_path, monkeypatch):
     _use_tmp_db(tmp_path, monkeypatch)
 

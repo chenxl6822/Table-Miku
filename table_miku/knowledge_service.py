@@ -8,18 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from . import knowledge_db, knowledge_repository as repo
+from .encoding_utils import normalize_zh_text
 from .knowledge_base import (
-    DEFAULT_KNOWLEDGE_TOPICS,
     _fallback_card,
     compact_card_for_context as legacy_compact_card_for_context,
     format_knowledge as legacy_format_knowledge,
     load_knowledge as legacy_load_knowledge,
-    normalize_knowledge_topics,
     refresh_computer_knowledge as legacy_refresh_computer_knowledge,
 )
 from .knowledge_ingest import ingest_trusted_topics
 from .knowledge_migration import migrate_json_to_sqlite
-from .storage import load_settings
+from .storage import DEFAULT_KNOWLEDGE_TOPICS, load_settings
 
 
 _initialized_repository_keys: set[tuple[str, tuple[str, ...]]] = set()
@@ -29,9 +28,42 @@ class KnowledgeStorageError(RuntimeError):
     """Raised when a knowledge mutation could not be persisted safely."""
 
 
+def _normalize_knowledge_topics(topics: list[str] | None = None) -> list[str]:
+    """Return required topics plus caller-provided extras without duplicates."""
+    normalized: list[str] = []
+    for topic in DEFAULT_KNOWLEDGE_TOPICS + (topics or []):
+        cleaned = normalize_zh_text(str(topic)).strip()
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+    return normalized
+
+
+def qa_pairs_for_card(card: dict[str, Any]) -> list[dict[str, str]]:
+    """Return complete QA pairs, synthesizing answers for legacy cards."""
+    pairs: list[dict[str, str]] = []
+    for item in card.get("qa_pairs") or []:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if question and answer:
+            pairs.append({"question": question, "answer": answer})
+    if pairs:
+        return pairs
+
+    for item in card.get("review_questions") or []:
+        question = str(item).strip()
+        if not question:
+            continue
+        answer = repo._generate_fallback_answer(question, card)
+        if answer:
+            pairs.append({"question": question, "answer": answer})
+    return pairs
+
+
 def ensure_knowledge_repository(topics: list[str] | None = None) -> None:
     """Initialize SQLite knowledge data and seed missing default topics."""
-    selected_topics = normalize_knowledge_topics(topics or DEFAULT_KNOWLEDGE_TOPICS)
+    selected_topics = _normalize_knowledge_topics(topics)
     cache_key = (
         str(knowledge_db.knowledge_db_path().resolve()),
         tuple(sorted(topic.strip().lower() for topic in selected_topics)),
@@ -95,7 +127,7 @@ def search_knowledge_cards(query: str, limit: int = 20) -> list[dict[str, Any]]:
 
 def refresh_knowledge_repository(topics: list[str] | None = None) -> dict[str, Any]:
     """Refresh legacy online cards, upsert into SQLite, then add trusted sources."""
-    selected_topics = normalize_knowledge_topics(topics)
+    selected_topics = _normalize_knowledge_topics(topics)
     records = legacy_refresh_computer_knowledge(selected_topics)
     ensure_knowledge_repository(selected_topics)
     for record in records:
