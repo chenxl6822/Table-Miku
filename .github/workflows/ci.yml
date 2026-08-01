@@ -15,7 +15,6 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       QT_QPA_PLATFORM: offscreen
-      TABLE_MIKU_DATA_DIR: ${{ runner.temp }}\TableMiku-ci-data
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -32,6 +31,8 @@ jobs:
       - name: Lint
         run: python -m ruff check main.py table_miku tests
       - name: Test with coverage
+        env:
+          TABLE_MIKU_DATA_DIR: ${{ runner.temp }}\TableMiku-ci-data
         run: python -m pytest --cov=table_miku --cov-branch --cov-report=term-missing
       - name: Audit production dependencies
         run: python -m pip_audit -r requirements.txt

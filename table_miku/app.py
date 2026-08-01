@@ -48,12 +48,13 @@ from .assistant_core import PersonalAssistant
 from .ai_consent import AIConsentChoice, request_ai_consent
 from .assistant_log import append_event
 from .goal_parser import ParsedGoalInput, parse_goal_input
-from .knowledge_base import migrate_legacy_record, qa_pairs_for_card
+from .knowledge_base import migrate_legacy_record
 from .knowledge_service import (
     KnowledgeStorageError,
     due_review_items,
     format_knowledge,
     load_knowledge_cards,
+    qa_pairs_for_card,
     record_review,
     refresh_knowledge_repository,
 )
