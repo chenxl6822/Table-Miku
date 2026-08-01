@@ -30,6 +30,10 @@ class TestInitDb:
             assert "review_states" in tables
             assert "review_history" in tables
             assert "knowledge_qa_pairs" in tables
+            assert "knowledge_documents" in tables
+            assert "knowledge_qa_sources" in tables
+            assert "question_review_states" in tables
+            assert "review_attempts" in tables
             assert "ingest_jobs" in tables
             assert "dedupe_links" in tables
             assert "_schema_version" in tables
@@ -73,6 +77,58 @@ class TestInitDb:
             knowledge_db.init_db(conn)
             ver = knowledge_db.get_schema_version(conn)
             assert ver == knowledge_db.CURRENT_SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    def test_v3_migration_creates_recoverable_database_backup(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "knowledge.db"
+        monkeypatch.setattr(knowledge_db, "knowledge_db_path", lambda: db_path)
+
+        conn = knowledge_db.connect()
+        knowledge_db.init_db(conn)
+        conn.execute("DELETE FROM _schema_version WHERE version >= 3")
+        conn.commit()
+        conn.close()
+
+        conn = knowledge_db.connect()
+        try:
+            knowledge_db.init_db(conn)
+            backups = list(tmp_path.glob("knowledge.pre-v3-*.bak"))
+            assert len(backups) == 1
+            assert backups[0].stat().st_size > 0
+            assert knowledge_db.get_schema_version(conn) == knowledge_db.CURRENT_SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    def test_v4_migration_adds_question_topic_and_backup(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "knowledge.db"
+        monkeypatch.setattr(knowledge_db, "knowledge_db_path", lambda: db_path)
+
+        conn = knowledge_db.connect()
+        knowledge_db.init_db(conn)
+        conn.execute("DROP INDEX idx_qa_question_topic")
+        conn.execute("ALTER TABLE knowledge_qa_pairs DROP COLUMN question_topic")
+        conn.execute("DELETE FROM _schema_version WHERE version = 4")
+        conn.commit()
+        conn.close()
+
+        conn = knowledge_db.connect()
+        try:
+            knowledge_db.init_db(conn)
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(knowledge_qa_pairs)")
+            }
+            backups = list(tmp_path.glob("knowledge.pre-v4-*.bak"))
+            assert "question_topic" in columns
+            assert len(backups) == 1
+            assert backups[0].stat().st_size > 0
+            assert knowledge_db.get_schema_version(conn) == knowledge_db.CURRENT_SCHEMA_VERSION
+            with sqlite3.connect(backups[0]) as backup:
+                backup_columns = {
+                    row[1]
+                    for row in backup.execute("PRAGMA table_info(knowledge_qa_pairs)")
+                }
+                assert "question_topic" not in backup_columns
         finally:
             conn.close()
 
@@ -147,7 +203,7 @@ class TestInitDb:
 
             knowledge_db.migrate(conn)
 
-            assert knowledge_db.get_schema_version(conn) == 2
+            assert knowledge_db.get_schema_version(conn) == knowledge_db.CURRENT_SCHEMA_VERSION
             assert conn.execute("SELECT COUNT(*) FROM knowledge_chunks").fetchone()[0] == 1
             assert conn.execute("SELECT COUNT(*) FROM knowledge_qa_pairs").fetchone()[0] == 1
         finally:

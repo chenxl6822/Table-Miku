@@ -259,3 +259,32 @@ def test_new_topics_have_fallback():
         assert len(fb["glossary"]) >= 4
         assert len(fb["review_questions"]) >= 2
         assert len(fb["examples"]) >= 1
+
+
+def test_practical_topics_have_fallback_and_qa_pairs():
+    """Java/Go/架构主题必须能离线进入知识库和复习答案页。"""
+    for topic in knowledge_base.PRACTICAL_TOPICS:
+        card = knowledge_base._fallback_card(topic)
+        assert card["topic"] == topic
+        assert len(card["overview"]) >= 60
+        assert len(card["key_points"]) >= 4
+        assert len(card["review_questions"]) >= 3
+        assert len(card["qa_pairs"]) == len(card["review_questions"])
+        for pair in card["qa_pairs"]:
+            assert pair["question"]
+            assert pair["answer"]
+
+
+def test_load_knowledge_auto_appends_missing_long_term_topics(monkeypatch):
+    """旧 JSON 只有 6 个主题时，读取层也要补齐长期主题。"""
+    old_payload = [
+        knowledge_base._fallback_card(topic)
+        for topic in knowledge_base.DEFAULT_COMPUTER_TOPICS[:6]
+    ]
+    monkeypatch.setattr(knowledge_base, "read_json", lambda filename, default: old_payload)
+
+    records = knowledge_base.load_knowledge()
+    topics = {record["topic"] for record in records}
+
+    for topic in knowledge_base.DEFAULT_KNOWLEDGE_TOPICS:
+        assert topic in topics

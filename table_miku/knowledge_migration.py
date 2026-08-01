@@ -6,6 +6,7 @@ directory and inserts / upserts rows into the SQLite knowledge database.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 
@@ -21,7 +22,10 @@ from .knowledge_repository import (
     upsert_card,
     upsert_qa_pair,
 )
-from .storage import read_json, write_json
+from .paths import runtime_path
+
+
+_MIGRATION_JOB_ID = "legacy-json-to-sqlite-v3"
 
 
 def migrate_json_to_sqlite(force: bool = False) -> dict[str, Any]:
@@ -41,10 +45,12 @@ def migrate_json_to_sqlite(force: bool = False) -> dict[str, Any]:
         _db.init_db(conn)
 
         if not force:
-            existing = conn.execute(
-                "SELECT COUNT(*) FROM knowledge_cards"
-            ).fetchone()[0]
-            if existing > 0:
+            completed = conn.execute(
+                "SELECT 1 FROM ingest_jobs WHERE id = ? AND status = 'completed'",
+                (_MIGRATION_JOB_ID,),
+            ).fetchone()
+            if completed:
+                existing = conn.execute("SELECT COUNT(*) FROM knowledge_cards").fetchone()[0]
                 return {
                     "cards": 0,
                     "review_states": 0,
@@ -54,6 +60,18 @@ def migrate_json_to_sqlite(force: bool = False) -> dict[str, Any]:
 
         cards_count = _migrate_cards(conn)
         states_count, history_count = _migrate_reviews(conn)
+        now = _now()
+        conn.execute(
+            """
+            INSERT INTO ingest_jobs
+                (id, source_kind, query, status, started_at, finished_at, error)
+            VALUES (?, 'legacy-json', 'knowledge_base.json;knowledge_reviews.json',
+                    'completed', ?, ?, '')
+            ON CONFLICT(id) DO UPDATE SET
+                status = 'completed', finished_at = excluded.finished_at, error = ''
+            """,
+            (_MIGRATION_JOB_ID, now, now),
+        )
         conn.commit()
 
         return {
@@ -68,7 +86,7 @@ def migrate_json_to_sqlite(force: bool = False) -> dict[str, Any]:
 
 def _migrate_cards(conn) -> int:
     """Migrate knowledge_base.json → knowledge_cards + sources + chunks + fts + qa."""
-    cards = read_json("knowledge_base.json", [])
+    cards = _read_legacy_json("knowledge_base.json")
     if not isinstance(cards, list):
         return 0
 
@@ -98,7 +116,7 @@ def _migrate_cards(conn) -> int:
 
 def _migrate_reviews(conn) -> tuple[int, int]:
     """Migrate knowledge_reviews.json → review_states + review_history."""
-    reviews = read_json("knowledge_reviews.json", [])
+    reviews = _read_legacy_json("knowledge_reviews.json")
     if not isinstance(reviews, list):
         return 0, 0
 
@@ -172,3 +190,14 @@ def _migrate_reviews(conn) -> tuple[int, int]:
             history_count += 1
 
     return states_count, history_count
+
+
+def _read_legacy_json(filename: str) -> Any:
+    """Read a legacy migration source without creating, repairing, or rewriting it."""
+    path = runtime_path(filename)
+    if not path.is_file():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []

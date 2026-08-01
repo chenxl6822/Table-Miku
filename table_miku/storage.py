@@ -114,6 +114,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "trusted_sources": {
             "enabled": True,
             "obsidian_vault": "",
+            "auto_discover_sibling_vault": True,
+            "included_subdirectories": ["计算机知识", "05-Interview"],
         },
     },
     "knowledge_review": {

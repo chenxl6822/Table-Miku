@@ -21,6 +21,12 @@ SAMPLE_CARD = {
     "key_points": ["分层模型降低协议设计复杂度", "TCP通过序号和确认保证可靠传输"],
     "glossary": [{"term": "TCP", "explanation": "面向连接的可靠传输协议。"}],
     "review_questions": ["TCP为什么需要三次握手？"],
+    "qa_pairs": [
+        {
+            "question": "TCP为什么需要三次握手？",
+            "answer": "三次握手用于确认双方收发能力并同步初始序列号。",
+        }
+    ],
 }
 
 
@@ -62,7 +68,7 @@ class TestUpsertCard:
 
         repo.upsert_card(dict(SAMPLE_CARD))
         qa_pairs = repo.list_qa_pairs("wiki-test-tcp")
-        # Should have at least 1 QA pair from review_questions
+        # Only explicit source-backed QA pairs are persisted.
         assert len(qa_pairs) >= 1
         assert qa_pairs[0]["question"] == "TCP为什么需要三次握手？"
         assert len(qa_pairs[0]["answer"]) > 0

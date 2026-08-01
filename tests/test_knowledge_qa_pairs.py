@@ -23,6 +23,10 @@ class TestQaPairCorrespondence:
                 "什么是单元测试？",
                 "TDD的核心流程是什么？",
             ],
+            "qa_pairs": [
+                {"question": "什么是单元测试？", "answer": "单元测试验证一个最小可测试单元的行为。"},
+                {"question": "TDD的核心流程是什么？", "answer": "先写失败测试，再实现通过，最后重构。"},
+            ],
         })
 
         pairs = repo.list_qa_pairs("card-qa-1")
@@ -49,6 +53,11 @@ class TestQaPairCorrespondence:
                 "DNS的作用是什么？",
                 "HTTP和HTTPS的区别？",
             ],
+            "qa_pairs": [
+                {"question": "TCP为什么需要三次握手？", "answer": "确认双方收发能力并同步序列号。"},
+                {"question": "DNS的作用是什么？", "answer": "把域名解析为可路由的地址。"},
+                {"question": "HTTP和HTTPS的区别？", "answer": "HTTPS 在 HTTP 外增加 TLS 机密性和身份认证。"},
+            ],
         })
 
         pairs = repo.list_qa_pairs("card-qa-2")
@@ -70,6 +79,11 @@ class TestQaPairCorrespondence:
             "title": "数据结构QA",
             "overview": "基础数据结构知识问答。",
             "review_questions": ["Q1?", "Q2?", "Q3?"],
+            "qa_pairs": [
+                {"question": "Q1?", "answer": "A1"},
+                {"question": "Q2?", "answer": "A2"},
+                {"question": "Q3?", "answer": "A3"},
+            ],
         })
 
         pairs = repo.list_qa_pairs("card-qa-3")
@@ -203,7 +217,7 @@ class TestQaPairUpdate:
 
 
 class TestQaPairsFromCardUpsert:
-    """When upserting a card with review_questions, QA pairs are auto-generated."""
+    """Only source-backed explicit QA pairs are persisted from cards."""
 
     def test_card_without_review_questions(self, tmp_path, monkeypatch):
         _use_tmp_db(tmp_path, monkeypatch)
@@ -230,6 +244,7 @@ class TestQaPairsFromCardUpsert:
             "title": "卡A",
             "overview": "卡片A的概述内容。",
             "review_questions": ["卡A的问题？"],
+            "qa_pairs": [{"question": "卡A的问题？", "answer": "卡A的答案。"}],
         })
         repo.upsert_card({
             "id": "card-b-iso",
@@ -237,6 +252,7 @@ class TestQaPairsFromCardUpsert:
             "title": "卡B",
             "overview": "卡片B的概述内容。",
             "review_questions": ["卡B的问题？"],
+            "qa_pairs": [{"question": "卡B的问题？", "answer": "卡B的答案。"}],
         })
 
         pairs_a = repo.list_qa_pairs("card-a-iso")
