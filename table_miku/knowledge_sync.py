@@ -17,22 +17,24 @@ from .paths import PROJECT_ROOT
 from .storage import load_settings
 
 
-PARSER_VERSION = "obsidian-v1"
+PARSER_VERSION = "obsidian-v2"
 ALLOWED_SUBDIRECTORIES = ("计算机知识", "05-Interview")
 ELIGIBLE_NOTE_TYPES = {"knowledge", "question", "algorithm", "interview"}
 MAX_NOTE_BYTES = 2 * 1024 * 1024
-QUESTION_HEADINGS = ("常见面试问法", "面试中最常见问法", "面试官追问")
-ANSWER_HEADINGS = ("我的回答模板", "面试口述稿", "一句话理解", "小白解释", "核心概念", "解法")
-PITFALL_HEADINGS = ("易错点", "常见误区")
+QUESTION_HEADINGS = ("题目", "常见面试问法", "面试中最常见问法", "面试官追问")
+ANSWER_HEADINGS = (
+    "标准答案", "我的回答模板", "面试口述稿", "一句话理解", "小白解释", "核心概念", "解法"
+)
+PITFALL_HEADINGS = ("易错点", "常见误区", "常见错误")
 TOPIC_ALIASES = {
     "数据库": "数据库原理",
-    "mysql": "数据库原理",
+    "mysql": "MySQL",
     "编译器": "编译原理",
     "计算机组成": "计算机组成原理",
     "java": "Java 后端基础",
     "jvm": "Java 后端基础",
     "spring": "Java 后端基础",
-    "redis": "Java 后端基础",
+    "redis": "Redis",
     "go": "Go 后端基础",
     "算法": "算法设计与分析",
     "哈希表": "算法设计与分析",
@@ -44,6 +46,7 @@ TOPIC_ALIASES = {
 
 @dataclass
 class ParsedQuestion:
+    topic: str
     question: str
     answer: str
     answer_summary: str
@@ -58,6 +61,7 @@ class ParsedQuestion:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "question_topic": self.topic,
             "question": self.question,
             "answer": self.answer,
             "answer_summary": self.answer_summary,
@@ -124,8 +128,13 @@ def parse_obsidian_note(path: Path, vault_root: Path) -> ParsedNote | None:
 
     title = _title_from_body(body) or resolved_path.stem
     tags = _metadata_list(metadata, "tags")
-    raw_topic = str(metadata.get("topic") or "").strip()
-    topic = canonical_topic(raw_topic or _infer_topic(resolved_path, title, tags))
+    declared_topics = _unique_items(
+        [canonical_topic(item) for item in _metadata_list(metadata, "topic")],
+        limit=8,
+    )
+    topic = " / ".join(declared_topics) if declared_topics else canonical_topic(
+        _infer_topic(resolved_path, title, tags)
+    )
     sections = _markdown_sections(body)
     section_map = _group_sections(sections)
     overview = _first_section(section_map, ("一句话理解", "小白解释", "题目")) or _first_prose(body)
@@ -138,8 +147,10 @@ def parse_obsidian_note(path: Path, vault_root: Path) -> ParsedNote | None:
     questions = _questions_from_note(
         title=title,
         topic=topic,
+        declared_topics=declared_topics,
         note_type=note_type,
         metadata=metadata,
+        body=body,
         sections=sections,
         section_map=section_map,
         key_points=key_points,
@@ -353,6 +364,10 @@ def _store_parsed_note(
     document_id = _stable_id("doc", f"{root_key}\0{relative}")
     source_id = _stable_id("src", f"obsidian-readonly\0{root_key}\0{relative}")
     card_id = _stable_id("obs", f"{parsed.topic}\0{_normalized_match_text(parsed.title)}")
+    previous_document = conn.execute(
+        "SELECT card_id FROM knowledge_documents WHERE id = ?", (document_id,)
+    ).fetchone()
+    previous_card_id = str(previous_document["card_id"] or "") if previous_document else ""
     source_url = str(root / Path(relative))
     conn.execute(
         """
@@ -422,6 +437,8 @@ def _store_parsed_note(
         question_ids.add(qa_id)
     for qa_id in set(old_question_ids) - question_ids:
         _deactivate_question_if_orphan(conn, qa_id)
+    if previous_card_id and previous_card_id != card_id:
+        _archive_card_if_orphan(conn, previous_card_id)
     repo._refresh_card_fts(conn, card_id)
     return len(question_ids)
 
@@ -480,12 +497,23 @@ def _deactivate_document(conn, document_id: str) -> None:
         _deactivate_question_if_orphan(conn, qa_id)
     card_id = str(row["card_id"] or "")
     if card_id:
-        active = conn.execute(
-            "SELECT 1 FROM knowledge_documents WHERE card_id = ? AND id <> ? AND status = 'active' LIMIT 1",
-            (card_id, document_id),
-        ).fetchone()
-        if active is None:
-            conn.execute("UPDATE knowledge_cards SET archived = 1 WHERE id = ?", (card_id,))
+        _archive_card_if_orphan(conn, card_id, excluded_document_id=document_id)
+
+
+def _archive_card_if_orphan(
+    conn,
+    card_id: str,
+    *,
+    excluded_document_id: str = "",
+) -> None:
+    query = "SELECT 1 FROM knowledge_documents WHERE card_id = ? AND status = 'active'"
+    params: tuple[str, ...] = (card_id,)
+    if excluded_document_id:
+        query += " AND id <> ?"
+        params += (excluded_document_id,)
+    active = conn.execute(query + " LIMIT 1", params).fetchone()
+    if active is None:
+        conn.execute("UPDATE knowledge_cards SET archived = 1 WHERE id = ?", (card_id,))
 
 
 def _deactivate_question_if_orphan(conn, qa_id: str) -> None:
@@ -523,46 +551,117 @@ def _questions_from_note(
     *,
     title: str,
     topic: str,
+    declared_topics: list[str],
     note_type: str,
     metadata: dict[str, Any],
+    body: str,
     sections: list[tuple[str, str]],
     section_map: dict[str, list[str]],
     key_points: list[str],
     pitfalls: list[str],
     source_label: str,
 ) -> list[ParsedQuestion]:
-    candidates: list[tuple[str, str]] = []
+    specifications: list[dict[str, Any]] = []
+    structured_groups = _structured_question_groups(body)
     if note_type == "algorithm":
         problem = _first_section(section_map, ("题目",))
         if problem:
-            candidates.append((f"请口述「{title}」的最优解、复杂度和易错点。", ""))
+            specifications.append(
+                {
+                    "candidate": (f"请口述「{title}」的最优解、复杂度和易错点。", ""),
+                    "context": title,
+                    "sections": sections,
+                    "section_map": section_map,
+                    "key_points": key_points,
+                    "pitfalls": pitfalls,
+                    "follow_ups": [],
+                    "allow_generic": True,
+                }
+            )
+    elif structured_groups:
+        for group_title, group_sections, group_map in structured_groups:
+            candidates = _question_lines(_first_section(group_map, ("题目",)))
+            if not candidates:
+                candidates = _question_lines(group_title)
+            group_points = _unique_items(
+                _items_for_headings(group_map, ("考察点", "核心概念", "关键点")) + key_points,
+                limit=10,
+            )
+            group_pitfalls = _unique_items(
+                _items_for_headings(group_map, PITFALL_HEADINGS) + pitfalls,
+                limit=8,
+            )
+            group_follow_ups = [
+                _ensure_question(_plain_text(question))
+                for question, _answer in _question_lines(
+                    _first_section(group_map, ("面试官追问", "追问"))
+                )
+            ]
+            for candidate in candidates:
+                specifications.append(
+                    {
+                        "candidate": candidate,
+                        "context": f"{group_title}\n{_first_section(group_map, ('题目',))}",
+                        "sections": group_sections,
+                        "section_map": group_map,
+                        "key_points": group_points,
+                        "pitfalls": group_pitfalls,
+                        "follow_ups": group_follow_ups,
+                        "allow_generic": True,
+                    }
+                )
     else:
+        candidates: list[tuple[str, str]] = []
         for heading, content in sections:
             if not _heading_matches(heading, QUESTION_HEADINGS):
                 continue
             candidates.extend(_question_lines(content))
         if note_type in {"question", "interview"} and not candidates:
-            candidates.append((_ensure_question(title), ""))
+            candidates.extend(_question_lines(title))
+        follow_ups = [
+            _ensure_question(_plain_text(question))
+            for question, _answer in _question_lines(
+                _first_section(section_map, ("面试官追问", "追问"))
+            )
+        ]
+        for candidate in candidates:
+            specifications.append(
+                {
+                    "candidate": candidate,
+                    "context": title,
+                    "sections": sections,
+                    "section_map": section_map,
+                    "key_points": key_points,
+                    "pitfalls": pitfalls,
+                    "follow_ups": follow_ups,
+                    "allow_generic": len(candidates) == 1,
+                }
+            )
 
-    follow_ups = [question for question, _answer in _question_lines(_first_section(section_map, ("面试官追问",)))]
     question_type = "interview-real" if any(
         metadata.get(key) for key in ("company", "interview_source", "provenance", "source_interview")
     ) else "high-frequency"
     difficulty = str(metadata.get("difficulty") or "normal")
     result: list[ParsedQuestion] = []
     seen: set[str] = set()
-    for question, inline_answer in candidates:
+    for specification in specifications:
+        question, inline_answer = specification["candidate"]
         cleaned_question = _ensure_question(_plain_text(question))
-        key = canonical_question_key(topic, cleaned_question)
+        question_topic = _topic_for_question(
+            f"{specification['context']}\n{cleaned_question}",
+            declared_topics,
+            topic,
+        )
+        key = canonical_question_key(question_topic, cleaned_question)
         if not cleaned_question or key in seen:
             continue
         answer_summary, answer_detail, answer_points = _answer_for_question(
             cleaned_question,
             inline_answer,
-            sections,
-            section_map,
-            key_points,
-            allow_generic_answer=len(candidates) == 1,
+            specification["sections"],
+            specification["section_map"],
+            specification["key_points"],
+            allow_generic_answer=specification["allow_generic"],
         )
         if not answer_summary or not answer_detail:
             continue
@@ -570,20 +669,25 @@ def _questions_from_note(
             answer_summary,
             answer_detail,
             answer_points,
-            pitfalls,
-            [item for item in follow_ups if item != cleaned_question][:3],
+            specification["pitfalls"],
+            [item for item in specification["follow_ups"] if item != cleaned_question][:3],
             source_label,
-            _engineering_example_for_note(section_map, answer_detail, answer_points),
+            _engineering_example_for_note(
+                specification["section_map"], answer_detail, answer_points
+            ),
         )
         result.append(
             ParsedQuestion(
+                topic=question_topic,
                 question=cleaned_question,
                 answer=structured,
                 answer_summary=answer_summary,
                 answer_detail=answer_detail,
                 key_points=answer_points,
-                pitfalls=pitfalls[:6],
-                follow_ups=[item for item in follow_ups if item != cleaned_question][:3],
+                pitfalls=specification["pitfalls"][:6],
+                follow_ups=[
+                    item for item in specification["follow_ups"] if item != cleaned_question
+                ][:3],
                 question_type=question_type,
                 difficulty=difficulty,
                 source_label=source_label,
@@ -592,6 +696,63 @@ def _questions_from_note(
         )
         seen.add(key)
     return result
+
+
+def _structured_question_groups(
+    body: str,
+) -> list[tuple[str, list[tuple[str, str]], dict[str, list[str]]]]:
+    """Split daily-practice notes into independent H2 question blocks."""
+    question_heading = re.compile(
+        r"^##\s+(?:第\s*(?:[一二三四五六七八九十百]+|\d+)\s*题|题目\s*\d+|Q\s*\d+)"
+        r"\s*[:：｜|.\-]?\s*(.*?)\s*$",
+        flags=re.IGNORECASE,
+    )
+    any_h2 = re.compile(r"^##\s+")
+    groups: list[tuple[str, list[str]]] = []
+    current_title = ""
+    current_lines: list[str] = []
+    in_code = False
+    for line in body.splitlines():
+        if line.strip().startswith("```"):
+            in_code = not in_code
+        match = None if in_code else question_heading.match(line)
+        if match:
+            if current_title:
+                groups.append((current_title, current_lines))
+            current_title = match.group(1).strip() or _plain_text(line)
+            current_lines = []
+            continue
+        if current_title and not in_code and any_h2.match(line):
+            groups.append((current_title, current_lines))
+            current_title = ""
+            current_lines = []
+            continue
+        if current_title:
+            current_lines.append(line)
+    if current_title:
+        groups.append((current_title, current_lines))
+
+    result: list[tuple[str, list[tuple[str, str]], dict[str, list[str]]]] = []
+    for group_title, lines in groups:
+        group_sections = _markdown_sections("\n".join(lines))
+        result.append((group_title, group_sections, _group_sections(group_sections)))
+    return result
+
+
+def _topic_for_question(text: str, declared_topics: list[str], fallback: str) -> str:
+    if not declared_topics:
+        return fallback
+    if len(declared_topics) == 1:
+        return declared_topics[0]
+    normalized = _normalized_match_text(text)
+    scores = {
+        topic: normalized.count(_normalized_match_text(topic))
+        for topic in declared_topics
+        if _normalized_match_text(topic)
+    }
+    best = max(scores.values(), default=0)
+    winners = [topic for topic, score in scores.items() if score == best and score > 0]
+    return winners[0] if len(winners) == 1 else fallback
 
 
 def _answer_for_question(
@@ -875,7 +1036,7 @@ def _heading_matches(heading: str, names: Iterable[str]) -> bool:
 
 def _ensure_question(text: str) -> str:
     cleaned = text.strip().strip("\"“”'")
-    return cleaned if cleaned.endswith(("?", "？")) else cleaned + "？"
+    return cleaned if "?" in cleaned or "？" in cleaned else cleaned + "？"
 
 
 def _unique_items(items: Iterable[str], limit: int) -> list[str]:

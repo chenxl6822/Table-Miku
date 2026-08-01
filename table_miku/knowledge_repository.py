@@ -927,6 +927,7 @@ def upsert_structured_qa(
         payload = {
             "question": question,
             "answer": answer,
+            "question_topic": str(pair.get("question_topic") or "").strip(),
             "question_type": str(pair.get("question_type") or "high-frequency"),
             "difficulty": str(pair.get("difficulty") or "normal"),
             "answer_summary": str(pair.get("answer_summary") or "").strip(),
@@ -942,14 +943,15 @@ def upsert_structured_qa(
                 """
                 INSERT INTO knowledge_qa_pairs
                     (id, card_id, question, answer, source_chunk_id, created_at, updated_at,
-                     canonical_key, question_type, difficulty, answer_summary,
+                     canonical_key, question_topic, question_type, difficulty, answer_summary,
                      answer_detail, key_points, pitfalls, follow_ups, source_label,
                      document_id, active)
-                VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     qa_id, card_id, payload["question"], payload["answer"], now, now,
-                    canonical_key, payload["question_type"], payload["difficulty"],
+                    canonical_key, payload["question_topic"],
+                    payload["question_type"], payload["difficulty"],
                     payload["answer_summary"], payload["answer_detail"],
                     payload["key_points"], payload["pitfalls"], payload["follow_ups"],
                     payload["source_label"], document_id,
@@ -967,6 +969,7 @@ def upsert_structured_qa(
                     UPDATE knowledge_qa_pairs
                     SET card_id = ?, question = ?, answer = ?, updated_at = ?,
                         canonical_key = ?, question_type = ?, difficulty = ?, answer_summary = ?,
+                        question_topic = ?,
                         answer_detail = ?, key_points = ?, pitfalls = ?, follow_ups = ?,
                         source_label = ?, document_id = ?, active = 1
                     WHERE id = ?
@@ -975,7 +978,8 @@ def upsert_structured_qa(
                         card_id, payload["question"], payload["answer"], now,
                         canonical_key,
                         payload["question_type"], payload["difficulty"],
-                        payload["answer_summary"], payload["answer_detail"],
+                        payload["answer_summary"], payload["question_topic"],
+                        payload["answer_detail"],
                         payload["key_points"], payload["pitfalls"], payload["follow_ups"],
                         payload["source_label"], document_id, qa_id,
                     ),
@@ -1008,7 +1012,8 @@ def list_due_questions(now: datetime | None = None, limit: int = 20) -> list[dic
     try:
         rows = conn.execute(
             """
-            SELECT qa.*, kc.topic, kc.title, kc.overview,
+            SELECT qa.*, COALESCE(NULLIF(qa.question_topic, ''), kc.topic) AS resolved_topic,
+                   kc.title, kc.overview,
                    qrs.mastery, qrs.review_stage, qrs.next_review_at,
                    qrs.last_reviewed_at, qrs.review_count, qrs.correct_streak,
                    qrs.wrong_count, qrs.in_mistake_book, qrs.last_user_answer,
@@ -1033,7 +1038,8 @@ def list_mistake_questions(limit: int = 100) -> list[dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT qa.*, kc.topic, kc.title, kc.overview,
+            SELECT qa.*, COALESCE(NULLIF(qa.question_topic, ''), kc.topic) AS resolved_topic,
+                   kc.title, kc.overview,
                    qrs.mastery, qrs.review_stage, qrs.next_review_at,
                    qrs.last_reviewed_at, qrs.review_count, qrs.correct_streak,
                    qrs.wrong_count, qrs.in_mistake_book, qrs.last_user_answer,
@@ -1058,7 +1064,8 @@ def list_questions_for_card(card_id: str, limit: int = 50) -> list[dict[str, Any
     try:
         rows = conn.execute(
             """
-            SELECT qa.*, kc.topic, kc.title, kc.overview,
+            SELECT qa.*, COALESCE(NULLIF(qa.question_topic, ''), kc.topic) AS resolved_topic,
+                   kc.title, kc.overview,
                    qrs.mastery, qrs.review_stage, qrs.next_review_at,
                    qrs.last_reviewed_at, qrs.review_count, qrs.correct_streak,
                    qrs.wrong_count, qrs.in_mistake_book, qrs.last_user_answer,
@@ -1242,6 +1249,7 @@ def _decode_structured_qa(pair: dict[str, Any]) -> None:
 
 def _question_row(row: sqlite3.Row) -> dict[str, Any]:
     payload = dict(row)
+    payload["topic"] = str(payload.pop("resolved_topic", "") or payload.get("question_topic") or "")
     _decode_structured_qa(payload)
     payload["matched_points"] = _parse_json_list(payload.pop("last_matched_points", "[]"))
     payload["in_mistake_book"] = bool(payload.get("in_mistake_book"))

@@ -15,7 +15,7 @@ from .paths import runtime_path
 # ---------------------------------------------------------------------------
 # Schema version
 # ---------------------------------------------------------------------------
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 # ---------------------------------------------------------------------------
 # DDL
@@ -267,8 +267,8 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
 
         try:
             current_version = get_schema_version(conn)
-            if 1 <= current_version < 3:
-                _backup_database_before_v3(conn)
+            if 1 <= current_version < CURRENT_SCHEMA_VERSION:
+                _backup_database_before_migration(conn, current_version + 1)
             for stmt in _SCHEMA_STATEMENTS:
                 conn.execute(stmt)
 
@@ -337,6 +337,14 @@ def migrate(conn: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO _schema_version(version, applied_at) VALUES(?, ?)",
             (3, ts),
         )
+        current = 3
+
+    if current < 4:
+        _migrate_v4(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_version(version, applied_at) VALUES(?, ?)",
+            (4, ts),
+        )
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
@@ -404,19 +412,22 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
             pass
 
 
-def _backup_database_before_v3(conn: sqlite3.Connection) -> Path | None:
-    """Create a one-time recoverable copy before the question-level migration."""
+def _backup_database_before_migration(
+    conn: sqlite3.Connection,
+    target_version: int,
+) -> Path | None:
+    """Create a one-time recoverable copy before a schema migration."""
     path = knowledge_db_path()
     if not path.exists() or path.stat().st_size == 0:
         return None
-    existing = sorted(path.parent.glob(f"{path.stem}.pre-v3-*.bak"))
+    existing = sorted(path.parent.glob(f"{path.stem}.pre-v{target_version}-*.bak"))
     if existing:
         return existing[-1]
 
     from datetime import datetime
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = path.with_name(f"{path.stem}.pre-v3-{stamp}.bak")
+    backup_path = path.with_name(f"{path.stem}.pre-v{target_version}-{stamp}.bak")
     destination = sqlite3.connect(str(backup_path))
     try:
         conn.backup(destination)
@@ -487,3 +498,19 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     ]
     for statement in index_statements:
         conn.execute(statement)
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """Persist a normalized topic for each question in multi-topic notes."""
+    existing = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(knowledge_qa_pairs)")
+    }
+    if "question_topic" not in existing:
+        conn.execute(
+            "ALTER TABLE knowledge_qa_pairs "
+            "ADD COLUMN question_topic TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qa_question_topic "
+        "ON knowledge_qa_pairs(question_topic, active)"
+    )
