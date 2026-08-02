@@ -34,3 +34,23 @@ def test_agent_center_defaults_to_knowledge_and_review_only(tmp_path: Path):
         assert dialog.current_session_id
     finally:
         runtime.shutdown()
+
+
+def test_agent_center_renders_message_markdown(tmp_path: Path):
+    _app()
+    store = AgentStore(tmp_path / "agent.db")
+    session_id = store.create_session()
+    store.add_message(session_id, "assistant", "## 复习计划\n\n- Spring IoC\n- MySQL 索引")
+    runtime = AgentRuntime(store=store, backend=FakeBackend())
+    try:
+        dialog = AgentCenterDialog(runtime)
+        dialog.current_session_id = session_id
+        dialog._render_messages()
+
+        plain_text = dialog.chat.toPlainText()
+        assert "## 复习计划" not in plain_text
+        assert "复习计划" in plain_text
+        assert "Spring IoC" in plain_text
+        assert "<h2" in dialog.chat.toHtml().lower()
+    finally:
+        runtime.shutdown()

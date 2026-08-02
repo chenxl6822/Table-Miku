@@ -156,11 +156,11 @@ class AgentCenterDialog(QDialog):
         self._render_messages()
 
     def _render_messages(self) -> None:
-        lines = []
+        blocks = []
         for message in self.runtime.store.list_messages(self.current_session_id):
             speaker = "你" if message["role"] == "user" else "Miku"
-            lines.append(f"{speaker}\n{message['content']}")
-        self.chat.setPlainText("\n\n".join(lines))
+            blocks.append(f"### {speaker}\n\n{message['content']}")
+        self.chat.setMarkdown("\n\n---\n\n".join(blocks))
 
     def _new_session(self) -> None:
         self.current_session_id = self.runtime.new_session()
