@@ -33,6 +33,7 @@ from .knowledge_service import (
     mark_knowledge_card_learned,
     mistake_question_items,
     question_attempt_items,
+    question_item,
     record_question_answer,
     search_knowledge_cards,
     sync_local_knowledge,
@@ -281,10 +282,9 @@ def _execute_write(context: AgentRunContext, tool_name: str, raw: BaseModel) -> 
         result = {"questions_scheduled": mark_knowledge_card_learned(args.card_id)}
     elif tool_name == "record_review_answer":
         args = RecordAnswerArgs.model_validate(raw)
-        question = next(
-            (item for item in due_question_items(limit=100) + mistake_question_items(limit=100) if item.get("id") == args.question_id),
-            {"key_points": args.matched_points},
-        )
+        question = question_item(args.question_id)
+        if question is None:
+            raise ValueError(f"Unknown active question: {args.question_id}")
         matched = answer_key_point_hints(question, args.user_answer)
         result = record_question_answer(
             args.question_id,
