@@ -46,6 +46,8 @@ from .assistant_data import (
 )
 from .assistant_core import PersonalAssistant
 from .ai_consent import AIConsentChoice, request_ai_consent
+from .agent_center import AgentCenterDialog
+from .agent_runtime import AgentRuntime
 from .assistant_log import append_event
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import migrate_legacy_record
@@ -1147,6 +1149,11 @@ class TableMiku(QWidget):
         self.assistant = PersonalAssistant(lambda: self.system_monitor.latest_snapshot, PROJECT_ROOT, self)
         self.assistant.notice.connect(self._handle_system_notice)
         self.assistant.start()
+        self.agent_runtime = AgentRuntime(parent=self)
+        self._agent_center_dialog: AgentCenterDialog | None = None
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.agent_runtime.shutdown)
         if (self.settings.get("knowledge") or {}).get("enabled", True):
             QTimer.singleShot(1200, self._start_background_knowledge_sync)
 
@@ -1169,14 +1176,16 @@ class TableMiku(QWidget):
         show_action = QAction("显示/隐藏 Miku", self)
         review_action = QAction("今日复习", self)
         brief_action = QAction("生成助手简报", self)
+        agent_center_action = QAction("Agent 中心", self)
         pomodoro_action = QAction("开始番茄钟", self)
         quit_action = QAction("关闭 Miku", self)
         show_action.triggered.connect(self.toggle_visible)
         review_action.triggered.connect(self.show_due_reviews)
         brief_action.triggered.connect(self.show_assistant_brief)
+        agent_center_action.triggered.connect(self.show_agent_center)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
         quit_action.triggered.connect(QApplication.instance().quit)
-        for action in (show_action, review_action, brief_action, pomodoro_action):
+        for action in (show_action, review_action, agent_center_action, brief_action, pomodoro_action):
             menu.addAction(action)
         menu.addSeparator()
         menu.addAction(quit_action)
@@ -1283,6 +1292,7 @@ class TableMiku(QWidget):
         watch_command_action = QAction("运行并监视命令", self)
         cancel_command_action = QAction("取消正在监视的命令", self)
         ai_plan_action = QAction("AI 规划/汇报（可选）", self)
+        agent_center_action = QAction("Agent 中心", self)
         toggle_ai_action = QAction(
             "关闭 AI 助理" if (self.settings.get("assistant") or {}).get("ai_agent_enabled", False) else "开启 AI 助理",
             self,
@@ -1323,6 +1333,7 @@ class TableMiku(QWidget):
         watch_command_action.triggered.connect(self.watch_command)
         cancel_command_action.triggered.connect(self.cancel_watched_commands)
         ai_plan_action.triggered.connect(self.show_ai_plan)
+        agent_center_action.triggered.connect(self.show_agent_center)
         toggle_ai_action.triggered.connect(self.toggle_ai_agent)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
         view_timetable_action.triggered.connect(self.show_timetable)
@@ -1372,6 +1383,7 @@ class TableMiku(QWidget):
         tools_menu.addAction(system_status_action)
         tools_menu.addSeparator()
         tools_menu.addAction(brief_action)
+        tools_menu.addAction(agent_center_action)
         tools_menu.addAction(ai_plan_action)
         tools_menu.addAction(watch_command_action)
         tools_menu.addAction(cancel_command_action)
@@ -1588,6 +1600,13 @@ class TableMiku(QWidget):
     def show_ai_plan(self) -> None:
         self.pet.set_expression("focus")
         self.assistant.ai_plan_now()
+
+    def show_agent_center(self) -> None:
+        if self._agent_center_dialog is None:
+            self._agent_center_dialog = AgentCenterDialog(self.agent_runtime, self)
+        self._agent_center_dialog.show()
+        self._agent_center_dialog.raise_()
+        self._agent_center_dialog.activateWindow()
 
     def toggle_ai_agent(self) -> None:
         self.settings = load_settings()

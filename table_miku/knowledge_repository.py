@@ -1199,6 +1199,29 @@ def record_question_attempt(
         conn.close()
 
 
+def list_question_attempts(qa_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Return recent persisted attempts for one active or archived question."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, qa_id, answered_at, user_answer, result, matched_points,
+                   answer_snapshot, mastery_after, stage_after
+            FROM review_attempts
+            WHERE qa_id = ?
+            ORDER BY answered_at DESC
+            LIMIT ?
+            """,
+            (qa_id, min(max(int(limit), 1), 100)),
+        ).fetchall()
+        attempts = _rows_to_dicts(rows)
+        for attempt in attempts:
+            attempt["matched_points"] = _parse_json_list(attempt.get("matched_points"))
+        return attempts
+    finally:
+        conn.close()
+
+
 def _ensure_question_review_state(
     conn: sqlite3.Connection,
     qa_id: str,

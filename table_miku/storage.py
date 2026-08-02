@@ -121,6 +121,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "knowledge_review": {
         "enabled": True,
     },
+    "agent_center": {
+        "enabled": True,
+        "timeout_seconds": 90,
+        "max_turns": 8,
+        "multi_agent_enabled": False,
+    },
     "fired_review_reminders": {},
 }
 
