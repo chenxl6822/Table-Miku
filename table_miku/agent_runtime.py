@@ -8,6 +8,7 @@ from concurrent.futures import CancelledError as FutureCancelledError, Future
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from PySide6.QtCore import QObject, Signal
 
 from .agent_adapter import _env_value
@@ -120,21 +121,37 @@ class DeepSeekModelProvider:
         )
         message = response.choices[0].message if response.choices else None
         calls = list(message.tool_calls or []) if message else []
+        tool_name = str(calls[0].function.name or "") if calls else ""
         arguments = calls[0].function.arguments if calls else ""
         try:
             parsed = __import__("json").loads(arguments)
         except (TypeError, ValueError):
             parsed = {}
-        tool_ok = bool(calls and isinstance(parsed.get("query"), str))
+        try:
+            _SyntheticSearchArgs.model_validate(parsed)
+            arguments_ok = True
+        except ValidationError:
+            arguments_ok = False
+        chat_ok = message is not None
+        tool_ok = bool(calls and tool_name == "synthetic_search")
+        json_ok = isinstance(parsed, dict) and bool(parsed)
         return {
-            "chat": message is not None,
-            "function_tool": bool(calls),
-            "json_arguments": bool(parsed),
-            "argument_validation": tool_ok,
-            "multi_agent_enabled": tool_ok,
+            "chat": chat_ok,
+            "chat_completion": chat_ok,
+            "function_tool": tool_ok,
+            "tool_name": tool_name,
+            "json_arguments": json_ok,
+            "argument_validation": arguments_ok,
+            "multi_agent_enabled": all((chat_ok, tool_ok, json_ok, arguments_ok)),
             "synthetic": True,
             "request_count": 1,
         }
+
+
+class _SyntheticSearchArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=80)
 
 
 @dataclass
@@ -415,6 +432,7 @@ class AgentRuntime(QObject):
     failed = Signal(str, str)
     sessions_changed = Signal()
     capability_ready = Signal(object)
+    capability_failed = Signal(str)
 
     def __init__(self, store: AgentStore | None = None, backend: AgentBackend | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -476,8 +494,9 @@ class AgentRuntime(QObject):
         async def run_test() -> dict[str, Any]:
             result = await self.core.provider.test_capabilities()
             config = self.core.provider.config
+            result.update({"base_url": config.base_url, "model": config.model})
             self.store.save_capability(config.base_url, config.model, result)
-            return result
+            return self.store.load_capability(config.base_url, config.model) or result
 
         self._future = asyncio.run_coroutine_threadsafe(run_test(), self._thread.loop)
         self._future.add_done_callback(self._capability_complete)
@@ -508,6 +527,6 @@ class AgentRuntime(QObject):
         try:
             result = future.result()
         except Exception as exc:
-            self.failed.emit("", friendly_agent_error(exc))
+            self.capability_failed.emit(friendly_agent_error(exc))
         else:
             self.capability_ready.emit(result)

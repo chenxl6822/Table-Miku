@@ -120,9 +120,11 @@ class AgentCenterDialog(QDialog):
         self.capability_button = QPushButton("测试 DeepSeek Agent 能力")
         self.capability_button.clicked.connect(self._test_capabilities)
         source_layout.addWidget(self.capability_button)
-        self.capability_button = QPushButton("测试 DeepSeek Agent 能力")
-        self.capability_button.clicked.connect(self._test_capabilities)
-        source_layout.addWidget(self.capability_button)
+        self.capability_result = QTextEdit(source_panel)
+        self.capability_result.setReadOnly(True)
+        self.capability_result.setMaximumHeight(170)
+        self.capability_result.setPlainText("尚未测试当前 DeepSeek 接口与模型。")
+        source_layout.addWidget(self.capability_result)
 
         splitter.setSizes([190, 560, 230])
         self.runtime.progress.connect(self._progress)
@@ -130,7 +132,8 @@ class AgentCenterDialog(QDialog):
         self.runtime.failed.connect(self._failed)
         self.runtime.sessions_changed.connect(self.reload_sessions)
         self.runtime.capability_ready.connect(self._capability_ready)
-        self.runtime.capability_ready.connect(self._capability_ready)
+        self.runtime.capability_failed.connect(self._capability_failed)
+        self._load_cached_capability()
         self.reload_sessions()
 
     def reload_sessions(self) -> None:
@@ -251,26 +254,42 @@ class AgentCenterDialog(QDialog):
     def _capability_ready(self, result: object) -> None:
         self.capability_button.setEnabled(True)
         compatible = bool(isinstance(result, dict) and result.get("multi_agent_enabled"))
+        if isinstance(result, dict):
+            self.capability_result.setPlainText(self._format_capability_result(result))
         self.status.setText("能力测试通过，已启用专家协作" if compatible else "能力测试未通过，多 Agent 保持禁用")
 
-    def _test_capabilities(self) -> None:
-        answer = QMessageBox.question(
-            self,
-            "测试 DeepSeek Agent 能力",
-            "将发送 1 次不含用户数据的合成 API 请求，验证 function tool 与 JSON 参数。是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        if self.runtime.test_capabilities():
-            self.capability_button.setEnabled(False)
-            self.status.setText("正在进行合成能力测试…")
-
-    def _capability_ready(self, result: object) -> None:
+    def _capability_failed(self, message: str) -> None:
         self.capability_button.setEnabled(True)
-        compatible = bool(isinstance(result, dict) and result.get("multi_agent_enabled"))
-        self.status.setText("能力测试通过，已启用专家协作" if compatible else "能力测试未通过，多 Agent 保持禁用")
+        config = self.runtime.core.provider.config
+        self.capability_result.setPlainText(
+            f"接口：{config.base_url}\n模型：{config.model}\n结果：失败\n原因：{message}"
+        )
+        self.status.setText(f"能力测试失败：{message}")
+
+    def _load_cached_capability(self) -> None:
+        config = self.runtime.core.provider.config
+        cached = self.runtime.store.load_capability(config.base_url, config.model)
+        if cached is not None:
+            self.capability_result.setPlainText(self._format_capability_result(cached))
+
+    @staticmethod
+    def _format_capability_result(result: dict[str, object]) -> str:
+        def state(key: str) -> str:
+            return "通过" if result.get(key) else "未通过"
+
+        return "\n".join(
+            (
+                f"接口：{result.get('base_url') or '未知'}",
+                f"模型：{result.get('model') or '未知'}",
+                f"Chat Completion：{state('chat_completion')}",
+                f"Function Tool：{state('function_tool')}",
+                f"JSON 参数：{state('json_arguments')}",
+                f"本地参数校验：{state('argument_validation')}",
+                f"专家协作：{'已启用' if result.get('multi_agent_enabled') else '保持关闭'}",
+                f"请求次数：{result.get('request_count') or 0}",
+                f"测试时间：{result.get('tested_at') or '本次运行'}",
+            )
+        )
 
     def _approve(self) -> None:
         if self._pending_operation_id and self.runtime.approve(self._pending_operation_id):

@@ -5,9 +5,11 @@ import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import Future
 
 from table_miku.agent_models import CoachResponse
 from table_miku.agent_runtime import (
+    AgentRuntime,
     AgentRuntimeCore,
     BackendOutcome,
     DeepSeekConfig,
@@ -130,6 +132,55 @@ def test_deepseek_provider_does_not_require_openai_key():
     assert str(model._client.base_url).rstrip("/") == "https://api.deepseek.test"
     assert model._client.max_retries == 0
     asyncio.run(provider.close())
+
+
+def test_deepseek_capability_check_validates_synthetic_tool_arguments():
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.request = {}
+
+        async def create(self, **kwargs):
+            self.request = kwargs
+            function = SimpleNamespace(name="synthetic_search", arguments='{"query":"spring"}')
+            message = SimpleNamespace(tool_calls=[SimpleNamespace(function=function)])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    completions = FakeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    provider = DeepSeekModelProvider(
+        DeepSeekConfig(api_key="deepseek-test", base_url="https://api.deepseek.test", model="chat-test")
+    )
+    provider._client = client
+    provider._model = object()
+
+    result = asyncio.run(provider.test_capabilities())
+
+    assert result == {
+        "chat": True,
+        "chat_completion": True,
+        "function_tool": True,
+        "tool_name": "synthetic_search",
+        "json_arguments": True,
+        "argument_validation": True,
+        "multi_agent_enabled": True,
+        "synthetic": True,
+        "request_count": 1,
+    }
+    assert completions.request["model"] == "chat-test"
+    assert completions.request["tool_choice"]["function"]["name"] == "synthetic_search"
+
+
+def test_capability_failure_uses_dedicated_signal(tmp_path: Path):
+    runtime = AgentRuntime(store=AgentStore(tmp_path / "agent.db"), backend=FakeBackend())
+    messages: list[str] = []
+    runtime.capability_failed.connect(messages.append)
+    failed: Future[object] = Future()
+    failed.set_exception(RuntimeError("HTTP 401 authentication"))
+    try:
+        runtime._capability_complete(failed)
+        assert messages == ["DeepSeek API 认证失败，请检查 DEEPSEEK_API_KEY；本次不会自动重试。"]
+    finally:
+        runtime.shutdown()
 
 
 def test_non_strict_tool_validation_allows_only_one_repair(tmp_path: Path):
