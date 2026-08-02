@@ -140,10 +140,20 @@ class AgentsSDKBackend:
     def __init__(self, provider: DeepSeekModelProvider) -> None:
         self.provider = provider
 
-    def _agent(self) -> Any:
+    def _agent(self, use_specialists: bool = False) -> Any:
         from agents import Agent
 
         model = self.provider.model()
+        specialist_tools = []
+        if use_specialists:
+            knowledge = Agent(name="Knowledge Tutor", instructions="检索本地知识并解释来源；不得写入。", model=model, tools=create_read_tools())
+            practice = Agent(name="Practice Analyst", instructions="分析答案命中点、遗漏点和追问；不得替用户自评。", model=model, tools=create_read_tools())
+            planner = Agent(name="Review Planner", instructions="基于复习、错题及授权目标提出计划；不得写入。", model=model, tools=create_read_tools())
+            specialist_tools = [
+                knowledge.as_tool("consult_knowledge_tutor", "Ask the knowledge specialist"),
+                practice.as_tool("consult_practice_analyst", "Ask the practice specialist"),
+                planner.as_tool("consult_review_planner", "Ask the review specialist"),
+            ]
         return Agent(
             name="Interview Coach",
             instructions=(
@@ -153,13 +163,15 @@ class AgentsSDKBackend:
                 "引用资料时保留工具返回的 source_id。若资源未授权，说明需要用户在 Agent 中心开启对应开关。"
             ),
             model=model,
-            tools=create_read_tools() + create_write_tools(),
+            tools=create_read_tools() + create_write_tools() + specialist_tools,
         )
 
     async def run(self, *, prompt: str, context: AgentRunContext, history: list[dict[str, Any]]) -> BackendOutcome:
         from agents import RunConfig, Runner
 
-        agent = self._agent()
+        capability = context.store.load_capability(self.provider.config.base_url, self.provider.config.model) or {}
+        use_specialists = bool(capability.get("multi_agent_enabled"))
+        agent = self._agent(use_specialists)
         history_text = "\n".join(
             f"{item.get('role', 'user')}: {item.get('content', '')}" for item in history[-20:]
         )
@@ -187,7 +199,7 @@ class AgentsSDKBackend:
         return BackendOutcome(
             response=response,
             source_ids=list(context.sources),
-            metadata={"provider": "deepseek", "model": self.provider.config.model, "mode": "single-agent"},
+            metadata={"provider": "deepseek", "model": self.provider.config.model, "mode": "multi-agent" if use_specialists else "single-agent"},
         )
 
     async def resume(self, pending: PendingBackendApproval, authorized_at: str) -> BackendOutcome:
