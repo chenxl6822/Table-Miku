@@ -3,12 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from concurrent.futures import Future
+from concurrent.futures import CancelledError as FutureCancelledError, Future
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from table_miku.agent_evaluation import (
+    TOPOLOGY_EVAL_CASES,
+    build_topology_evaluation,
+    capability_supports_specialists,
+    specialists_enabled,
+)
 from table_miku.agent_models import CoachResponse
 from table_miku.agent_runtime import (
     AgentRuntime,
@@ -39,6 +45,22 @@ class FakeBackend:
 
     async def close(self):
         self.closed = True
+
+    async def evaluate_topologies(self):
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        samples = []
+        for case in TOPOLOGY_EVAL_CASES:
+            complete = " ".join(group[0] for group in case.required_groups)
+            samples.append(
+                {
+                    "name": case.name,
+                    "single_output": complete.rsplit(" ", 1)[0],
+                    "multi_output": complete,
+                    "multi_tools": [case.specialist_tool],
+                }
+            )
+        return build_topology_evaluation(samples)
 
 
 def test_agent_store_redacts_trims_and_restores_sessions(tmp_path: Path):
@@ -212,6 +234,30 @@ def test_agent_instructions_include_read_grant_boundaries():
     assert "学习目标=未授权" in agent.instructions
     assert "禁止读取、推断或声称使用未授权资源" in agent.instructions
 
+    multi = backend._agent(True, {"knowledge": True})
+    specialist_tools = [tool for tool in multi.tools if tool.name.startswith("consult_")]
+    assert len(specialist_tools) == 3
+    assert all(tool.strict_json_schema is False for tool in specialist_tools)
+
+
+def test_synthetic_topology_agents_never_expose_production_tools():
+    provider = DeepSeekModelProvider(
+        DeepSeekConfig(api_key="deepseek-test", base_url="https://api.deepseek.test", model="chat-test")
+    )
+    provider._model = "chat-test"
+    backend = AgentsSDKBackend(provider)
+
+    for case in TOPOLOGY_EVAL_CASES:
+        single = backend._evaluation_agent(case, False)
+        multi = backend._evaluation_agent(case, True)
+
+        assert single.tools == []
+        assert [tool.name for tool in multi.tools] == [case.specialist_tool]
+        assert multi.tools[0].strict_json_schema is False
+        assert multi.model_settings.tool_choice == case.specialist_tool
+        assert multi.model_settings.parallel_tool_calls is False
+        assert "不得调用或声称读取本地知识库" in multi.instructions
+
 
 def test_deepseek_capability_check_validates_synthetic_tool_arguments():
     class FakeCompletions:
@@ -241,12 +287,122 @@ def test_deepseek_capability_check_validates_synthetic_tool_arguments():
         "tool_name": "synthetic_search",
         "json_arguments": True,
         "argument_validation": True,
-        "multi_agent_enabled": True,
+        "multi_agent_capable": True,
         "synthetic": True,
         "request_count": 1,
     }
     assert completions.request["model"] == "chat-test"
     assert completions.request["tool_choice"]["function"]["name"] == "synthetic_search"
+
+
+def test_topology_scoring_requires_quality_and_correct_specialist_routing():
+    passing_samples = []
+    wrong_route_samples = []
+    for case in TOPOLOGY_EVAL_CASES:
+        complete = " ".join(group[0] for group in case.required_groups)
+        single = " ".join(group[0] for group in case.required_groups[:-1])
+        passing_samples.append(
+            {
+                "name": case.name,
+                "single_output": single,
+                "multi_output": complete,
+                "multi_tools": [case.specialist_tool],
+            }
+        )
+        wrong_route_samples.append(
+            {
+                "name": case.name,
+                "single_output": single,
+                "multi_output": complete,
+                "multi_tools": ["consult_wrong_specialist"],
+            }
+        )
+
+    passing = build_topology_evaluation(passing_samples)
+    wrong_route = build_topology_evaluation(wrong_route_samples)
+
+    assert passing["passed"] is True
+    assert passing["multi_score"] > passing["single_score"]
+    assert passing["routing_passed"] is True
+    assert wrong_route["passed"] is False
+    assert wrong_route["routing_passed"] is False
+
+
+def test_specialists_require_capability_and_passing_quality_evaluation():
+    capability = {"multi_agent_capable": True}
+
+    assert capability_supports_specialists(capability)
+    assert capability_supports_specialists({"multi_agent_enabled": True})
+    assert not specialists_enabled(capability, None)
+    assert not specialists_enabled(capability, {"passed": False})
+    assert specialists_enabled(capability, {"passed": True})
+
+
+def test_topology_evaluation_persists_separately_from_capability(tmp_path: Path):
+    store = AgentStore(tmp_path / "agent.db")
+    base_url = "https://api.deepseek.test"
+    model = "chat-test"
+    store.save_capability(base_url, model, {"multi_agent_capable": True})
+    store.save_topology_evaluation(base_url, model, {"passed": True, "single_score": 80, "multi_score": 90})
+
+    assert store.load_capability(base_url, model)["multi_agent_capable"] is True
+    evaluation = store.load_topology_evaluation(base_url, model)
+    assert evaluation["passed"] is True
+    assert evaluation["single_score"] == 80
+    assert evaluation["multi_score"] == 90
+    assert evaluation["evaluated_at"]
+
+
+def test_runtime_topology_evaluation_uses_fake_backend_and_persists(tmp_path: Path):
+    store = AgentStore(tmp_path / "agent.db")
+    runtime = AgentRuntime(store=store, backend=FakeBackend())
+    config = runtime.core.provider.config
+    store.save_capability(config.base_url, config.model, {"multi_agent_capable": True})
+    try:
+        assert runtime.evaluate_topologies()
+        result = runtime._future.result(timeout=3)
+
+        assert result["passed"] is True
+        assert result["real_user_data_used"] is False
+        saved = store.load_topology_evaluation(config.base_url, config.model)
+        assert saved["passed"] is True
+    finally:
+        runtime.shutdown()
+
+
+def test_runtime_topology_evaluation_requires_capability_and_times_out_without_retry(tmp_path: Path):
+    store = AgentStore(tmp_path / "agent.db")
+    runtime = AgentRuntime(store=store, backend=FakeBackend(delay=0.05))
+    config = runtime.core.provider.config
+    failures: list[str] = []
+    runtime.topology_evaluation_failed.connect(failures.append)
+    try:
+        assert not runtime.evaluate_topologies()
+        assert failures == ["请先通过当前接口与模型的 DeepSeek Agent 能力测试。"]
+
+        store.save_capability(config.base_url, config.model, {"multi_agent_capable": True})
+        runtime.core.timeout_seconds = 0.01
+        assert runtime.evaluate_topologies()
+        with pytest.raises(RuntimeError, match="超过 0.01 秒"):
+            runtime._future.result(timeout=3)
+        assert store.load_topology_evaluation(config.base_url, config.model) is None
+    finally:
+        runtime.shutdown()
+
+
+def test_runtime_topology_evaluation_can_be_cancelled_without_saving_result(tmp_path: Path):
+    store = AgentStore(tmp_path / "agent.db")
+    runtime = AgentRuntime(store=store, backend=FakeBackend(delay=0.5))
+    config = runtime.core.provider.config
+    store.save_capability(config.base_url, config.model, {"multi_agent_capable": True})
+    try:
+        assert runtime.evaluate_topologies()
+        assert runtime.cancel()
+        with pytest.raises(FutureCancelledError):
+            runtime._future.result(timeout=3)
+        assert store.load_topology_evaluation(config.base_url, config.model) is None
+    finally:
+        runtime.shutdown()
 
 
 def test_capability_failure_uses_dedicated_signal(tmp_path: Path):

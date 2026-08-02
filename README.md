@@ -208,6 +208,14 @@ Table-Miku 只分析 Vault 内的 `计算机知识` 和 `05-Interview` 两个白
 
 右键“同步本地知识库”可重跑只读增量同步；“更新在线来源”是单独的手动操作。在线更新最多 4 个并发请求，单请求超时 12 秒、整批超时 30 秒，失败时会保留部分成功结果。Wikipedia 只补充缺失片段，不覆盖现有本地或内置高质量概览，官方链接仅作为来源元数据。
 
+### DeepSeek Agent 中心
+
+Agent 中心使用 `DEEPSEEK_API_KEY` 和设置中的 `deepseek_base_url`、`deepseek_model`，不会读取 `OPENAI_API_KEY`，SDK tracing 保持关闭。知识库与复习调度仍由本地 Python/SQLite 处理；Agent 只能通过受控工具读取已索引内容，所有写入操作都需要逐次审批。
+
+首次使用某个接口与模型组合时，先手动运行“测试 DeepSeek Agent 能力”。该操作只发送 1 次不含用户数据的合成请求，验证 Chat Completion、function tool 和 JSON 参数。能力通过后，还需手动运行“对比单/多 Agent 质量”：程序使用 3 个合成场景比较单 Agent 与 Knowledge Tutor、Practice Analyst、Review Planner 三专家拓扑，最多产生 12 次模型响应，不读取知识库、Vault、会话或其他用户数据。
+
+专家协作只有在三个场景全部调用正确专家、多 Agent 得分至少为 80，且严格高于单 Agent 时才会启用。失败、超时或未胜出时继续使用单 Agent，不会自动重试产生额外费用。评测结果按 `base_url + model` 保存在 `%APPDATA%\TableMiku\agent.db`。
+
 ### 修改个人助手
 
 个人助手默认开启：启动后生成一次简报；每天 `08:10` 做天气汇报，`08:20` 做今日简报；右键“运行并监视命令”可以让 Miku 运行 PowerShell 命令，命令结束后自动提示退出码和简短输出。

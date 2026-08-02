@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from table_miku.agent_policy import required_ungranted_resource  # noqa: E402
+from table_miku.agent_evaluation import TOPOLOGY_EVAL_PASS_SCORE, TOPOLOGY_EVAL_REQUEST_LIMIT  # noqa: E402
 from table_miku.agent_runtime import AgentsSDKBackend, DeepSeekConfig, DeepSeekModelProvider  # noqa: E402
 
 
@@ -121,7 +122,13 @@ def run_contract_evals(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "multi_tool_count": len(contracts["multi"]),
             "single_specialists": sorted(SPECIALIST_TOOLS.intersection(contracts["single"])),
             "multi_specialists": sorted(SPECIALIST_TOOLS.intersection(contracts["multi"])),
-            "quality_comparison": "requires_explicit_real_deepseek_run",
+            "quality_comparison": "explicit_runtime_ab_evaluation_available",
+            "activation_gate": {
+                "minimum_multi_score": TOPOLOGY_EVAL_PASS_SCORE,
+                "must_beat_single": True,
+                "all_specialist_routes_required": True,
+                "request_limit": TOPOLOGY_EVAL_REQUEST_LIMIT,
+            },
         },
         "results": [asdict(item) for item in results],
     }

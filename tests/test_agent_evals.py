@@ -19,7 +19,13 @@ def test_synthetic_agent_contract_eval_matrix_passes():
         "consult_practice_analyst",
         "consult_review_planner",
     ]
-    assert payload["topology"]["quality_comparison"] == "requires_explicit_real_deepseek_run"
+    assert payload["topology"]["quality_comparison"] == "explicit_runtime_ab_evaluation_available"
+    assert payload["topology"]["activation_gate"] == {
+        "minimum_multi_score": 80,
+        "must_beat_single": True,
+        "all_specialist_routes_required": True,
+        "request_limit": 12,
+    }
 
 
 def test_agent_tool_contracts_keep_writes_approved_and_forbidden_tools_absent():

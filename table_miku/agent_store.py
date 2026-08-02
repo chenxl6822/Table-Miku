@@ -90,6 +90,13 @@ class AgentStore:
                     result_json TEXT NOT NULL,
                     tested_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS topology_evaluations(
+                    cache_key TEXT PRIMARY KEY,
+                    base_url TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    evaluated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS resource_grants(
                     resource TEXT PRIMARY KEY,
                     enabled INTEGER NOT NULL
@@ -288,5 +295,29 @@ class AgentStore:
             conn.execute(
                 "INSERT INTO capabilities(cache_key, base_url, model, result_json, tested_at) VALUES(?, ?, ?, ?, ?) "
                 "ON CONFLICT(cache_key) DO UPDATE SET result_json = excluded.result_json, tested_at = excluded.tested_at",
+                (key, base_url.rstrip("/"), model, json.dumps(result, ensure_ascii=False), self._now()),
+            )
+
+    def load_topology_evaluation(self, base_url: str, model: str) -> dict[str, Any] | None:
+        key = self.capability_key(base_url, model)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT result_json, evaluated_at FROM topology_evaluations WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = json.loads(row[0])
+        result["evaluated_at"] = row[1]
+        return result
+
+    def save_topology_evaluation(self, base_url: str, model: str, result: dict[str, Any]) -> None:
+        key = self.capability_key(base_url, model)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO topology_evaluations(cache_key, base_url, model, result_json, evaluated_at) "
+                "VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(cache_key) DO UPDATE SET result_json = excluded.result_json, "
+                "evaluated_at = excluded.evaluated_at",
                 (key, base_url.rstrip("/"), model, json.dumps(result, ensure_ascii=False), self._now()),
             )

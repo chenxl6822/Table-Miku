@@ -17,5 +17,7 @@ The default result is written to ignored `evals/results/latest.json`. The harnes
 never reads the Vault, API keys, or production databases, and never calls a real API.
 
 These contract evals do not measure DeepSeek answer quality, latency, token use, or actual tool selection. Compare those
-only after explicitly starting the synthetic capability test and manual prompt matrix in the Agent Center. Do not add a
-real API call to CI, and do not commit generated results.
+only after explicitly starting the synthetic capability test and the "对比单/多 Agent 质量" action in the Agent Center.
+The runtime comparison uses three synthetic cases, never reads user data, and caps the comparison at 12 model responses.
+Specialists are enabled only when every specialist route is correct, the multi-Agent score is at least 80, and it strictly
+beats the single-Agent score. Do not add a real API call to CI, and do not commit generated results.

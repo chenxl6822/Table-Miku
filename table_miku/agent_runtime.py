@@ -11,6 +11,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from PySide6.QtCore import QObject, Signal
 
 from .agent_adapter import _env_value
+from .agent_evaluation import (
+    TOPOLOGY_EVAL_CASES,
+    TopologyEvalCase,
+    build_topology_evaluation,
+    capability_supports_specialists,
+    specialists_enabled,
+)
 from .agent_models import CoachResponse
 from .agent_policy import blocked_resource_response, format_grant_summary
 from .agent_store import AgentStore
@@ -118,7 +125,7 @@ class DeepSeekModelProvider:
             "tool_name": tool_name,
             "json_arguments": json_ok,
             "argument_validation": arguments_ok,
-            "multi_agent_enabled": all((chat_ok, tool_ok, json_ok, arguments_ok)),
+            "multi_agent_capable": all((chat_ok, tool_ok, json_ok, arguments_ok)),
             "synthetic": True,
             "request_count": 1,
         }
@@ -152,6 +159,8 @@ class AgentBackend(Protocol):
     async def close(self) -> None: ...
 
     async def resume(self, pending: PendingBackendApproval, authorized_at: str) -> BackendOutcome: ...
+
+    async def evaluate_topologies(self) -> dict[str, Any]: ...
 
 
 class AgentsSDKBackend:
@@ -189,6 +198,8 @@ class AgentsSDKBackend:
                 practice.as_tool("consult_practice_analyst", "Ask the practice specialist"),
                 planner.as_tool("consult_review_planner", "Ask the review specialist"),
             ]
+            for tool in specialist_tools:
+                tool.strict_json_schema = False
         return Agent(
             name="Interview Coach",
             instructions=(
@@ -202,11 +213,97 @@ class AgentsSDKBackend:
             tools=create_read_tools() + create_write_tools() + specialist_tools,
         )
 
+    def _evaluation_agent(self, case: TopologyEvalCase, use_specialists: bool) -> Any:
+        from agents import Agent, ModelSettings
+
+        model = self.provider.model()
+        shared_rule = (
+            "这是 Table Miku 的合成拓扑评测。仅使用用户消息中的合成证据，不得调用或声称读取本地知识库、"
+            "复习数据、Vault、文件系统或网络。答案必须清晰、完整，并保留消息中给出的合成编号。"
+        )
+        if not use_specialists:
+            return Agent(
+                name="Synthetic Single Interview Coach",
+                instructions=shared_rule,
+                model=model,
+                tools=[],
+                model_settings=ModelSettings(temperature=0),
+            )
+
+        specialist = Agent(
+            name=case.specialist_name,
+            instructions=(
+                f"{shared_rule}你是{case.label}专家。严格完成用户要求的全部结构，不添加合成证据之外的事实。"
+            ),
+            model=model,
+            tools=[],
+            model_settings=ModelSettings(temperature=0),
+        )
+        specialist_tool = specialist.as_tool(
+            case.specialist_tool,
+            f"处理合成评测中的{case.label}任务；必须把完整合成证据传给专家。",
+            max_turns=1,
+        )
+        specialist_tool.strict_json_schema = False
+        return Agent(
+            name="Synthetic Multi Interview Coach",
+            instructions=(
+                f"{shared_rule}必须先调用唯一的 {case.specialist_tool} 工具，并把完整用户消息传给专家；"
+                "收到专家结果后再整理为最终答案，不得跳过专家。"
+            ),
+            model=model,
+            tools=[specialist_tool],
+            model_settings=ModelSettings(
+                temperature=0,
+                tool_choice=case.specialist_tool,
+                parallel_tool_calls=False,
+            ),
+        )
+
+    async def evaluate_topologies(self) -> dict[str, Any]:
+        from agents import RunConfig, Runner
+
+        run_config = RunConfig(tracing_disabled=True, trace_include_sensitive_data=False)
+        samples: list[dict[str, Any]] = []
+        for case in TOPOLOGY_EVAL_CASES:
+            single_result, multi_result = await asyncio.gather(
+                Runner.run(
+                    self._evaluation_agent(case, False),
+                    case.prompt,
+                    max_turns=1,
+                    run_config=run_config,
+                ),
+                Runner.run(
+                    self._evaluation_agent(case, True),
+                    case.prompt,
+                    max_turns=2,
+                    run_config=run_config,
+                ),
+            )
+            used_tools = [
+                str(tool_name)
+                for item in multi_result.new_items
+                if (tool_name := getattr(item, "tool_name", None))
+            ]
+            samples.append(
+                {
+                    "name": case.name,
+                    "single_output": str(single_result.final_output or ""),
+                    "multi_output": str(multi_result.final_output or ""),
+                    "multi_tools": used_tools,
+                }
+            )
+        return build_topology_evaluation(samples)
+
     async def run(self, *, prompt: str, context: AgentRunContext, history: list[dict[str, Any]]) -> BackendOutcome:
         from agents import RunConfig, Runner
 
         capability = context.store.load_capability(self.provider.config.base_url, self.provider.config.model) or {}
-        use_specialists = bool(capability.get("multi_agent_enabled"))
+        evaluation = context.store.load_topology_evaluation(
+            self.provider.config.base_url,
+            self.provider.config.model,
+        )
+        use_specialists = specialists_enabled(capability, evaluation)
         agent = self._agent(use_specialists, context.store.resource_grants())
         history_text = "\n".join(
             f"{item.get('role', 'user')}: {item.get('content', '')}" for item in history[-20:]
@@ -427,6 +524,8 @@ class AgentRuntime(QObject):
     sessions_changed = Signal()
     capability_ready = Signal(object)
     capability_failed = Signal(str)
+    topology_evaluation_ready = Signal(object)
+    topology_evaluation_failed = Signal(str)
 
     def __init__(self, store: AgentStore | None = None, backend: AgentBackend | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -496,6 +595,33 @@ class AgentRuntime(QObject):
         self._future.add_done_callback(self._capability_complete)
         return True
 
+    def evaluate_topologies(self) -> bool:
+        if self._future is not None and not self._future.done():
+            return False
+        config = self.core.provider.config
+        capability = self.store.load_capability(config.base_url, config.model)
+        if not capability_supports_specialists(capability):
+            self.topology_evaluation_failed.emit("请先通过当前接口与模型的 DeepSeek Agent 能力测试。")
+            return False
+
+        async def run_evaluation() -> dict[str, Any]:
+            evaluate = getattr(self.core.backend, "evaluate_topologies", None)
+            if evaluate is None:
+                raise RuntimeError("当前 Agent 后端不支持单/多 Agent 拓扑评测。")
+            try:
+                result = await asyncio.wait_for(evaluate(), timeout=self.core.timeout_seconds)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"单/多 Agent 合成评测超过 {self.core.timeout_seconds:g} 秒，已停止；本次不会自动重试。"
+                ) from exc
+            result.update({"base_url": config.base_url, "model": config.model})
+            self.store.save_topology_evaluation(config.base_url, config.model, result)
+            return self.store.load_topology_evaluation(config.base_url, config.model) or result
+
+        self._future = asyncio.run_coroutine_threadsafe(run_evaluation(), self._thread.loop)
+        self._future.add_done_callback(self._topology_evaluation_complete)
+        return True
+
     def shutdown(self) -> None:
         if not self._thread.is_alive():
             return
@@ -524,3 +650,13 @@ class AgentRuntime(QObject):
             self.capability_failed.emit(friendly_agent_error(exc))
         else:
             self.capability_ready.emit(result)
+
+    def _topology_evaluation_complete(self, future: Future[Any]) -> None:
+        try:
+            result = future.result()
+        except (asyncio.CancelledError, FutureCancelledError):
+            self.topology_evaluation_failed.emit("单/多 Agent 评测已取消。")
+        except Exception as exc:
+            self.topology_evaluation_failed.emit(friendly_agent_error(exc))
+        else:
+            self.topology_evaluation_ready.emit(result)

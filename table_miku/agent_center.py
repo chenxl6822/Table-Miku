@@ -18,6 +18,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .agent_evaluation import (
+    TOPOLOGY_EVAL_REQUEST_LIMIT,
+    capability_supports_specialists,
+)
 from .agent_models import CoachResponse, ReadResource
 from .agent_policy import RESOURCE_LABELS
 from .agent_runtime import AgentRuntime
@@ -115,18 +119,30 @@ class AgentCenterDialog(QDialog):
         source_layout.addWidget(self.capability_button)
         self.capability_result = QTextEdit(source_panel)
         self.capability_result.setReadOnly(True)
-        self.capability_result.setMaximumHeight(170)
+        self.capability_result.setMaximumHeight(120)
         self.capability_result.setPlainText("尚未测试当前 DeepSeek 接口与模型。")
         source_layout.addWidget(self.capability_result)
+        self.topology_evaluation_button = QPushButton("对比单/多 Agent 质量")
+        self.topology_evaluation_button.setEnabled(False)
+        self.topology_evaluation_button.clicked.connect(self._test_topologies)
+        source_layout.addWidget(self.topology_evaluation_button)
+        self.topology_evaluation_result = QTextEdit(source_panel)
+        self.topology_evaluation_result.setReadOnly(True)
+        self.topology_evaluation_result.setMaximumHeight(170)
+        self.topology_evaluation_result.setPlainText("能力测试通过后，可手动运行单/多 Agent 合成质量对比。")
+        source_layout.addWidget(self.topology_evaluation_result)
 
-        splitter.setSizes([190, 560, 230])
+        splitter.setSizes([180, 500, 300])
         self.runtime.progress.connect(self._progress)
         self.runtime.response_ready.connect(self._response)
         self.runtime.failed.connect(self._failed)
         self.runtime.sessions_changed.connect(self.reload_sessions)
         self.runtime.capability_ready.connect(self._capability_ready)
         self.runtime.capability_failed.connect(self._capability_failed)
+        self.runtime.topology_evaluation_ready.connect(self._topology_evaluation_ready)
+        self.runtime.topology_evaluation_failed.connect(self._topology_evaluation_failed)
         self._load_cached_capability()
+        self._load_cached_topology_evaluation()
         self.reload_sessions()
 
     def reload_sessions(self) -> None:
@@ -246,13 +262,15 @@ class AgentCenterDialog(QDialog):
 
     def _capability_ready(self, result: object) -> None:
         self.capability_button.setEnabled(True)
-        compatible = bool(isinstance(result, dict) and result.get("multi_agent_enabled"))
+        compatible = bool(isinstance(result, dict) and capability_supports_specialists(result))
+        self.topology_evaluation_button.setEnabled(compatible)
         if isinstance(result, dict):
             self.capability_result.setPlainText(self._format_capability_result(result))
-        self.status.setText("能力测试通过，已启用专家协作" if compatible else "能力测试未通过，多 Agent 保持禁用")
+        self.status.setText("能力测试通过，可运行单/多 Agent 质量对比" if compatible else "能力测试未通过，多 Agent 保持禁用")
 
     def _capability_failed(self, message: str) -> None:
         self.capability_button.setEnabled(True)
+        self.topology_evaluation_button.setEnabled(False)
         config = self.runtime.core.provider.config
         self.capability_result.setPlainText(
             f"接口：{config.base_url}\n模型：{config.model}\n结果：失败\n原因：{message}"
@@ -264,6 +282,13 @@ class AgentCenterDialog(QDialog):
         cached = self.runtime.store.load_capability(config.base_url, config.model)
         if cached is not None:
             self.capability_result.setPlainText(self._format_capability_result(cached))
+            self.topology_evaluation_button.setEnabled(capability_supports_specialists(cached))
+
+    def _load_cached_topology_evaluation(self) -> None:
+        config = self.runtime.core.provider.config
+        cached = self.runtime.store.load_topology_evaluation(config.base_url, config.model)
+        if cached is not None:
+            self.topology_evaluation_result.setPlainText(self._format_topology_evaluation(cached))
 
     @staticmethod
     def _format_capability_result(result: dict[str, object]) -> str:
@@ -278,11 +303,84 @@ class AgentCenterDialog(QDialog):
                 f"Function Tool：{state('function_tool')}",
                 f"JSON 参数：{state('json_arguments')}",
                 f"本地参数校验：{state('argument_validation')}",
-                f"专家协作：{'已启用' if result.get('multi_agent_enabled') else '保持关闭'}",
+                f"多 Agent 接口：{'可评测' if capability_supports_specialists(result) else '不可用'}",
                 f"请求次数：{result.get('request_count') or 0}",
                 f"测试时间：{result.get('tested_at') or '本次运行'}",
             )
         )
+
+    def _test_topologies(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "对比单/多 Agent 质量",
+            (
+                "将使用 3 个不含用户数据的合成场景，对单 Agent 和三专家拓扑进行对比。\n"
+                f"最多产生 {TOPOLOGY_EVAL_REQUEST_LIMIT} 次模型响应，可能产生 DeepSeek API 费用；"
+                "不会读取知识库、Vault 或会话内容，也不会自动重试。是否继续？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self.runtime.evaluate_topologies():
+            self.capability_button.setEnabled(False)
+            self.topology_evaluation_button.setEnabled(False)
+            self.send_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.status.setText("正在对比单 Agent 与三专家拓扑…")
+
+    def _topology_evaluation_ready(self, result: object) -> None:
+        self.capability_button.setEnabled(True)
+        self.topology_evaluation_button.setEnabled(True)
+        self.send_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        if not isinstance(result, dict):
+            self._topology_evaluation_failed("评测返回了无法识别的结果。")
+            return
+        self.topology_evaluation_result.setPlainText(self._format_topology_evaluation(result))
+        self.status.setText("多 Agent 评测胜出，已启用专家协作" if result.get("passed") else "多 Agent 未胜出，继续使用单 Agent")
+
+    def _topology_evaluation_failed(self, message: str) -> None:
+        config = self.runtime.core.provider.config
+        capability = self.runtime.store.load_capability(config.base_url, config.model)
+        self.capability_button.setEnabled(True)
+        self.topology_evaluation_button.setEnabled(capability_supports_specialists(capability))
+        self.send_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.topology_evaluation_result.setPlainText(f"结果：失败\n原因：{message}\n本次不会自动重试。")
+        self.status.setText(f"单/多 Agent 评测失败：{message}")
+
+    @staticmethod
+    def _format_topology_evaluation(result: dict[str, object]) -> str:
+        lines = [
+            f"接口：{result.get('base_url') or '未知'}",
+            f"模型：{result.get('model') or '未知'}",
+            f"单 Agent：{result.get('single_score') or 0} 分",
+            f"多 Agent：{result.get('multi_score') or 0} 分",
+            f"专家路由：{'全部正确' if result.get('routing_passed') else '未全部命中'}",
+            f"专家协作：{'已启用' if result.get('passed') else '保持关闭'}",
+            f"结论：{result.get('reason') or '无'}",
+            f"响应上限：{result.get('request_limit') or TOPOLOGY_EVAL_REQUEST_LIMIT}",
+            f"评测时间：{result.get('evaluated_at') or '本次运行'}",
+        ]
+        cases = result.get("cases")
+        if isinstance(cases, list):
+            for case in cases:
+                if not isinstance(case, dict):
+                    continue
+                single = case.get("single") if isinstance(case.get("single"), dict) else {}
+                multi = case.get("multi") if isinstance(case.get("multi"), dict) else {}
+                lines.extend(
+                    (
+                        "",
+                        f"【{case.get('label') or case.get('name')}】单 {single.get('score', 0)} / 多 {multi.get('score', 0)}",
+                        f"调用专家：{', '.join(multi.get('used_tools') or []) or '未调用'}",
+                        f"单 Agent 输出：{str(single.get('output') or '')[:800]}",
+                        f"多 Agent 输出：{str(multi.get('output') or '')[:800]}",
+                    )
+                )
+        return "\n".join(lines)
 
     def _approve(self) -> None:
         if self._pending_operation_id and self.runtime.approve(self._pending_operation_id):
