@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, ValidationError
@@ -13,6 +14,12 @@ from .agent_models import (
     ReviewQueryArgs,
     SearchKnowledgeArgs,
     SourceReference,
+    ApplyLearningPlanArgs,
+    ApprovalRequest,
+    MarkLearnedArgs,
+    RecordAnswerArgs,
+    SyncKnowledgeArgs,
+    WRITE_ARGUMENT_MODELS,
 )
 from .agent_store import AgentStore, redact_text
 from .assistant_data import (
@@ -22,11 +29,15 @@ from .assistant_data import (
 )
 from .knowledge_service import (
     due_question_items,
+    answer_key_point_hints,
+    mark_knowledge_card_learned,
     mistake_question_items,
     question_attempt_items,
+    record_question_answer,
     search_knowledge_cards,
+    sync_local_knowledge,
 )
-from .storage import load_goals
+from .storage import load_goals, save_goals
 
 
 MAX_TOOL_ITEMS = 8
@@ -39,6 +50,7 @@ class AgentRunContext:
     session_id: str
     repair_attempts: int = 0
     sources: dict[str, SourceReference] = field(default_factory=dict)
+    authorized_at: dict[str, str] = field(default_factory=dict)
 
     def grant(self, resource: ReadResource) -> bool:
         return self.store.resource_grants().get(resource.value, False)
@@ -171,6 +183,144 @@ def create_read_tools() -> list[Any]:
             _interviews,
         ),
     ]
+
+
+def create_write_tools() -> list[Any]:
+    from agents import FunctionTool
+
+    tools = []
+    descriptions = {
+        "mark_knowledge_learned": "Mark one local knowledge card as learned. Always needs per-call approval.",
+        "record_review_answer": "Persist one user answer and self-rating. Never decides mastery automatically.",
+        "apply_learning_plan": "Apply a proposed local learning plan after explicit approval.",
+        "sync_local_knowledge": "Run configured read-only Vault indexing after explicit approval.",
+    }
+    for name, model in WRITE_ARGUMENT_MODELS.items():
+        async def invoke(tool_context: Any, raw_arguments: str, name=name, model=model) -> str:
+            context: AgentRunContext = tool_context.context
+            return await _invoke_validated(
+                context,
+                raw_arguments,
+                model,
+                lambda parsed: _execute_write(context, name, parsed),
+            )
+
+        tools.append(
+            FunctionTool(
+                name=name,
+                description=descriptions[name],
+                params_json_schema=model.model_json_schema(),
+                on_invoke_tool=invoke,
+                strict_json_schema=False,
+                needs_approval=True,
+            )
+        )
+    return tools
+
+
+def approval_preview(tool_name: str, raw_arguments: str) -> ApprovalRequest:
+    model = WRITE_ARGUMENT_MODELS.get(tool_name)
+    if model is None:
+        raise ValueError(f"不允许审批未知工具：{tool_name}")
+    parsed = model.model_validate_json(raw_arguments)
+    values = parsed.model_dump()
+    operation_id = str(values.pop("operation_id"))
+    if tool_name == "mark_knowledge_learned":
+        return ApprovalRequest(
+            operation_id=operation_id,
+            tool_name=tool_name,
+            title="标记知识卡已学",
+            target=str(values["card_id"]),
+            fields=values,
+            reversible=False,
+            approve_label="标记这张知识卡已学",
+        )
+    if tool_name == "record_review_answer":
+        return ApprovalRequest(
+            operation_id=operation_id,
+            tool_name=tool_name,
+            title="记录本次作答",
+            target=str(values["question_id"]),
+            fields=values,
+            reversible=False,
+            approve_label="记录本次作答",
+        )
+    if tool_name == "apply_learning_plan":
+        return ApprovalRequest(
+            operation_id=operation_id,
+            tool_name=tool_name,
+            title="应用学习计划",
+            target=str(values["goal_title"]),
+            fields=values,
+            reversible=False,
+            approve_label="应用学习计划",
+        )
+    return ApprovalRequest(
+        operation_id=operation_id,
+        tool_name=tool_name,
+        title="同步本地知识库",
+        target="已配置的 Obsidian 白名单目录",
+        fields=values,
+        reversible=False,
+        approve_label="开始只读同步",
+    )
+
+
+def _execute_write(context: AgentRunContext, tool_name: str, raw: BaseModel) -> str:
+    operation_id = str(getattr(raw, "operation_id"))
+    existing = context.store.get_receipt(operation_id)
+    if existing is not None:
+        return _bounded_json({"idempotent": True, "receipt": existing})
+    preview = approval_preview(tool_name, raw.model_dump_json()).model_dump()
+    authorized_at = context.authorized_at.get(operation_id)
+    if not authorized_at:
+        return _bounded_json({"error": "approval_missing", "operation_id": operation_id})
+
+    if tool_name == "mark_knowledge_learned":
+        args = MarkLearnedArgs.model_validate(raw)
+        result = {"questions_scheduled": mark_knowledge_card_learned(args.card_id)}
+    elif tool_name == "record_review_answer":
+        args = RecordAnswerArgs.model_validate(raw)
+        question = next(
+            (item for item in due_question_items(limit=100) + mistake_question_items(limit=100) if item.get("id") == args.question_id),
+            {"key_points": args.matched_points},
+        )
+        matched = answer_key_point_hints(question, args.user_answer)
+        result = record_question_answer(
+            args.question_id,
+            args.self_rating,
+            args.user_answer,
+            matched_points=matched,
+        )
+    elif tool_name == "apply_learning_plan":
+        args = ApplyLearningPlanArgs.model_validate(raw)
+        goals = load_goals()
+        goal = next((item for item in goals if str(item.get("title")) == args.goal_title), None)
+        if goal is None:
+            goal = {"title": args.goal_title}
+            goals.append(goal)
+        goal["daily_minutes"] = args.daily_minutes
+        goal["plan"] = args.tasks
+        save_goals(goals)
+        result = {"goal_title": args.goal_title, "task_count": len(args.tasks)}
+    else:
+        SyncKnowledgeArgs.model_validate(raw)
+        summary = sync_local_knowledge()
+        result = {
+            key: summary.get(key)
+            for key in ("available", "scanned", "created", "updated", "deleted", "questions", "errors")
+        }
+    receipt = context.store.save_receipt(
+        operation_id=operation_id,
+        session_id=context.session_id,
+        tool_name=tool_name,
+        preview=preview,
+        result=result,
+        authorized_at=authorized_at,
+        status="completed",
+        reversible=False,
+    )
+    return _bounded_json({"receipt": receipt})
 
 
 def _search_knowledge(context: AgentRunContext, raw: BaseModel) -> str:

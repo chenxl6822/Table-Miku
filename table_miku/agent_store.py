@@ -195,6 +195,10 @@ class AgentStore:
                 ),
             )
 
+    def set_run_status(self, run_id: str, status: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE runs SET status = ? WHERE id = ?", (status, run_id))
+
     def cancel_interrupted_runs(self) -> int:
         with self._connect() as conn:
             cursor = conn.execute(

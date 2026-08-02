@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import datetime
 from concurrent.futures import CancelledError as FutureCancelledError, Future
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -11,7 +12,7 @@ from PySide6.QtCore import QObject, Signal
 from .agent_adapter import _env_value
 from .agent_models import CoachResponse
 from .agent_store import AgentStore
-from .agent_tools import AgentRunContext, create_read_tools
+from .agent_tools import AgentRunContext, approval_preview, create_read_tools, create_write_tools
 from .storage import load_settings
 
 
@@ -72,12 +73,59 @@ class DeepSeekModelProvider:
         if self._client is not None:
             await self._client.close()
 
+    async def test_capabilities(self) -> dict[str, Any]:
+        self.model()
+        response = await self._client.chat.completions.create(
+            model=self.config.model,
+            messages=[{"role": "user", "content": "合成测试：调用工具查询 spring，并使用合法 JSON 参数。"}],
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "synthetic_search",
+                    "description": "Synthetic capability test only",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }],
+            tool_choice={"type": "function", "function": {"name": "synthetic_search"}},
+            temperature=0,
+        )
+        message = response.choices[0].message if response.choices else None
+        calls = list(message.tool_calls or []) if message else []
+        arguments = calls[0].function.arguments if calls else ""
+        try:
+            parsed = __import__("json").loads(arguments)
+        except (TypeError, ValueError):
+            parsed = {}
+        tool_ok = bool(calls and isinstance(parsed.get("query"), str))
+        return {
+            "chat": message is not None,
+            "function_tool": bool(calls),
+            "json_arguments": bool(parsed),
+            "argument_validation": tool_ok,
+            "multi_agent_enabled": tool_ok,
+            "synthetic": True,
+            "request_count": 1,
+        }
+
 
 @dataclass
 class BackendOutcome:
     response: CoachResponse
     source_ids: list[str]
     metadata: dict[str, Any]
+    pending: PendingBackendApproval | None = None
+
+
+@dataclass
+class PendingBackendApproval:
+    state: Any
+    interruption: Any
+    agent: Any
+    context: AgentRunContext
 
 
 class AgentBackend(Protocol):
@@ -85,15 +133,18 @@ class AgentBackend(Protocol):
 
     async def close(self) -> None: ...
 
+    async def resume(self, pending: PendingBackendApproval, authorized_at: str) -> BackendOutcome: ...
+
 
 class AgentsSDKBackend:
     def __init__(self, provider: DeepSeekModelProvider) -> None:
         self.provider = provider
 
-    async def run(self, *, prompt: str, context: AgentRunContext, history: list[dict[str, Any]]) -> BackendOutcome:
-        from agents import Agent, RunConfig, Runner
+    def _agent(self) -> Any:
+        from agents import Agent
 
-        agent = Agent(
+        model = self.provider.model()
+        return Agent(
             name="Interview Coach",
             instructions=(
                 "你是 Table Miku 的 Java 后端面试学习教练，也是唯一对话出口。"
@@ -101,9 +152,14 @@ class AgentsSDKBackend:
                 "练习时先让用户独立作答，提交前不得展示参考答案；反馈不能替代用户的掌握度自评。"
                 "引用资料时保留工具返回的 source_id。若资源未授权，说明需要用户在 Agent 中心开启对应开关。"
             ),
-            model=self.provider.model(),
-            tools=create_read_tools(),
+            model=model,
+            tools=create_read_tools() + create_write_tools(),
         )
+
+    async def run(self, *, prompt: str, context: AgentRunContext, history: list[dict[str, Any]]) -> BackendOutcome:
+        from agents import RunConfig, Runner
+
+        agent = self._agent()
         history_text = "\n".join(
             f"{item.get('role', 'user')}: {item.get('content', '')}" for item in history[-20:]
         )
@@ -116,7 +172,14 @@ class AgentsSDKBackend:
             run_config=RunConfig(tracing_disabled=True, trace_include_sensitive_data=False),
         )
         if result.interruptions:
-            raise RuntimeError("只读阶段出现了意外审批请求，本次运行已停止。")
+            interruption = result.interruptions[0]
+            preview = approval_preview(str(interruption.tool_name or ""), str(interruption.arguments or "{}"))
+            return BackendOutcome(
+                response=CoachResponse(body="Agent 请求执行一项本地写操作，请检查下方预览。", approval_request=preview),
+                source_ids=list(context.sources),
+                metadata={"provider": "deepseek", "model": self.provider.config.model, "mode": "awaiting-approval"},
+                pending=PendingBackendApproval(result.to_state(), interruption, agent, context),
+            )
         response = CoachResponse(
             body=str(result.final_output or "").strip() or "DeepSeek 已返回，但没有可展示的文本。",
             sources=list(context.sources.values()),
@@ -125,6 +188,33 @@ class AgentsSDKBackend:
             response=response,
             source_ids=list(context.sources),
             metadata={"provider": "deepseek", "model": self.provider.config.model, "mode": "single-agent"},
+        )
+
+    async def resume(self, pending: PendingBackendApproval, authorized_at: str) -> BackendOutcome:
+        from agents import RunConfig, Runner
+
+        preview = approval_preview(
+            str(pending.interruption.tool_name or ""),
+            str(pending.interruption.arguments or "{}"),
+        )
+        pending.context.authorized_at[preview.operation_id] = authorized_at
+        pending.state.approve(pending.interruption)
+        result = await Runner.run(
+            pending.agent,
+            pending.state,
+            max_turns=8,
+            run_config=RunConfig(tracing_disabled=True, trace_include_sensitive_data=False),
+        )
+        if result.interruptions:
+            raise RuntimeError("一次审批仅允许一项写操作；后续写请求已终止。")
+        response = CoachResponse(
+            body=str(result.final_output or "").strip() or "操作已执行。",
+            sources=list(pending.context.sources.values()),
+        )
+        return BackendOutcome(
+            response=response,
+            source_ids=list(pending.context.sources),
+            metadata={"provider": "deepseek", "model": self.provider.config.model, "mode": "approved-write"},
         )
 
     async def close(self) -> None:
@@ -144,6 +234,7 @@ class AgentRuntimeCore:
         self.backend = backend or AgentsSDKBackend(self.provider)
         self.timeout_seconds = min(max(float(timeout_seconds), 0.01), 90.0)
         self._active_task: asyncio.Task[BackendOutcome] | None = None
+        self._pending: tuple[str, str, PendingBackendApproval] | None = None
 
     async def submit(self, session_id: str, text: str) -> CoachResponse:
         message = text.strip()
@@ -174,6 +265,12 @@ class AgentRuntimeCore:
         finally:
             self._active_task = None
 
+        if outcome.pending is not None and outcome.response.approval_request is not None:
+            operation_id = outcome.response.approval_request.operation_id
+            self._pending = (session_id, run_id, outcome.pending)
+            self.store.set_run_status(run_id, "awaiting_approval")
+            return outcome.response
+
         self.store.add_message(
             session_id,
             "assistant",
@@ -183,6 +280,42 @@ class AgentRuntimeCore:
         )
         self.store.finish_run(run_id, "completed", metadata=outcome.metadata)
         return outcome.response
+
+    async def approve(self, operation_id: str) -> CoachResponse:
+        if self._pending is None:
+            raise RuntimeError("当前没有待审批操作。")
+        session_id, run_id, pending = self._pending
+        preview = approval_preview(str(pending.interruption.tool_name or ""), str(pending.interruption.arguments or "{}"))
+        if preview.operation_id != operation_id:
+            raise RuntimeError("审批 operation_id 与待执行操作不一致。")
+        authorized_at = datetime.now().isoformat(timespec="seconds")
+        self._active_task = asyncio.create_task(self.backend.resume(pending, authorized_at))
+        try:
+            outcome = await asyncio.wait_for(self._active_task, timeout=self.timeout_seconds)
+        except Exception as exc:
+            message = friendly_agent_error(exc)
+            self.store.finish_run(run_id, "failed", error=message)
+            raise RuntimeError(message) from exc
+        finally:
+            self._active_task = None
+            self._pending = None
+        self.store.add_message(session_id, "assistant", outcome.response.body, run_id=run_id, source_ids=outcome.source_ids)
+        self.store.finish_run(run_id, "completed", metadata=outcome.metadata)
+        return outcome.response
+
+    async def reject(self, operation_id: str) -> CoachResponse:
+        if self._pending is None:
+            raise RuntimeError("当前没有待审批操作。")
+        session_id, run_id, pending = self._pending
+        preview = approval_preview(str(pending.interruption.tool_name or ""), str(pending.interruption.arguments or "{}"))
+        if preview.operation_id != operation_id:
+            raise RuntimeError("拒绝 operation_id 与待执行操作不一致。")
+        pending.state.reject(pending.interruption, rejection_message="用户拒绝了本次写入。")
+        message = f"已拒绝“{preview.title}”，本地数据未发生变化。"
+        self.store.add_message(session_id, "assistant", message, run_id=run_id)
+        self.store.finish_run(run_id, "rejected", metadata={"operation_id": operation_id})
+        self._pending = None
+        return CoachResponse(body=message)
 
     def cancel(self) -> bool:
         if self._active_task is None or self._active_task.done():
@@ -235,6 +368,7 @@ class AgentRuntime(QObject):
     response_ready = Signal(str, object)
     failed = Signal(str, str)
     sessions_changed = Signal()
+    capability_ready = Signal(object)
 
     def __init__(self, store: AgentStore | None = None, backend: AgentBackend | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -266,18 +400,41 @@ class AgentRuntime(QObject):
         return True
 
     def approve(self, operation_id: str) -> bool:
-        del operation_id
-        return False
+        if self._future is not None and not self._future.done():
+            return False
+        session_id = self.core._pending[0] if self.core._pending else ""
+        self.progress.emit(session_id, "正在执行已批准的本地操作…")
+        self._future = asyncio.run_coroutine_threadsafe(self.core.approve(operation_id), self._thread.loop)
+        self._future.add_done_callback(lambda future: self._complete(session_id, future))
+        return True
 
     def reject(self, operation_id: str) -> bool:
-        del operation_id
-        return False
+        if self._future is not None and not self._future.done():
+            return False
+        session_id = self.core._pending[0] if self.core._pending else ""
+        self._future = asyncio.run_coroutine_threadsafe(self.core.reject(operation_id), self._thread.loop)
+        self._future.add_done_callback(lambda future: self._complete(session_id, future))
+        return True
 
     def cancel(self) -> bool:
         if self._future is None or self._future.done():
             return False
         self._thread.loop.call_soon_threadsafe(self.core.cancel)
         self._future.cancel()
+        return True
+
+    def test_capabilities(self) -> bool:
+        if self._future is not None and not self._future.done():
+            return False
+
+        async def run_test() -> dict[str, Any]:
+            result = await self.core.provider.test_capabilities()
+            config = self.core.provider.config
+            self.store.save_capability(config.base_url, config.model, result)
+            return result
+
+        self._future = asyncio.run_coroutine_threadsafe(run_test(), self._thread.loop)
+        self._future.add_done_callback(self._capability_complete)
         return True
 
     def shutdown(self) -> None:
@@ -300,3 +457,11 @@ class AgentRuntime(QObject):
             self.failed.emit(session_id, str(exc))
         else:
             self.response_ready.emit(session_id, response)
+
+    def _capability_complete(self, future: Future[Any]) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.failed.emit("", friendly_agent_error(exc))
+        else:
+            self.capability_ready.emit(result)
