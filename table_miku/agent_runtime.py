@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from datetime import datetime
 from concurrent.futures import CancelledError as FutureCancelledError, Future
@@ -14,6 +15,30 @@ from .agent_models import CoachResponse
 from .agent_store import AgentStore
 from .agent_tools import AgentRunContext, approval_preview, create_read_tools, create_write_tools
 from .storage import load_settings
+
+
+_PERSONAL_GOAL_PATTERNS = (
+    re.compile(r"我的学习目标"),
+    re.compile(r"(?:根据|基于|按照|结合|参考).{0,8}学习目标"),
+    re.compile(r"学习目标.{0,8}(?:制定|安排|规划|生成)"),
+    re.compile(r"\bmy\s+(?:learning\s+)?goals?\b", re.IGNORECASE),
+)
+
+
+def _blocked_resource_response(message: str, grants: dict[str, bool]) -> CoachResponse | None:
+    """Fail closed when a prompt explicitly requires an ungranted private resource."""
+    if grants.get("goals", False):
+        return None
+    compact = re.sub(r"\s+", "", message)
+    if not any(pattern.search(compact) for pattern in _PERSONAL_GOAL_PATTERNS):
+        return None
+    return CoachResponse(
+        body=(
+            "“学习目标”目前未授权，因此我不能读取或声称依据你的个人目标制定计划。\n\n"
+            "请在 Agent 中心右侧勾选“学习目标”后重新发送；你也可以保持关闭，并让我制定一份不使用个人数据的通用复习计划。"
+        ),
+        intent="permission_required",
+    )
 
 
 @dataclass(frozen=True)
@@ -260,6 +285,15 @@ class AgentRuntimeCore:
         self.store.add_message(session_id, "user", message)
         history = self.store.list_messages(session_id, limit=100)[:-1]
         run_id = self.store.start_run(session_id)
+        blocked = _blocked_resource_response(message, self.store.resource_grants())
+        if blocked is not None:
+            self.store.add_message(session_id, "assistant", blocked.body, run_id=run_id)
+            self.store.finish_run(
+                run_id,
+                "completed",
+                metadata={"mode": "permission-blocked", "resource": "goals"},
+            )
+            return blocked
         context = AgentRunContext(store=self.store, session_id=session_id)
         self._active_task = asyncio.create_task(self.backend.run(prompt=message, context=context, history=history))
         try:

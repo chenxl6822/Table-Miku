@@ -23,9 +23,11 @@ class FakeBackend:
         self.text = text
         self.delay = delay
         self.closed = False
+        self.prompts: list[str] = []
 
     async def run(self, *, prompt, context, history):
         del context, history
+        self.prompts.append(prompt)
         if self.delay:
             await asyncio.sleep(self.delay)
         return BackendOutcome(CoachResponse(body=f"{self.text}: {prompt}"), [], {"fake": True})
@@ -75,6 +77,34 @@ def test_runtime_uses_fake_backend_without_network(tmp_path: Path):
     assert [item["role"] for item in store.list_messages(session_id)] == ["user", "assistant"]
     asyncio.run(core.close())
     assert backend.closed
+
+
+def test_ungranted_learning_goals_are_blocked_before_model_call(tmp_path: Path):
+    store = AgentStore(tmp_path / "agent.db")
+    session_id = store.create_session()
+    backend = FakeBackend()
+    core = AgentRuntimeCore(store=store, backend=backend)
+
+    response = asyncio.run(core.submit(session_id, "根据我的学习目标制定今天的复习计划"))
+
+    assert response.intent == "permission_required"
+    assert "学习目标" in response.body
+    assert "未授权" in response.body
+    assert backend.prompts == []
+    assert [item["role"] for item in store.list_messages(session_id)] == ["user", "assistant"]
+
+
+def test_granted_learning_goals_can_reach_model(tmp_path: Path):
+    store = AgentStore(tmp_path / "agent.db")
+    store.set_resource_grant("goals", True)
+    session_id = store.create_session()
+    backend = FakeBackend()
+    core = AgentRuntimeCore(store=store, backend=backend)
+
+    response = asyncio.run(core.submit(session_id, "根据我的学习目标制定今天的复习计划"))
+
+    assert response.body.startswith("fake answer")
+    assert backend.prompts == ["根据我的学习目标制定今天的复习计划"]
 
 
 def test_runtime_timeout_keeps_user_message(tmp_path: Path):
