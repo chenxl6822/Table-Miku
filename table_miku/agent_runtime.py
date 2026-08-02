@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import threading
 from datetime import datetime
 from concurrent.futures import CancelledError as FutureCancelledError, Future
@@ -13,33 +12,10 @@ from PySide6.QtCore import QObject, Signal
 
 from .agent_adapter import _env_value
 from .agent_models import CoachResponse
+from .agent_policy import blocked_resource_response, format_grant_summary
 from .agent_store import AgentStore
 from .agent_tools import AgentRunContext, approval_preview, create_read_tools, create_write_tools
 from .storage import load_settings
-
-
-_PERSONAL_GOAL_PATTERNS = (
-    re.compile(r"我的学习目标"),
-    re.compile(r"(?:根据|基于|按照|结合|参考).{0,8}学习目标"),
-    re.compile(r"学习目标.{0,8}(?:制定|安排|规划|生成)"),
-    re.compile(r"\bmy\s+(?:learning\s+)?goals?\b", re.IGNORECASE),
-)
-
-
-def _blocked_resource_response(message: str, grants: dict[str, bool]) -> CoachResponse | None:
-    """Fail closed when a prompt explicitly requires an ungranted private resource."""
-    if grants.get("goals", False):
-        return None
-    compact = re.sub(r"\s+", "", message)
-    if not any(pattern.search(compact) for pattern in _PERSONAL_GOAL_PATTERNS):
-        return None
-    return CoachResponse(
-        body=(
-            "“学习目标”目前未授权，因此我不能读取或声称依据你的个人目标制定计划。\n\n"
-            "请在 Agent 中心右侧勾选“学习目标”后重新发送；你也可以保持关闭，并让我制定一份不使用个人数据的通用复习计划。"
-        ),
-        intent="permission_required",
-    )
 
 
 @dataclass(frozen=True)
@@ -182,15 +158,32 @@ class AgentsSDKBackend:
     def __init__(self, provider: DeepSeekModelProvider) -> None:
         self.provider = provider
 
-    def _agent(self, use_specialists: bool = False) -> Any:
+    def _agent(self, use_specialists: bool = False, grants: dict[str, bool] | None = None) -> Any:
         from agents import Agent
 
         model = self.provider.model()
+        grant_summary = format_grant_summary(grants or {})
         specialist_tools = []
         if use_specialists:
-            knowledge = Agent(name="Knowledge Tutor", instructions="检索本地知识并解释来源；不得写入。", model=model, tools=create_read_tools())
-            practice = Agent(name="Practice Analyst", instructions="分析答案命中点、遗漏点和追问；不得替用户自评。", model=model, tools=create_read_tools())
-            planner = Agent(name="Review Planner", instructions="基于复习、错题及授权目标提出计划；不得写入。", model=model, tools=create_read_tools())
+            grant_rule = f"当前只读资源授权：{grant_summary}。不得读取或声称使用未授权资源。"
+            knowledge = Agent(
+                name="Knowledge Tutor",
+                instructions=f"检索本地知识并解释来源；不得写入。{grant_rule}",
+                model=model,
+                tools=create_read_tools(),
+            )
+            practice = Agent(
+                name="Practice Analyst",
+                instructions=f"分析答案命中点、遗漏点和追问；不得替用户自评。{grant_rule}",
+                model=model,
+                tools=create_read_tools(),
+            )
+            planner = Agent(
+                name="Review Planner",
+                instructions=f"基于复习、错题及授权目标提出计划；不得写入。{grant_rule}",
+                model=model,
+                tools=create_read_tools(),
+            )
             specialist_tools = [
                 knowledge.as_tool("consult_knowledge_tutor", "Ask the knowledge specialist"),
                 practice.as_tool("consult_practice_analyst", "Ask the practice specialist"),
@@ -203,6 +196,7 @@ class AgentsSDKBackend:
                 "知识检索、复习状态和写入必须通过提供的本地工具完成；禁止声称访问原始 Vault、文件系统、Shell 或网络搜索。"
                 "练习时先让用户独立作答，提交前不得展示参考答案；反馈不能替代用户的掌握度自评。"
                 "引用资料时保留工具返回的 source_id。若资源未授权，说明需要用户在 Agent 中心开启对应开关。"
+                f"本次只读资源授权状态：{grant_summary}。禁止读取、推断或声称使用未授权资源中的个人数据。"
             ),
             model=model,
             tools=create_read_tools() + create_write_tools() + specialist_tools,
@@ -213,7 +207,7 @@ class AgentsSDKBackend:
 
         capability = context.store.load_capability(self.provider.config.base_url, self.provider.config.model) or {}
         use_specialists = bool(capability.get("multi_agent_enabled"))
-        agent = self._agent(use_specialists)
+        agent = self._agent(use_specialists, context.store.resource_grants())
         history_text = "\n".join(
             f"{item.get('role', 'user')}: {item.get('content', '')}" for item in history[-20:]
         )
@@ -302,13 +296,13 @@ class AgentRuntimeCore:
         self.store.add_message(session_id, "user", message)
         history = self.store.list_messages(session_id, limit=100)[:-1]
         run_id = self.store.start_run(session_id)
-        blocked = _blocked_resource_response(message, self.store.resource_grants())
+        blocked = blocked_resource_response(message, self.store.resource_grants())
         if blocked is not None:
             self.store.add_message(session_id, "assistant", blocked.body, run_id=run_id)
             self.store.finish_run(
                 run_id,
                 "completed",
-                metadata={"mode": "permission-blocked", "resource": "goals"},
+                metadata={"mode": "permission-blocked"},
             )
             return blocked
         context = AgentRunContext(store=self.store, session_id=session_id)

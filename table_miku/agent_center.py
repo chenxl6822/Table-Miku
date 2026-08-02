@@ -19,16 +19,8 @@ from PySide6.QtWidgets import (
 )
 
 from .agent_models import CoachResponse, ReadResource
+from .agent_policy import RESOURCE_LABELS
 from .agent_runtime import AgentRuntime
-
-
-RESOURCE_LABELS = {
-    ReadResource.KNOWLEDGE: "知识库",
-    ReadResource.REVIEW: "复习与错题",
-    ReadResource.GOALS: "学习目标",
-    ReadResource.TIMETABLE: "课程表",
-    ReadResource.INTERVIEWS: "投递/面试记录",
-}
 
 
 class AgentCenterDialog(QDialog):
@@ -110,7 +102,8 @@ class AgentCenterDialog(QDialog):
         self.resource_checks: dict[ReadResource, QCheckBox] = {}
         grants = self.runtime.store.resource_grants()
         for resource, label in RESOURCE_LABELS.items():
-            checkbox = QCheckBox(label, source_panel)
+            checkbox = QCheckBox(f"{label}（只读）", source_panel)
+            checkbox.setToolTip(f"关闭后立即禁止 Agent 读取{label}")
             checkbox.setChecked(grants.get(resource.value, False))
             checkbox.toggled.connect(
                 lambda checked, resource=resource: self.runtime.store.set_resource_grant(resource.value, checked)

@@ -32,6 +32,7 @@ def test_agent_center_defaults_to_knowledge_and_review_only(tmp_path: Path):
             "interviews": False,
         }
         assert dialog.current_session_id
+        assert all("（只读）" in checkbox.text() for checkbox in dialog.resource_checks.values())
         capability_buttons = [
             button for button in dialog.findChildren(QPushButton) if button.text() == "测试 DeepSeek Agent 能力"
         ]

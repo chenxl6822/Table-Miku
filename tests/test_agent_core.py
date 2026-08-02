@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
-from concurrent.futures import Future
+
+import pytest
 
 from table_miku.agent_models import CoachResponse
 from table_miku.agent_runtime import (
     AgentRuntime,
     AgentRuntimeCore,
+    AgentsSDKBackend,
     BackendOutcome,
     DeepSeekConfig,
     DeepSeekModelProvider,
@@ -81,32 +84,94 @@ def test_runtime_uses_fake_backend_without_network(tmp_path: Path):
     assert backend.closed
 
 
-def test_ungranted_learning_goals_are_blocked_before_model_call(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("resource", "prompt", "label"),
+    (
+        ("knowledge", "请从本地知识库检索 Spring IoC", "知识库"),
+        ("review", "打开我的错题本", "复习与错题"),
+        ("goals", "根据我的学习目标制定今天的复习计划", "学习目标"),
+        ("timetable", "查看我的课程表", "课程表"),
+        ("interviews", "根据我的投递记录安排下一步", "投递/面试记录"),
+    ),
+)
+def test_ungranted_resources_are_blocked_before_model_call(
+    tmp_path: Path, resource: str, prompt: str, label: str
+):
     store = AgentStore(tmp_path / "agent.db")
+    store.set_resource_grant(resource, False)
     session_id = store.create_session()
     backend = FakeBackend()
     core = AgentRuntimeCore(store=store, backend=backend)
 
-    response = asyncio.run(core.submit(session_id, "根据我的学习目标制定今天的复习计划"))
+    response = asyncio.run(core.submit(session_id, prompt))
 
     assert response.intent == "permission_required"
-    assert "学习目标" in response.body
+    assert label in response.body
     assert "未授权" in response.body
     assert backend.prompts == []
     assert [item["role"] for item in store.list_messages(session_id)] == ["user", "assistant"]
 
 
-def test_granted_learning_goals_can_reach_model(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("resource", "prompt"),
+    (
+        ("knowledge", "请从本地知识库检索 Spring IoC"),
+        ("review", "打开我的错题本"),
+        ("goals", "根据我的学习目标制定今天的复习计划"),
+        ("timetable", "查看我的课程表"),
+        ("interviews", "根据我的投递记录安排下一步"),
+    ),
+)
+def test_granted_resources_can_reach_model(tmp_path: Path, resource: str, prompt: str):
     store = AgentStore(tmp_path / "agent.db")
-    store.set_resource_grant("goals", True)
+    store.set_resource_grant(resource, True)
     session_id = store.create_session()
     backend = FakeBackend()
     core = AgentRuntimeCore(store=store, backend=backend)
 
-    response = asyncio.run(core.submit(session_id, "根据我的学习目标制定今天的复习计划"))
+    response = asyncio.run(core.submit(session_id, prompt))
 
     assert response.body.startswith("fake answer")
-    assert backend.prompts == ["根据我的学习目标制定今天的复习计划"]
+    assert backend.prompts == [prompt]
+
+
+def test_resource_revocation_takes_effect_on_next_request(tmp_path: Path):
+    store = AgentStore(tmp_path / "agent.db")
+    store.set_resource_grant("timetable", True)
+    session_id = store.create_session()
+    backend = FakeBackend()
+    core = AgentRuntimeCore(store=store, backend=backend)
+
+    first = asyncio.run(core.submit(session_id, "查看我的课程表"))
+    store.set_resource_grant("timetable", False)
+    second = asyncio.run(core.submit(session_id, "查看我的课程表"))
+
+    assert first.body.startswith("fake answer")
+    assert second.intent == "permission_required"
+    assert backend.prompts == ["查看我的课程表"]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    (
+        "解释 Spring IoC",
+        "制定一份不使用个人数据的通用复习计划",
+        "如何改进我的复习方法",
+        "我的面试应该怎么准备",
+    ),
+)
+def test_generic_requests_do_not_require_private_resource_grants(tmp_path: Path, prompt: str):
+    store = AgentStore(tmp_path / "agent.db")
+    for resource in store.resource_grants():
+        store.set_resource_grant(resource, False)
+    session_id = store.create_session()
+    backend = FakeBackend()
+    core = AgentRuntimeCore(store=store, backend=backend)
+
+    response = asyncio.run(core.submit(session_id, prompt))
+
+    assert response.body.startswith("fake answer")
+    assert backend.prompts == [prompt]
 
 
 def test_runtime_timeout_keeps_user_message(tmp_path: Path):
@@ -132,6 +197,20 @@ def test_deepseek_provider_does_not_require_openai_key():
     assert str(model._client.base_url).rstrip("/") == "https://api.deepseek.test"
     assert model._client.max_retries == 0
     asyncio.run(provider.close())
+
+
+def test_agent_instructions_include_read_grant_boundaries():
+    provider = DeepSeekModelProvider(
+        DeepSeekConfig(api_key="deepseek-test", base_url="https://api.deepseek.test", model="chat-test")
+    )
+    provider._model = "chat-test"
+    backend = AgentsSDKBackend(provider)
+
+    agent = backend._agent(False, {"knowledge": True, "goals": False})
+
+    assert "知识库=允许只读" in agent.instructions
+    assert "学习目标=未授权" in agent.instructions
+    assert "禁止读取、推断或声称使用未授权资源" in agent.instructions
 
 
 def test_deepseek_capability_check_validates_synthetic_tool_arguments():
