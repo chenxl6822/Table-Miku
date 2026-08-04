@@ -198,6 +198,11 @@ def practice_question_items(card_id: str, limit: int = 50) -> list[dict[str, Any
     return repo.list_questions_for_card(card_id, limit=limit)
 
 
+def question_item(qa_id: str) -> dict[str, Any] | None:
+    ensure_knowledge_repository()
+    return repo.get_question(qa_id)
+
+
 def mark_knowledge_card_learned(card_id: str, now: datetime | None = None) -> int:
     ensure_knowledge_repository()
     return repo.mark_card_learned(card_id, now=now)
@@ -220,6 +225,11 @@ def record_question_answer(
         )
     except (sqlite3.Error, OSError) as ex:
         raise KnowledgeStorageError("知识作答记录未能写入 SQLite。") from ex
+
+
+def question_attempt_items(qa_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    ensure_knowledge_repository()
+    return repo.list_question_attempts(qa_id, limit=limit)
 
 
 def format_knowledge(records: list[dict[str, Any]] | None = None, limit: int = 12) -> str:

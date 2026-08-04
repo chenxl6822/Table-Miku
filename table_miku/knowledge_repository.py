@@ -1199,6 +1199,53 @@ def record_question_attempt(
         conn.close()
 
 
+def get_question(qa_id: str) -> dict[str, Any] | None:
+    """Return one active question with its current review state."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT qa.*, COALESCE(NULLIF(qa.question_topic, ''), kc.topic) AS resolved_topic,
+                   kc.title, kc.overview,
+                   qrs.mastery, qrs.review_stage, qrs.next_review_at,
+                   qrs.last_reviewed_at, qrs.review_count, qrs.correct_streak,
+                   qrs.wrong_count, qrs.in_mistake_book, qrs.last_user_answer,
+                   qrs.last_matched_points
+            FROM knowledge_qa_pairs qa
+            JOIN knowledge_cards kc ON kc.id = qa.card_id
+            JOIN question_review_states qrs ON qrs.qa_id = qa.id
+            WHERE qa.id = ? AND qa.active = 1 AND kc.archived = 0
+            """,
+            (qa_id,),
+        ).fetchone()
+        return _question_row(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def list_question_attempts(qa_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Return recent persisted attempts for one active or archived question."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, qa_id, answered_at, user_answer, result, matched_points,
+                   answer_snapshot, mastery_after, stage_after
+            FROM review_attempts
+            WHERE qa_id = ?
+            ORDER BY answered_at DESC
+            LIMIT ?
+            """,
+            (qa_id, min(max(int(limit), 1), 100)),
+        ).fetchall()
+        attempts = _rows_to_dicts(rows)
+        for attempt in attempts:
+            attempt["matched_points"] = _parse_json_list(attempt.get("matched_points"))
+        return attempts
+    finally:
+        conn.close()
+
+
 def _ensure_question_review_state(
     conn: sqlite3.Connection,
     qa_id: str,

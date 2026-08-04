@@ -1,4 +1,5 @@
 __pycache__/
+evals/results/
 *.py[cod]
 .venv/
 venv/
