@@ -1,8 +1,16 @@
 # Table Miku
 
-Table Miku 是一个 Windows 桌面 Miku 桌宠：可以透明置顶、自由拖动、点击互动、提醒学习计划，也可以查询当前城市天气。
+Table Miku 是一个 Windows 本地优先的桌面学习与求职助理：以透明置顶、可拖动、可互动的 Miku 桌宠作为入口，整合学习计划、课程表、番茄钟、知识复习、错题回流、求职记录、天气与系统监控，并提供经过显式授权和逐次写审批的可选 AI 能力。
 
-这个项目的 v1 目标是先做成一个稳定、能本地运行、能打包转发的桌宠。默认使用本地规则模板；配置 API Key 后，仍需在应用内明确选择单次或持续授权，才会调用 AI 规划和汇报。
+项目默认使用本地规则、JSON 与 SQLite 运行，不配置 API Key 也能完成主要学习与桌面助理流程。配置 API Key 后，个人助手仍需选择单次或持续授权；Interview Agent Center 还会通过资源权限、受控工具、结构化参数、逐次写审批和幂等收据限制模型能力。
+
+## 项目全景与面试手册
+
+如果希望系统理解本项目的设计取舍、实现原理和面试讲法，请阅读：
+
+- [Table Miku 项目全景、STAR 与面试实战手册](docs/Table-Miku_项目全景与面试实战手册.md)
+
+手册覆盖 STAR 项目介绍、总体架构、技术栈、SQLite 数据模型、Obsidian 增量同步、间隔复习、两条 AI 路径、单/多 Agent 质量门、安全威胁模型、测试体系、Vibe Coding 工作流、常见故障处理、30 个面试问答和生产化路线。
 
 ## 功能
 
@@ -40,11 +48,20 @@ Table-Miku/
 ├─ table_miku/
 │  ├─ app.py
 │  ├─ agent_adapter.py
+│  ├─ agent_center.py
+│  ├─ agent_runtime.py
+│  ├─ agent_store.py
+│  ├─ agent_tools.py
+│  ├─ ai_consent.py
 │  ├─ assistant_core.py
 │  ├─ assistant_log.py
 │  ├─ command_runner.py
+│  ├─ knowledge_db.py
+│  ├─ knowledge_repository.py
+│  ├─ knowledge_sync.py
 │  ├─ paths.py
 │  ├─ planner.py
+│  ├─ qml/
 │  ├─ reminders.py
 │  ├─ storage.py
 │  ├─ system_monitor.py
