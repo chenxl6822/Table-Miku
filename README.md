@@ -10,6 +10,17 @@ Table Miku 是一个 Windows 本地优先的桌面学习与求职助理：以透
 
 - [Table Miku 项目全景、STAR 与面试实战手册](docs/Table-Miku_项目全景与面试实战手册.md)
 
+## Knowledge Assistant 2.0
+
+仓库新增了一个与桌面端数据隔离、可独立部署的企业知识库与任务处理纵向切片，覆盖文件摄取、本地向量检索、来源引用、无答案拒答、工具任务、写审批、RBAC、幂等收据、链路追踪与离线质量门。
+
+- 设计、API、权限、威胁模型、部署和验收证据见 [Knowledge Assistant 2.0 实施与运维手册](docs/KNOWLEDGE_ASSISTANT_2.md)。
+- 本地启动：`.\.venv\Scripts\python.exe -m table_miku.knowledge_assistant.api`
+- 离线评测：`.\.venv\Scripts\python.exe evals\run_knowledge_assistant_evals.py`
+- Docker 启动前先设置 `KNOWLEDGE_ASSISTANT_API_TOKEN`，再执行 `docker compose up --build`。
+
+该服务当前使用依赖无关的本地哈希向量和 SQLite 单节点存储，适合离线演示、开发与安全边界验证；它不是未经容量、安全和真实语义模型评测即可直接上线的大规模生产方案。
+
 手册覆盖 STAR 项目介绍、总体架构、技术栈、SQLite 数据模型、Obsidian 增量同步、间隔复习、两条 AI 路径、单/多 Agent 质量门、安全威胁模型、测试体系、Vibe Coding 工作流、常见故障处理、30 个面试问答和生产化路线。
 
 ## 功能

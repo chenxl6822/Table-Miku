@@ -16,6 +16,16 @@ $env:TABLE_MIKU_DATA_DIR = Join-Path $env:TEMP "TableMiku-test-data"
 
 覆盖率门槛从当前全项目基线 40% 起步。新增或修改逻辑应优先补回归测试，不应通过降低门槛来让 CI 通过。
 
+Knowledge Assistant 2.0 还必须运行独立离线质量门和最小服务依赖审计：
+
+```powershell
+.\.venv\Scripts\python.exe evals\run_knowledge_assistant_evals.py
+.\.venv\Scripts\python.exe -m pip_audit -r requirements-ka2.txt
+```
+
+容器构建、非 root/只读运行、备份恢复、RBAC、审批和故障处理流程见
+[`KNOWLEDGE_ASSISTANT_2.md`](KNOWLEDGE_ASSISTANT_2.md)。离线 8 个固定样例仅用于防回归，不能替代真实企业语料、容量、安全和模型评测。
+
 ## 数据与迁移
 
 - 可写运行数据位于 `%APPDATA%\TableMiku`，测试可用 `TABLE_MIKU_DATA_DIR` 定向到临时目录。
