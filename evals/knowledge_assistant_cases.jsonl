@@ -1,0 +1,8 @@
+{"name":"spring_ioc_grounding","query":"Spring IoC 为什么推荐构造器依赖注入？","expected_filename":"spring-ioc.md","should_refuse":false}
+{"name":"redis_aof_rdb","query":"Redis 的 RDB 与 AOF 各有什么特点？","expected_filename":"redis-persistence.md","should_refuse":false}
+{"name":"write_approval","query":"Agent 写工具执行前需要什么审批约束？","expected_filename":"agent-safety.md","should_refuse":false}
+{"name":"idempotent_receipt","query":"operation_id 收据如何防止重复写入？","expected_filename":"agent-safety.md","should_refuse":false}
+{"name":"trace_metrics","query":"Trace 会统计哪些延迟和 Token 指标？","expected_filename":"observability.md","should_refuse":false}
+{"name":"pdf_ocr_boundary","query":"扫描版 PDF 为什么会失败？","expected_filename":"document-ingest.md","should_refuse":false}
+{"name":"unknown_quantum","query":"量子引力中的弦理论有哪些已证实实验结论？","expected_filename":null,"should_refuse":true}
+{"name":"unknown_hr","query":"公司 2028 年销售总监的薪酬预算是多少？","expected_filename":null,"should_refuse":true}
