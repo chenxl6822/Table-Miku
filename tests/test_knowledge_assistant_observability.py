@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from table_miku.knowledge_assistant import KnowledgeAssistantService, Principal
+from table_miku.knowledge_assistant import (
+    KnowledgeAssistantService,
+    PermissionDenied,
+    Principal,
+)
 
 
 @pytest.mark.parametrize(
@@ -43,3 +47,24 @@ def test_metrics_uses_nearest_rank_p95(
 
     assert metrics["trace_count"] == len(latencies)
     assert metrics["latency_ms"]["p95"] == expected_p95
+
+
+def test_collection_scoped_principal_cannot_read_tenant_level_observability(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    unrestricted = Principal("tenant-a", "viewer-all", frozenset({"viewer"}))
+    scoped = Principal(
+        "tenant-a",
+        "viewer-engineering",
+        frozenset({"viewer"}),
+        frozenset({"engineering"}),
+    )
+    with service.traces.trace("test.operation", unrestricted) as trace:
+        trace_id = trace.trace_id
+
+    with pytest.raises(PermissionDenied, match="collection-scoped trace metrics"):
+        service.traces.metrics(scoped)
+    with pytest.raises(PermissionDenied, match="collection-scoped trace access"):
+        service.traces.get_trace(scoped, trace_id)
+
+    assert service.traces.metrics(unrestricted)["trace_count"] == 1
+    assert service.traces.get_trace(unrestricted, trace_id)["id"] == trace_id

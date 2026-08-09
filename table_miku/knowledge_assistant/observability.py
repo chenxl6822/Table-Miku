@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from .auth import Principal
+from .auth import PermissionDenied, Principal
 from .database import AssistantDatabase
 
 
@@ -136,6 +136,10 @@ class TraceRecorder:
 
     def metrics(self, principal: Principal, limit: int = 1000) -> dict[str, Any]:
         principal.require("trace:read")
+        if principal.collection_ids is not None:
+            raise PermissionDenied(
+                "collection-scoped trace metrics are unavailable until traces carry collection ownership"
+            )
         with self.database.connect() as conn:
             rows = conn.execute(
                 "SELECT operation, status, latency_ms, input_tokens, output_tokens "
@@ -169,6 +173,10 @@ class TraceRecorder:
 
     def get_trace(self, principal: Principal, trace_id: str) -> dict[str, Any]:
         principal.require("trace:read")
+        if principal.collection_ids is not None:
+            raise PermissionDenied(
+                "collection-scoped trace access is unavailable until traces carry collection ownership"
+            )
         with self.database.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM traces WHERE id = ? AND tenant_id = ?",
