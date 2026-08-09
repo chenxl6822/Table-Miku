@@ -7,10 +7,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import table_miku.knowledge_assistant.tasks as tasks_module
 
 from table_miku.knowledge_assistant import KnowledgeAssistantService, PermissionDenied, Principal
 from table_miku.knowledge_assistant.auth import ConflictError, ResourceNotFound
 from table_miku.knowledge_assistant.documents import request_digest
+from table_miku.knowledge_assistant.tasks import APPROVAL_PREVIEW_VERSION
 
 
 def editor(user_id: str = "agent-1", tenant: str = "tenant-a") -> Principal:
@@ -228,6 +230,50 @@ def test_legacy_pending_archive_task_can_use_new_approval_preview(tmp_path: Path
     assert preview["action"]["target"]["filename"] == "legacy.txt"
     assert preview["action"]["target"]["collection_id"] == "default"
     assert completed["status"] == "succeeded"
+    assert completed["receipt"]["arguments"] == {
+        "document_id": document["id"],
+        "filename": "legacy.txt",
+        "collection_id": "default",
+        "checksum": document["checksum"],
+    }
+
+
+def test_legacy_archive_preview_binds_enriched_document_metadata(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    requester = editor()
+    document = service.documents.upload(
+        requester,
+        filename="legacy-bound.txt",
+        content=b"legacy approval target",
+        idempotency_key="legacy-bound-document",
+    )
+    task = service.tasks.create(
+        requester,
+        tool_name="archive_document",
+        arguments={"document_id": document["id"]},
+        idempotency_key="legacy-bound-task",
+    )
+    legacy_arguments = {"document_id": document["id"]}
+    legacy_hash = request_digest({"tool_name": "archive_document", "arguments": legacy_arguments})
+    with service.database.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET arguments_json = ?, request_hash = ? WHERE id = ?",
+            (json.dumps(legacy_arguments), legacy_hash, task["id"]),
+        )
+    reviewer = approver()
+    preview = service.tasks.preview(reviewer, task["id"])
+    with service.database.connect() as conn:
+        conn.execute(
+            "UPDATE documents SET filename = ? WHERE id = ?",
+            ("changed-after-preview.txt", document["id"]),
+        )
+
+    with pytest.raises(ConflictError, match="preview"):
+        service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+
+    unchanged = service.documents.get_document(requester, document["id"])
+    assert unchanged["archived"] is False
+    assert service.tasks.get(requester, task["id"])["receipt"] is None
 
 
 def test_legacy_receipt_without_preview_contract_remains_readable(tmp_path: Path):
@@ -258,18 +304,22 @@ def test_cross_tenant_task_access_and_approval_are_hidden(tmp_path: Path):
         service.tasks.approve(approver(tenant="tenant-b"), task["id"], "0" * 64)
 
 
-def test_expired_approval_cancels_task_and_removes_payload(tmp_path: Path):
+def test_expired_approval_cancels_task_and_removes_payload(tmp_path: Path, monkeypatch):
     service = KnowledgeAssistantService(tmp_path / "assistant.db")
     task = create_ingest_task(service, editor())
-    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(timespec="milliseconds")
-    with service.database.connect() as conn:
-        conn.execute("UPDATE approvals SET expires_at = ? WHERE task_id = ?", (expired, task["id"]))
-        approval_row = service.tasks._approval_row(conn, "tenant-a", task["id"])
+    reviewer = approver()
+    preview = service.tasks.preview(reviewer, task["id"])
+    expires_at = datetime.fromisoformat(task["approval"]["expires_at"])
 
-    assert approval_row is not None
-    preview_hash = service.tasks._approval_preview_hash(approval_row)
+    class ExpiredDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            expired = expires_at + timedelta(seconds=1)
+            return expired if tz is not None else expired.replace(tzinfo=None)
+
+    monkeypatch.setattr(tasks_module, "datetime", ExpiredDateTime)
     with pytest.raises(ConflictError, match="expired"):
-        service.tasks.approve(approver(), task["id"], preview_hash)
+        service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
     cancelled = service.tasks.get(editor(), task["id"])
     assert cancelled["status"] == "cancelled"
     assert cancelled["approval"]["status"] == "expired"
@@ -345,13 +395,14 @@ def test_approval_preview_is_exact_and_not_exposed_by_regular_task_reads(tmp_pat
     preview = service.tasks.preview(reviewer, task["id"])
 
     assert preview["task_id"] == task["id"]
-    assert preview["preview_version"] == 1
+    assert preview["preview_version"] == APPROVAL_PREVIEW_VERSION
     assert len(preview["preview_hash"]) == 64
     assert preview["provenance"] == {
         "origin": "agent_tool_request",
         "requested_by": "agent-1",
         "input_trust": "unverified",
     }
+    assert preview["decision"]["bound_approver"] == "human-1"
     assert preview["action"]["intent"] == "ensure_indexed"
     assert preview["action"]["target"] == {
         "tenant_id": "tenant-a",
@@ -362,6 +413,80 @@ def test_approval_preview_is_exact_and_not_exposed_by_regular_task_reads(tmp_pat
     assert preview["action"]["parameters"]["render_as"] == "plain_text"
     assert preview["action"]["parameters"]["content_sha256"] == task["arguments"]["content_sha256"]
     assert preview["action"]["consequences"]
+
+
+def test_approval_preview_hash_is_server_issued_and_bound_to_approver(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    task = create_ingest_task(service, editor(), "approval-preview-token")
+    reviewer = approver("reviewer-a")
+    other_reviewer = approver("reviewer-b")
+    regular_task = service.tasks.get(reviewer, task["id"])
+    computed_request_hash = request_digest(
+        {
+            "tool_name": regular_task["tool_name"],
+            "arguments": regular_task["arguments"],
+        }
+    )
+    client_computed_hash = request_digest(
+        {
+            "preview_version": APPROVAL_PREVIEW_VERSION,
+            "task_id": regular_task["id"],
+            "tenant_id": regular_task["tenant_id"],
+            "approval_id": regular_task["approval"]["id"],
+            "request_hash": computed_request_hash,
+            "expires_at": regular_task["approval"]["expires_at"],
+        }
+    )
+
+    with pytest.raises(ConflictError, match="preview"):
+        service.tasks.approve(reviewer, task["id"], client_computed_hash)
+
+    preview = service.tasks.preview(reviewer, task["id"])
+    other_preview = service.tasks.preview(other_reviewer, task["id"])
+    assert preview["decision"]["bound_approver"] == "reviewer-a"
+    assert other_preview["decision"]["bound_approver"] == "reviewer-b"
+    assert other_preview["preview_hash"] != preview["preview_hash"]
+    with pytest.raises(ConflictError, match="preview"):
+        service.tasks.approve(other_reviewer, task["id"], preview["preview_hash"])
+
+    completed = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+    assert completed["status"] == "succeeded"
+    with pytest.raises(ConflictError, match="preview"):
+        service.tasks.approve(other_reviewer, task["id"], preview["preview_hash"])
+
+
+def test_pending_preview_and_completed_replay_survive_restart(tmp_path: Path):
+    database_path = tmp_path / "assistant.db"
+    service = KnowledgeAssistantService(database_path)
+    reviewer = approver()
+    pending = create_ingest_task(service, editor(), "restart-pending-preview")
+    preview = service.tasks.preview(reviewer, pending["id"])
+
+    restarted = KnowledgeAssistantService(database_path)
+    completed = restarted.tasks.approve(
+        reviewer,
+        pending["id"],
+        preview["preview_hash"],
+    )
+
+    restarted_again = KnowledgeAssistantService(database_path)
+    replayed = restarted_again.tasks.approve(
+        reviewer,
+        pending["id"],
+        preview["preview_hash"],
+    )
+    assert replayed["status"] == "succeeded"
+    assert replayed["receipt"] == completed["receipt"]
+
+
+def test_invalid_persisted_approval_signing_key_fails_closed(tmp_path: Path):
+    database_path = tmp_path / "assistant.db"
+    KnowledgeAssistantService(database_path)
+    key_path = database_path.with_name(f"{database_path.name}.approval-hmac-key")
+    key_path.write_bytes(b"invalid")
+
+    with pytest.raises(RuntimeError, match="signing key"):
+        KnowledgeAssistantService(database_path)
 
 
 def test_approval_hash_and_staged_payload_integrity_fail_closed(tmp_path: Path):
@@ -410,6 +535,7 @@ def test_execution_revalidates_payload_after_approval_transition(tmp_path: Path)
         *,
         approved_by: str = "",
         approved_preview_hash: str = "",
+        approved_arguments: dict | None = None,
     ):
         with service.database.connect() as conn:
             conn.execute("UPDATE task_payloads SET payload = ? WHERE task_id = ?", (b"tampered", task_id))
@@ -418,6 +544,7 @@ def test_execution_revalidates_payload_after_approval_transition(tmp_path: Path)
             principal,
             approved_by=approved_by,
             approved_preview_hash=approved_preview_hash,
+            approved_arguments=approved_arguments,
         )
 
     service.tasks._execute = tampering_execute  # type: ignore[method-assign]
@@ -430,6 +557,77 @@ def test_execution_revalidates_payload_after_approval_transition(tmp_path: Path)
     with service.database.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
+
+
+def test_execution_revalidates_archive_target_after_approval_transition(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    requester = editor()
+    document = service.documents.upload(
+        requester,
+        filename="archive-target.txt",
+        content=b"archive target",
+        idempotency_key="archive-target-document",
+    )
+    task = service.tasks.create(
+        requester,
+        tool_name="archive_document",
+        arguments={"document_id": document["id"]},
+        idempotency_key="archive-target-task",
+    )
+    reviewer = approver()
+    preview = service.tasks.preview(reviewer, task["id"])
+    original_execute = service.tasks._execute
+
+    def tampering_execute(task_id: str, principal: Principal, **kwargs):
+        with service.database.connect() as conn:
+            conn.execute(
+                "UPDATE documents SET filename = ? WHERE id = ?",
+                ("changed-before-execution.txt", document["id"]),
+            )
+        return original_execute(task_id, principal, **kwargs)
+
+    service.tasks._execute = tampering_execute  # type: ignore[method-assign]
+    failed = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "ConflictError"
+    assert "archive target" in failed["error_message"]
+    assert service.documents.get_document(requester, document["id"])["archived"] is False
+    assert failed["receipt"] is None
+
+
+def test_corrupt_arguments_after_approval_return_failed_state_without_breaking_list(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    task = create_ingest_task(service, editor(), "approval-execute-arguments-integrity")
+    reviewer = approver()
+    preview = service.tasks.preview(reviewer, task["id"])
+    original_execute = service.tasks._execute
+
+    def tampering_execute(task_id: str, principal: Principal, **kwargs):
+        with service.database.connect() as conn:
+            conn.execute("UPDATE tasks SET arguments_json = '{}' WHERE id = ?", (task_id,))
+        return original_execute(task_id, principal, **kwargs)
+
+    service.tasks._execute = tampering_execute  # type: ignore[method-assign]
+    failed = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "ConflictError"
+    assert failed["arguments"] == {}
+    assert failed["arguments_integrity"] == "failed"
+    unrestricted = service.tasks.get(reviewer, task["id"])
+    assert unrestricted["status"] == "failed"
+    assert [item["id"] for item in service.tasks.list(reviewer)] == [task["id"]]
+
+    restricted_reviewer = Principal(
+        "tenant-a",
+        "scoped-reviewer",
+        frozenset({"approver"}),
+        frozenset({"engineering"}),
+    )
+    with pytest.raises(PermissionDenied, match="scope"):
+        service.tasks.get(restricted_reviewer, task["id"])
+    assert service.tasks.list(restricted_reviewer) == []
 
 
 def test_concurrent_duplicate_approval_executes_write_once(tmp_path: Path):
@@ -501,7 +699,8 @@ def test_task_collection_scope_applies_to_read_preview_reject_and_execution(tmp_
         frozenset({"viewer"}),
         frozenset({"engineering"}),
     )
-    unrestricted_preview = service.tasks.preview(approver("global-reviewer"), hr_task["id"])
+    global_reviewer = approver("global-reviewer")
+    unrestricted_preview = service.tasks.preview(global_reviewer, hr_task["id"])
 
     with pytest.raises(PermissionDenied, match="collection"):
         service.tasks.get(engineering_viewer, hr_task["id"])
@@ -517,6 +716,13 @@ def test_task_collection_scope_applies_to_read_preview_reject_and_execution(tmp_
     with pytest.raises(PermissionDenied, match="collection"):
         service.tasks.reject(engineering_reviewer, hr_task["id"], "outside scope")
 
+    rejected = service.tasks.reject(global_reviewer, hr_task["id"], "not approved")
+    assert rejected["status"] == "rejected"
+    with pytest.raises(PermissionDenied, match="collection"):
+        service.tasks.preview(engineering_reviewer, hr_task["id"])
+    with pytest.raises(PermissionDenied, match="collection"):
+        service.tasks.reject(engineering_reviewer, hr_task["id"], "outside scope")
+
     seen_execution_scopes: list[frozenset[str] | None] = []
     original_upload = service.documents.upload
 
@@ -529,7 +735,7 @@ def test_task_collection_scope_applies_to_read_preview_reject_and_execution(tmp_
 
     assert completed["status"] == "succeeded"
     assert seen_execution_scopes == [frozenset({"engineering"})]
-    assert service.tasks.get(requester, hr_task["id"])["status"] == "awaiting_approval"
+    assert service.tasks.get(requester, hr_task["id"])["status"] == "rejected"
 
 
 def test_restricted_query_task_persists_effective_collection_scope(tmp_path: Path):

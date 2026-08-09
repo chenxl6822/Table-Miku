@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
+import secrets
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -18,8 +20,31 @@ from .rag import RagService
 
 
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "rejected", "cancelled"})
-APPROVAL_PREVIEW_VERSION = 1
+APPROVAL_PREVIEW_VERSION = 2
 _SECRET = re.compile(r"(?i)(api[_-]?key|authorization|token|password)\s*[:=]\s*[^\s,;]+")
+_APPROVAL_SIGNING_KEY_BYTES = 32
+
+
+def _load_or_create_approval_signing_key(database: AssistantDatabase) -> bytes:
+    key_path = database.path.with_name(f"{database.path.name}.approval-hmac-key")
+    try:
+        key = key_path.read_bytes()
+    except FileNotFoundError:
+        candidate = secrets.token_bytes(_APPROVAL_SIGNING_KEY_BYTES)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        try:
+            descriptor = os.open(key_path, flags, 0o600)
+        except FileExistsError:
+            key = key_path.read_bytes()
+        else:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(candidate)
+                stream.flush()
+                os.fsync(stream.fileno())
+            key = candidate
+    if len(key) != _APPROVAL_SIGNING_KEY_BYTES:
+        raise RuntimeError("approval signing key has an invalid length")
+    return key
 
 
 @dataclass(frozen=True)
@@ -45,6 +70,7 @@ class TaskService:
         self.rag = rag
         self.traces = traces
         self.approval_ttl_minutes = min(max(int(approval_ttl_minutes), 1), 1440)
+        self._approval_signing_key = _load_or_create_approval_signing_key(database)
         self.tools = {
             "query_knowledge": ToolSpec(
                 "query_knowledge", False, "knowledge:read", self._validate_query
@@ -141,6 +167,8 @@ class TaskService:
             row = self._approval_row(conn, principal.tenant_id, task_id)
         if row is None:
             raise ResourceNotFound("task or approval not found")
+        arguments = self._validated_task_arguments(row)
+        self._task_collection_scope(principal, str(row["tool_name"]), arguments)
         if row["requested_by"] == principal.user_id:
             raise PermissionDenied("requester cannot preview or approve their own write task")
         if row["approval_status"] != "pending" or row["status"] != "awaiting_approval":
@@ -148,11 +176,14 @@ class TaskService:
         if datetime.fromisoformat(str(row["expires_at"])) <= datetime.now(timezone.utc):
             raise ConflictError("approval expired")
 
-        arguments = self._validated_task_arguments(row)
-        self._task_collection_scope(principal, str(row["tool_name"]), arguments)
         payload = self._validated_staged_payload(str(row["tool_name"]), arguments, row["staged_payload"])
         preview_arguments = self._preview_arguments(principal, str(row["tool_name"]), arguments)
-        return self._build_approval_preview(row, preview_arguments, payload)
+        return self._build_approval_preview(
+            row,
+            preview_arguments,
+            payload,
+            approver_user_id=principal.user_id,
+        )
 
     def approve(self, principal: Principal, task_id: str, preview_hash: str) -> dict[str, Any]:
         principal.require("task:approve")
@@ -161,35 +192,63 @@ class TaskService:
             raise ValueError("preview_hash is required; fetch the approval preview before approving")
         expired = False
         execution_scope: frozenset[str] | None = None
+        approved_arguments: dict[str, Any] | None = None
         with self.database.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._approval_row(conn, principal.tenant_id, task_id)
             if row is None:
                 raise ResourceNotFound("task or approval not found")
-            if row["requested_by"] == principal.user_id:
-                raise PermissionDenied("requester cannot approve their own write task")
             arguments = self._validated_task_arguments(row)
             execution_scope = self._task_collection_scope(
                 principal,
                 str(row["tool_name"]),
                 arguments,
             )
-            expected_preview_hash = self._approval_preview_hash(row)
-            if not hmac.compare_digest(supplied_preview_hash, expected_preview_hash):
-                raise ConflictError("approval preview is stale or does not match this task")
+            if row["requested_by"] == principal.user_id:
+                raise PermissionDenied("requester cannot approve their own write task")
             if row["status"] == "succeeded":
-                return self.get(principal, task_id)
-            if row["approval_status"] == "approved" and row["status"] in {"queued", "running"}:
+                receipt_approver, receipt_preview_hash = self._completed_approval_contract(
+                    conn,
+                    task_id,
+                )
+                if (
+                    receipt_approver != principal.user_id
+                    or not receipt_preview_hash
+                    or not hmac.compare_digest(supplied_preview_hash, receipt_preview_hash)
+                ):
+                    raise ConflictError("approval preview is stale or does not match this task")
                 return self.get(principal, task_id)
             if row["status"] in TERMINAL_STATUSES:
                 raise ConflictError(f"task is already {row['status']}")
             if row["approval_status"] != "pending" or row["status"] != "awaiting_approval":
-                raise ConflictError("task is not awaiting approval")
-            self._validated_staged_payload(
+                if not (
+                    row["approval_status"] == "approved"
+                    and row["status"] in {"queued", "running"}
+                ):
+                    raise ConflictError("task is not awaiting approval")
+            payload = self._validated_staged_payload(
                 str(row["tool_name"]),
                 arguments,
                 row["staged_payload"],
             )
+            approved_arguments = self._preview_arguments(
+                principal,
+                str(row["tool_name"]),
+                arguments,
+            )
+            expected_preview = self._build_approval_preview(
+                row,
+                approved_arguments,
+                payload,
+                approver_user_id=principal.user_id,
+            )
+            if not hmac.compare_digest(
+                supplied_preview_hash,
+                str(expected_preview["preview_hash"]),
+            ):
+                raise ConflictError("approval preview is stale or does not match this task")
+            if row["approval_status"] == "approved" and row["status"] in {"queued", "running"}:
+                return self.get(principal, task_id)
             expires_at = datetime.fromisoformat(str(row["expires_at"]))
             if expires_at <= datetime.now(timezone.utc):
                 conn.execute(
@@ -226,6 +285,7 @@ class TaskService:
             execution_principal,
             approved_by=principal.user_id,
             approved_preview_hash=supplied_preview_hash,
+            approved_arguments=approved_arguments,
         )
 
     def reject(self, principal: Principal, task_id: str, reason: str = "") -> dict[str, Any]:
@@ -241,14 +301,14 @@ class TaskService:
             ).fetchone()
             if row is None:
                 raise ResourceNotFound("task or approval not found")
+            arguments = self._validated_task_arguments(row)
+            self._task_collection_scope(principal, str(row["tool_name"]), arguments)
             if row["status"] == "rejected":
                 return self.get(principal, task_id)
             if row["status"] in TERMINAL_STATUSES:
                 raise ConflictError(f"task is already {row['status']}")
             if row["requested_by"] == principal.user_id:
                 raise PermissionDenied("requester cannot decide their own write task")
-            arguments = self._validated_task_arguments(row)
-            self._task_collection_scope(principal, str(row["tool_name"]), arguments)
             if row["approval_status"] != "pending" or row["status"] != "awaiting_approval":
                 raise ConflictError("task is not awaiting approval")
             decided_at = utc_now()
@@ -265,7 +325,13 @@ class TaskService:
             conn.execute("DELETE FROM task_payloads WHERE task_id = ?", (task_id,))
         return self.get(principal, task_id)
 
-    def get(self, principal: Principal, task_id: str) -> dict[str, Any]:
+    def get(
+        self,
+        principal: Principal,
+        task_id: str,
+        *,
+        _allow_unverified_scope: bool = False,
+    ) -> dict[str, Any]:
         principal.require("task:read")
         with self.database.connect() as conn:
             row = conn.execute(
@@ -287,8 +353,15 @@ class TaskService:
             ).fetchone()
         result = dict(row)
         result.pop("request_hash")
-        arguments = self._validated_task_arguments(row)
-        self._task_collection_scope(principal, str(result["tool_name"]), arguments)
+        try:
+            arguments = self._validated_task_arguments(row)
+        except ConflictError:
+            if principal.collection_ids is not None and not _allow_unverified_scope:
+                raise PermissionDenied("task collection scope cannot be verified") from None
+            arguments = {}
+            result["arguments_integrity"] = "failed"
+        else:
+            self._task_collection_scope(principal, str(result["tool_name"]), arguments)
         result["arguments"] = arguments
         result.pop("arguments_json")
         result["result"] = json.loads(result.pop("result_json"))
@@ -345,6 +418,27 @@ class TaskService:
         ).fetchone()
 
     @staticmethod
+    def _completed_approval_contract(
+        conn: sqlite3.Connection,
+        task_id: str,
+    ) -> tuple[str, str]:
+        receipt = conn.execute(
+            "SELECT approved_by, result_json FROM operation_receipts WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if receipt is None:
+            return "", ""
+        try:
+            receipt_record = json.loads(str(receipt["result_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return str(receipt["approved_by"]), ""
+        if not isinstance(receipt_record, dict):
+            return str(receipt["approved_by"]), ""
+        return str(receipt["approved_by"]), str(
+            receipt_record.get("approved_preview_hash", "")
+        )
+
+    @staticmethod
     def _validated_task_arguments(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         try:
             arguments = json.loads(str(row["arguments_json"]))
@@ -359,18 +453,26 @@ class TaskService:
             raise ConflictError("stored task request no longer matches its integrity hash")
         return arguments
 
-    @staticmethod
-    def _approval_preview_hash(row: sqlite3.Row | dict[str, Any]) -> str:
-        return request_digest(
+    def _approval_preview_hash(
+        self,
+        preview_contract: dict[str, Any],
+        request_hash: str,
+    ) -> str:
+        encoded = json.dumps(
             {
-                "preview_version": APPROVAL_PREVIEW_VERSION,
-                "task_id": str(row["id"]),
-                "tenant_id": str(row["tenant_id"]),
-                "approval_id": str(row["approval_id"]),
-                "request_hash": str(row["request_hash"]),
-                "expires_at": str(row["expires_at"]),
-            }
-        )
+                "preview_contract": preview_contract,
+                "request_hash": request_hash,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        domain = f"table-miku/approval-preview/v{APPROVAL_PREVIEW_VERSION}\0".encode("ascii")
+        return hmac.new(
+            self._approval_signing_key,
+            domain + encoded,
+            hashlib.sha256,
+        ).hexdigest()
 
     @staticmethod
     def _validated_staged_payload(
@@ -430,6 +532,8 @@ class TaskService:
         row: sqlite3.Row,
         arguments: dict[str, Any],
         payload: bytes | None,
+        *,
+        approver_user_id: str,
     ) -> dict[str, Any]:
         tool_name = str(row["tool_name"])
         if tool_name == "ingest_text":
@@ -479,9 +583,8 @@ class TaskService:
             }
         else:
             raise ConflictError("task does not support approval preview")
-        return {
+        preview_contract = {
             "preview_version": APPROVAL_PREVIEW_VERSION,
-            "preview_hash": self._approval_preview_hash(row),
             "task_id": str(row["id"]),
             "approval_id": str(row["approval_id"]),
             "requested_at": str(row["requested_at"]),
@@ -492,11 +595,19 @@ class TaskService:
                 "input_trust": "unverified",
             },
             "decision": {
+                "bound_approver": approver_user_id,
                 "requester_separation_required": True,
                 "approve_label": "Approve this exact action",
                 "reject_label": "Reject without side effects",
             },
             "action": action,
+        }
+        return {
+            **preview_contract,
+            "preview_hash": self._approval_preview_hash(
+                preview_contract,
+                str(row["request_hash"]),
+            ),
         }
 
     def _preview_arguments(
@@ -505,19 +616,19 @@ class TaskService:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
-        if tool_name != "archive_document" or all(
-            key in arguments for key in ("filename", "collection_id", "checksum")
-        ):
+        if tool_name != "archive_document":
             return arguments
         document = self.documents.get_document(principal, str(arguments["document_id"]))
+        current_metadata = {
+            "filename": str(document["filename"]),
+            "collection_id": str(document["collection_id"]),
+            "checksum": str(document["checksum"]),
+        }
+        for key, value in current_metadata.items():
+            if key in arguments and str(arguments[key]) != value:
+                raise ConflictError("archive target no longer matches the stored task metadata")
         enriched = dict(arguments)
-        enriched.update(
-            {
-                "filename": str(document["filename"]),
-                "collection_id": str(document["collection_id"]),
-                "checksum": str(document["checksum"]),
-            }
-        )
+        enriched.update(current_metadata)
         return enriched
 
     def _execute(
@@ -527,6 +638,7 @@ class TaskService:
         *,
         approved_by: str = "",
         approved_preview_hash: str = "",
+        approved_arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self.database.connect() as conn:
             row = conn.execute(
@@ -558,6 +670,14 @@ class TaskService:
                 arguments,
                 payload_row["payload"] if payload_row is not None else None,
             )
+            if approved_by:
+                current_approved_arguments = self._preview_arguments(
+                    principal,
+                    tool_name,
+                    arguments,
+                )
+                if approved_arguments is None or current_approved_arguments != approved_arguments:
+                    raise ConflictError("write task action no longer matches the approved preview")
             with self.traces.trace("task.execute", principal, {"tool_name": tool_name}) as trace:
                 with trace.span(f"tool.{tool_name}"):
                     result = self._invoke(
@@ -582,7 +702,7 @@ class TaskService:
                     ),
                 )
                 conn.execute("DELETE FROM task_payloads WHERE task_id = ?", (task_id,))
-            return self.get(principal, task_id)
+            return self.get(principal, task_id, _allow_unverified_scope=True)
         finished_at = utc_now()
         with self.database.connect() as conn:
             conn.execute(
@@ -594,7 +714,8 @@ class TaskService:
                 receipt_record = {
                     "result": result,
                     "approved_preview_hash": approved_preview_hash,
-                    "arguments": arguments,
+                    "preview_version": APPROVAL_PREVIEW_VERSION,
+                    "arguments": approved_arguments or arguments,
                 }
                 conn.execute(
                     "INSERT OR IGNORE INTO operation_receipts(operation_id, tenant_id, task_id, tool_name, "

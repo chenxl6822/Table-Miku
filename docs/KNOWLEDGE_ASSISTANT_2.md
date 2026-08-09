@@ -124,12 +124,13 @@ stateDiagram-v2
 安全不变量：
 
 - 请求人不能批准或拒绝自己的写任务，即使同时具有 `editor` 和 `approver` 角色。
-- 审批人必须先读取专用 Action Preview，再把该预览的 `preview_hash` 原样提交给批准端点；缺失、错误、过期或与暂存正文不一致时失败关闭。
+- 审批人必须先读取专用 Action Preview，再把该预览的 `preview_hash` 原样提交给批准端点；v2 哈希是由服务端专用密钥签发的 HMAC，绑定完整动作、目标、正文、到期时间和当前审批人，客户端不能从普通任务字段自行合成或转交给另一审批人使用。
 - 任务读取、预览、批准、拒绝和最终执行都继承 Principal 的集合 allowlist；执行 Principal 只获得该动作的单一目标集合。
 - 审批默认 10 分钟过期；过期任务被取消并删除暂存正文。
 - 批准只把任务从 `awaiting_approval` 原子推进到 `queued`；同一 `preview_hash` 的并发重复批准返回当前/最终状态，并发执行只有一个认领者和一份收据。
 - 写成功后生成以 `task_id` 为 `operation_id` 的唯一收据。
 - 写失败没有收据，也不会自动重试；操作者审查失败后必须以新幂等键创建新任务。
+- 参数完整性在执行前再次失败时，任务仍持久化为 `failed`；不受集合限制的审计角色可读取脱敏失败状态，集合受限角色在无法证明原集合时失败关闭，任务列表不会被一条损坏记录整体阻断。
 - 进程重启时遗留的 `queued`/`running` 任务会以 `interrupted` 失败收口并删除暂存正文；必须先审查可能的局部副作用，再创建新任务。
 - 归档是软删除；没有实现危险的物理删除工具。
 
@@ -341,9 +342,11 @@ Invoke-RestMethod "http://127.0.0.1:8080/v1/tasks/$($task.id)/approve" `
   -Method Post -Headers $approvalHeaders -ContentType "application/json" -Body $approvalBody
 ```
 
-预览包含准确目标、来源、后果、恢复语义、原文字节数与 SHA-256。`preview_hash` 绑定任务、租户、审批对象、请求哈希和到期时间；普通任务创建、读取、列表、Trace 与错误响应仍不回显正文。拒绝继续使用 `POST /v1/tasks/{id}/reject`，可提交 `{"reason":"证据不足"}`，不要求预览哈希，保持“拒绝即安全”的默认行为。
+预览包含准确目标、来源、后果、恢复语义、原文字节数与 SHA-256。v2 `preview_hash` 使用 HMAC-SHA256 绑定任务、租户、审批对象、隐藏请求哈希、完整 Action Preview、到期时间和 `decision.bound_approver`；普通任务字段不足以伪造它，另一审批人也不能复用。服务端在批准事务和实际执行前都会重验参数、暂存正文及归档目标。普通任务创建、读取、列表、Trace 与错误响应仍不回显正文。拒绝继续使用 `POST /v1/tasks/{id}/reject`，可提交 `{"reason":"证据不足"}`，不要求预览哈希，保持“拒绝即安全”的默认行为。
 
-成功收据会在 `operation_receipts` 中持久化 `approved_preview_hash`、执行结果和不含正文的安全参数；升级前产生且没有预览契约的旧收据将返回 `approved_preview_hash = null`。SQLite 记录不能抵抗数据库管理员篡改，生产环境仍应把批准契约复制到追加写审计存储并签名或发送到 WORM 日志。
+签名密钥以 32 字节 sidecar 文件保存在数据库旁：`knowledge_assistant_2.db.approval-hmac-key`。文件以独占创建方式生成，长度异常时服务拒绝启动；Docker 中它随 `/data` 卷持久化，因此未过期预览可跨容器重建继续使用。不得把该文件提交到 Git、写入日志或单独公开。多实例部署必须让所有实例安全共享同一密钥；当前单节点原型尚未提供 Secret Manager 集成和在线轮换。
+
+成功收据会在 `operation_receipts` 中持久化 `preview_version`、`approved_preview_hash`、执行结果和不含正文的审批安全参数；旧版归档任务的富化目标也进入安全参数。升级前产生且没有预览契约的旧收据仍可读取，并返回 `approved_preview_hash = null`。SQLite 记录不能抵抗数据库管理员篡改，生产环境仍应把批准契约复制到追加写审计存储并签名或发送到 WORM 日志。HMAC 证明该身份从服务端获得了绑定预览令牌，但不能证明人实际阅读了屏幕内容。
 
 ### 7.6 其他端点
 
@@ -470,7 +473,7 @@ docker compose logs --tail 200 knowledge-assistant
 
 ### 10.2 数据备份
 
-数据库位于卷中的 `/data/knowledge_assistant_2.db`。SQLite WAL 模式下不要只复制主 `.db` 文件而忽略未 checkpoint 的 WAL。推荐在维护窗口停止服务后备份整个卷，或使用 SQLite Online Backup API 生成一致性副本。
+数据库位于卷中的 `/data/knowledge_assistant_2.db`，审批签名密钥位于同卷的 `/data/knowledge_assistant_2.db.approval-hmac-key`。SQLite WAL 模式下不要只复制主 `.db` 文件而忽略未 checkpoint 的 WAL；也不能遗漏签名密钥，否则未完成的预览令牌会全部失效。推荐在维护窗口停止服务后备份整个卷，或使用 SQLite Online Backup API 生成数据库一致性副本并把 sidecar 密钥作为受控秘密单独备份。
 
 恢复属于有状态外部操作，应先：
 
