@@ -15,11 +15,14 @@ Table Miku 是一个 Windows 本地优先的桌面学习与求职助理：以透
 仓库新增了一个与桌面端数据隔离、可独立部署的企业知识库与任务处理纵向切片，覆盖文件摄取、本地向量检索、来源引用、无答案拒答、工具任务、写审批、RBAC、幂等收据、链路追踪与离线质量门。
 
 - 设计、API、权限、威胁模型、部署和验收证据见 [Knowledge Assistant 2.0 实施与运维手册](docs/KNOWLEDGE_ASSISTANT_2.md)。
+- 可视化管理台：运行 `python main.py`，右键 Miku，在“系统工具”中打开“企业知识助手管理台”。默认由桌面应用托管随机端口和进程内随机 Token 的私有 loopback API，不需要另开 PowerShell 服务窗口，也不会自动复用 `127.0.0.1:8080`。若检测到该端口已有健康的 Knowledge Assistant，管理台会失败关闭；连接外部实例必须同时显式设置 `KNOWLEDGE_ASSISTANT_DESKTOP_URL` 与匹配的 `KNOWLEDGE_ASSISTANT_API_TOKEN`。
 - 本地启动：`.\.venv\Scripts\python.exe -m table_miku.knowledge_assistant.api`
 - 离线评测：`.\.venv\Scripts\python.exe evals\run_knowledge_assistant_evals.py`
 - Docker 启动前先设置 `KNOWLEDGE_ASSISTANT_API_TOKEN`，再执行 `docker compose up --build`。
 
-该服务当前使用依赖无关的本地哈希向量和 SQLite 单节点存储，适合离线演示、开发与安全边界验证；它不是未经容量、安全和真实语义模型评测即可直接上线的大规模生产方案。
+管理台提供文档、RAG 引用/拒答、任务审批、操作收据、延迟和 Token 面板。审批页把可信动作契约与不可信 Agent 正文分区显示，正文只按纯文本渲染；身份字段变化、身份切换、暂缓或关闭会清除当前审批状态，必须重新加载预览。带集合限制的身份访问租户级 metrics 或 Trace 时由服务端返回 403，界面禁用只是提前提示。上传或创建任务后若因超时、断线而无法确认结果，同一请求的人工重试会复用原幂等键；只有明确创建新的独立操作时才使用新键。界面中的租户、用户和角色切换只用于本地 UAT；它不会替代生产登录和可信网关。
+
+当前管理台的 HTTP 调用仍在 UI 线程同步执行，大文档处理时可能短暂显示忙碌；后台异步 job、取消与进度展示属于下一阶段。该服务当前使用依赖无关的本地哈希向量和 SQLite 单节点存储，适合离线演示、开发与安全边界验证；它不是未经容量、安全和真实语义模型评测即可直接上线的大规模生产方案。
 
 手册覆盖 STAR 项目介绍、总体架构、技术栈、SQLite 数据模型、Obsidian 增量同步、间隔复习、两条 AI 路径、单/多 Agent 质量门、安全威胁模型、测试体系、Vibe Coding 工作流、常见故障处理、30 个面试问答和生产化路线。
 

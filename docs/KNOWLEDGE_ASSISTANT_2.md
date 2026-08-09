@@ -229,7 +229,59 @@ API 支持 `KNOWLEDGE_ASSISTANT_API_TOKEN` 的 Bearer Token 比较，并读取�
 
 ## 7. HTTP API
 
-### 7.1 本地启动
+### 7.1 桌面可视化管理台（2.1）
+
+运行桌面应用：
+
+```powershell
+.\.venv\Scripts\python.exe main.py
+```
+
+右键 Miku，进入“系统工具”并选择“企业知识助手管理台”。窗口包含：
+
+- **文档**：列出当前租户/集合的文档、查看安全元数据、直接上传并索引，以及为现有文档创建归档审批任务；
+- **RAG 查询**：显示 grounded/refused 状态、检索统计、结构化引用和本次 `trace_id`；下一次拒答会清空上一次引用，避免来源错配；
+- **任务与审批**：查看安全任务参数、主动加载专用 Action Preview、批准/拒绝/暂缓以及查看幂等操作收据；
+- **观测**：显示租户级 Trace/error、平均/P95/最大延迟、Token 估算、operation 聚合，并可按 RAG 返回的 ID 查看 Trace/Span。
+
+默认情况下，桌面应用会在操作系统分配的随机 loopback 端口托管一个私有 HTTP API，并生成只保存在进程内存中的随机 Bearer Token。管理台仍经过真实的 JSON、Bearer、身份头、错误码和审批端点契约，但用户不需要另开 PowerShell 窗口。应用退出时会关闭该私有服务。
+
+管理台不会自动复用任何已存在的 `127.0.0.1:8080` 实例。未显式配置外部连接时，如果启动前探测到该端口已有健康的 Knowledge Assistant，管理台会失败关闭并提示用户：先关闭外部服务，或显式提供外部 URL 和与该实例匹配的 Token。该探测只会降低与已知 8080 外部实例错连或共用数据库的风险，不能阻止两个使用随机端口的 Table Miku 进程同时打开同一数据目录。
+
+连接外部实例必须同时显式设置以下两个变量；只设置 URL 或只设置 Token 都不构成有效外部连接配置：
+
+```powershell
+$env:KNOWLEDGE_ASSISTANT_DESKTOP_URL = "http://127.0.0.1:8080"
+$env:KNOWLEDGE_ASSISTANT_API_TOKEN = "与服务端一致的 Token"
+.\.venv\Scripts\python.exe main.py
+```
+
+非 loopback 连接必须使用 HTTPS，URL 不允许内嵌用户名、密码、路径、查询或 fragment。桌面客户端禁用环境 HTTP/HTTPS 代理，所有请求均直接连接显式目标，避免 loopback Token 和身份头被代理截获；需要企业代理或网关时，应把可信反向代理作为显式 HTTPS 目标。Token 不写入 `settings.json`、数据库、日志或界面。
+
+审批交互遵循以下安全约束：
+
+1. 管理台默认以 `viewer` 身份打开，不会自动执行上传、创建任务、批准或拒绝。
+2. Agent 写任务必须由不同用户的 `approver` 主动加载专用预览；批准按钮在此之前保持禁用。
+3. 审批页分成两个只读区域：可信动作契约显示准确目标、来源、`unverified` 标记、SHA-256、字节数、后果和恢复限制；不可信 Agent 原文与契约隔离，并通过 `QPlainTextEdit.setPlainText()` 仅按纯文本显示，不解释 HTML/Markdown，也不被当作界面指令。
+4. “暂不处理，保留待审批”是默认焦点；Escape 退出预览并保留 pending，不把关闭误当成终态拒绝。
+5. 最终批准还会弹出带目标、后果和可恢复性的二次确认，取消是默认选项；拒绝是另一个明确动作，不需要预览哈希且不会执行知识库写入。
+6. 身份字段一旦变化，当前预览立即标记为陈旧并清除内存中的 `preview_hash`，批准/拒绝保持禁用，直到应用身份并重新刷新；选择其他任务、切换身份、暂缓、关闭预览或关闭管理台也会清除审批动作状态。
+7. 批准成功后展示不含 ingest 正文的操作收据；拒绝会留下明确终态但不执行知识库写入。普通任务列表和收据区域不会重新显示不可信正文。
+
+界面中的租户、用户、角色和集合输入是为了本地 UAT 复现 RBAC 与职责分离，不是登录系统。生产管理台必须从可信 OIDC/OAuth2/mTLS 网关获得不可编辑身份。当前 Trace/metrics 是租户级语义，无法安全映射到集合级授权：服务端对设置了 `collection_ids` 的身份访问 `GET /v1/metrics` 或 `GET /v1/traces/{trace_id}` 一律返回 `permission_denied`（HTTP 403）。管理台提前禁用观测面板只是改善交互，不是权限边界。
+
+直接上传、创建 ingest 任务和创建归档任务都会保留本次输入及幂等键。若超时、连接中断、HTTP 408、服务端 5xx，或写请求返回 2xx 却带有畸形/超限响应体而使结果未知，管理台会在内存中保留一个绑定原 Principal 的未决请求胶囊：上传保存第一次读取的原始字节，ingest 保存原正文，归档保存原目标，重试界面的请求字段全部只读。关闭管理台、切换身份或取消重试不会静默删除胶囊；只有用户在风险提示中明确选择“放弃”才会生成新意图。除 408 外的明确 HTTP 4xx 或本地文件读取失败不会被误报为结果未知。若任务已经明确进入 `failed` 终态，则仍应先按第 4 节审查可能的局部副作用，再用新幂等键创建新任务。
+
+当前可视化边界：
+
+- API 没有 Trace 列表端点，只能查看本窗口查询返回或人工输入的单个 `trace_id`；
+- HTTP 调用目前在 Qt UI 线程中同步完成；忙碌光标不代表后台执行或可取消，大文档解析期间窗口可能短暂失去响应。异步 worker/job、取消和进度展示是下一阶段工作；
+- 5 秒 external health timeout 是 socket 空闲超时，不是抵御持续慢速响应的总时限；真正的 wall-clock deadline 与取消也属于下一阶段 worker/job；
+- 私有服务仍是 SQLite 单节点原型。需要连接外部服务时必须显式配置桌面 URL 与匹配的 Token；检测到未显式配置的 `127.0.0.1:8080` 实例时失败关闭。当前没有跨进程单实例锁，不要让两个 Table Miku 进程同时使用同一数据目录；
+- 未决请求胶囊只在当前桌面进程内存中保存；关闭管理台会保留，退出整个应用会丢失。生产版本需要持久化、加密且可审计的 outbox；
+- 集合受限 Trace 的服务端数据模型尚未实现，因此集合受限身份访问 metrics/Trace 会由服务端返回 403；当前版本不宣称支持集合级观测。
+
+### 7.2 本地启动
 
 完整桌面开发环境：
 
@@ -253,7 +305,7 @@ $env:KNOWLEDGE_ASSISTANT_API_TOKEN = "使用本地生成的长随机值"
 Invoke-RestMethod http://127.0.0.1:8080/health
 ```
 
-### 7.2 请求头
+### 7.3 请求头
 
 以下示例假设：
 
@@ -266,7 +318,7 @@ $headers = @{
 }
 ```
 
-### 7.3 上传文档
+### 7.4 上传文档
 
 `POST /v1/documents` 要求 `editor` 和至少 8 字符的 `Idempotency-Key`：
 
@@ -285,7 +337,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/documents `
 
 同一个租户中，同一幂等键和同一请求返回原响应并标记 `idempotent_replay = true`；同 key 不同请求返回 409。
 
-### 7.4 查询
+### 7.5 查询
 
 `POST /v1/query` 要求 `knowledge:read`：
 
@@ -303,7 +355,7 @@ Invoke-RestMethod http://127.0.0.1:8080/v1/query `
 
 响应始终含 `answer`、`refused`、`reason`、`citations`、`retrieval` 和 `trace_id`。
 
-### 7.5 创建并审批写工具任务
+### 7.6 创建并审批写工具任务
 
 Agent 以 `editor` 身份创建写任务：
 
@@ -348,7 +400,7 @@ Invoke-RestMethod "http://127.0.0.1:8080/v1/tasks/$($task.id)/approve" `
 
 成功收据会在 `operation_receipts` 中持久化 `preview_version`、`approved_preview_hash`、执行结果和不含正文的审批安全参数；旧版归档任务的富化目标也进入安全参数。升级前产生且没有预览契约的旧收据仍可读取，并返回 `approved_preview_hash = null`。SQLite 记录不能抵抗数据库管理员篡改，生产环境仍应把批准契约复制到追加写审计存储并签名或发送到 WORM 日志。HMAC 证明该身份从服务端获得了绑定预览令牌，但不能证明人实际阅读了屏幕内容。
 
-### 7.6 其他端点
+### 7.7 其他端点
 
 | 方法与路径 | 作用 |
 |---|---|

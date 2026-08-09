@@ -13,6 +13,7 @@ def main() -> None:
     os.chdir(PROJECT_ROOT)
     run_pyinstaller(
         [
+            "--noconfirm",
             "--noconsole",
             "--name",
             "TableMiku",
