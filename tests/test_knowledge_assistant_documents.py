@@ -13,7 +13,13 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from table_miku.knowledge_assistant import KnowledgeAssistantService, PermissionDenied, Principal
 from table_miku.knowledge_assistant.auth import ConflictError, ResourceNotFound
-from table_miku.knowledge_assistant.documents import DocumentParser, ParsedUnit, TextChunker
+from table_miku.knowledge_assistant.documents import (
+    MAX_DOCUMENT_BYTES,
+    MAX_PDF_PAGES,
+    DocumentParser,
+    ParsedUnit,
+    TextChunker,
+)
 
 
 def principal(
@@ -307,6 +313,43 @@ def test_pdf_text_pages_are_indexed_with_page_citations(tmp_path: Path):
     assert result["refused"] is False
     assert result["citations"][0]["filename"] == "runbook.pdf"
     assert result["citations"][0]["page_number"] == 2
+
+
+def test_pdf_parser_rejects_malformed_and_encrypted_documents():
+    parser = DocumentParser()
+
+    with pytest.raises(ValueError, match="invalid or unreadable PDF"):
+        parser.parse("truncated.pdf", b"%PDF-1.7\n1 0 obj\n<<")
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.encrypt("reviewer-secret")
+    output = io.BytesIO()
+    writer.write(output)
+
+    with pytest.raises(ValueError, match="encrypted PDF"):
+        parser.parse("encrypted.pdf", output.getvalue())
+
+
+def test_pdf_parser_enforces_file_size_before_reader(monkeypatch: pytest.MonkeyPatch):
+    def unexpected_reader(*_args, **_kwargs):
+        raise AssertionError("oversized input must be rejected before PdfReader")
+
+    monkeypatch.setattr("pypdf.PdfReader", unexpected_reader)
+
+    with pytest.raises(ValueError, match="byte limit"):
+        DocumentParser().parse("oversized.pdf", b"%PDF" + b"0" * MAX_DOCUMENT_BYTES)
+
+
+def test_pdf_parser_rejects_excessive_page_count():
+    writer = PdfWriter()
+    for _ in range(MAX_PDF_PAGES + 1):
+        writer.add_blank_page(width=1, height=1)
+    output = io.BytesIO()
+    writer.write(output)
+
+    with pytest.raises(ValueError, match="page limit"):
+        DocumentParser().parse("too-many-pages.pdf", output.getvalue())
 
 
 def test_chunker_rejects_empty_units():

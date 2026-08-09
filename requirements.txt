@@ -1,4 +1,4 @@
 PySide6==6.11.1
 openai-agents==0.19.2
 pyinstaller==6.20.0
-pypdf==6.14.2
+pypdf==6.15.0
