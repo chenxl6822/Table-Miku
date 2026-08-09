@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
 import time
 import uuid
@@ -143,7 +144,7 @@ class TraceRecorder:
             ).fetchall()
         latencies = [float(row["latency_ms"]) for row in rows]
         sorted_latencies = sorted(latencies)
-        p95_index = max(0, min(len(sorted_latencies) - 1, int(len(sorted_latencies) * 0.95) - 1))
+        p95_index = max(0, math.ceil(len(sorted_latencies) * 0.95) - 1)
         operations: dict[str, dict[str, int]] = {}
         for row in rows:
             operation = str(row["operation"])

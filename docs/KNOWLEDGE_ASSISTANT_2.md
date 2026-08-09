@@ -368,6 +368,8 @@ Invoke-RestMethod "http://127.0.0.1:8080/v1/tasks/$($task.id)/approve" `
 - 输入、输出和总 Token；
 - 按 operation 的调用数和错误数。
 
+P95 使用 nearest-rank 定义：对升序样本取第 `ceil(0.95 × N)` 个值；没有已完成 Trace 时返回 `0.0`。当前聚合范围是该租户最近最多 1000 条已完成 Trace。
+
 注意：当前 Token 是基于本地英文 token 与中文 uni/bi-gram 的估算，用于相对成本和趋势，不是任何模型供应商的账单 Token。真实 LLM 接入后必须优先使用供应商响应中的 usage，并同时保留估算值用于异常检测。
 
 SQLite 不是长期指标仓库。生产化应把脱敏 Trace 导出到 OpenTelemetry Collector，把延迟/错误率导入 Prometheus 或同类系统，并为：
