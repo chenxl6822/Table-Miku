@@ -17,6 +17,7 @@ def call_api(
     *,
     body: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
+    response_headers: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     raw = json.dumps(body, ensure_ascii=False).encode() if body is not None else b""
     environ: dict[str, Any] = {
@@ -34,6 +35,8 @@ def call_api(
         captured["headers"] = dict(response_headers)
 
     response = b"".join(api(environ, start_response))
+    if response_headers is not None:
+        response_headers.update(captured["headers"])
     return str(captured["status"]), json.loads(response)
 
 
@@ -111,18 +114,48 @@ def test_api_write_task_approval_flow(tmp_path: Path):
         },
         headers=task_headers,
     )
-    approved_status, approved = call_api(
+    preview_response_headers: dict[str, str] = {}
+    preview_status, preview = call_api(
+        api,
+        "GET",
+        f"/v1/tasks/{task['id']}/approval-preview",
+        headers=auth_headers("approver", "human-1"),
+        response_headers=preview_response_headers,
+    )
+    missing_hash_status, missing_hash = call_api(
         api,
         "POST",
         f"/v1/tasks/{task['id']}/approve",
         headers=auth_headers("approver", "human-1"),
     )
+    wrong_hash_status, _ = call_api(
+        api,
+        "POST",
+        f"/v1/tasks/{task['id']}/approve",
+        body={"preview_hash": "0" * 64},
+        headers=auth_headers("approver", "human-1"),
+    )
+    approved_status, approved = call_api(
+        api,
+        "POST",
+        f"/v1/tasks/{task['id']}/approve",
+        body={"preview_hash": preview["preview_hash"]},
+        headers=auth_headers("approver", "human-1"),
+    )
 
     assert created_status == "202 Accepted"
     assert task["status"] == "awaiting_approval"
+    assert "审批后才能写入。" not in str(task)
+    assert preview_status == "200 OK"
+    assert preview["action"]["parameters"]["content"] == "审批后才能写入。"
+    assert preview_response_headers["Cache-Control"] == "no-store"
+    assert missing_hash_status == "400 Bad Request"
+    assert missing_hash["error"]["code"] == "invalid_request"
+    assert wrong_hash_status == "409 Conflict"
     assert approved_status == "200 OK"
     assert approved["status"] == "succeeded"
     assert approved["receipt"]["approved_by"] == "human-1"
+    assert approved["receipt"]["approved_preview_hash"] == preview["preview_hash"]
 
 
 def test_api_optional_bearer_token_and_error_shape(tmp_path: Path):

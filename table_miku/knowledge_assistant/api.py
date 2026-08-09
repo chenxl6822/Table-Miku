@@ -19,6 +19,7 @@ from .service import KnowledgeAssistantService
 LOGGER = logging.getLogger("table_miku.knowledge_assistant")
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _TASK_PATH = re.compile(r"^/v1/tasks/([^/]+)$")
+_TASK_APPROVAL_PREVIEW_PATH = re.compile(r"^/v1/tasks/([^/]+)/approval-preview$")
 _TASK_DECISION_PATH = re.compile(r"^/v1/tasks/([^/]+)/(approve|reject)$")
 _DOCUMENT_PATH = re.compile(r"^/v1/documents/([^/]+)$")
 _TRACE_PATH = re.compile(r"^/v1/traces/([^/]+)$")
@@ -115,15 +116,22 @@ class KnowledgeAssistantApi:
             return "202 Accepted", result
         if method == "GET" and path == "/v1/tasks":
             return "200 OK", {"items": self.service.tasks.list(principal)}
+        preview_match = _TASK_APPROVAL_PREVIEW_PATH.match(path)
+        if method == "GET" and preview_match:
+            return "200 OK", self.service.tasks.preview(principal, preview_match.group(1))
         decision_match = _TASK_DECISION_PATH.match(path)
         if method == "POST" and decision_match:
             task_id, action = decision_match.groups()
-            body = self._json_body(environ, allow_empty=True)
-            result = (
-                self.service.tasks.approve(principal, task_id)
-                if action == "approve"
-                else self.service.tasks.reject(principal, task_id, str(body.get("reason", "")))
-            )
+            if action == "approve":
+                body = self._json_body(environ)
+                result = self.service.tasks.approve(
+                    principal,
+                    task_id,
+                    str(body.get("preview_hash", "")),
+                )
+            else:
+                body = self._json_body(environ, allow_empty=True)
+                result = self.service.tasks.reject(principal, task_id, str(body.get("reason", "")))
             return "200 OK", result
         task_match = _TASK_PATH.match(path)
         if method == "GET" and task_match:

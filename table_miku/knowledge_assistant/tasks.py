@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -17,6 +18,7 @@ from .rag import RagService
 
 
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "rejected", "cancelled"})
+APPROVAL_PREVIEW_VERSION = 1
 _SECRET = re.compile(r"(?i)(api[_-]?key|authorization|token|password)\s*[:=]\s*[^\s,;]+")
 
 
@@ -133,27 +135,61 @@ class TaskService:
         task["idempotent_replay"] = False
         return task
 
-    def approve(self, principal: Principal, task_id: str) -> dict[str, Any]:
+    def preview(self, principal: Principal, task_id: str) -> dict[str, Any]:
         principal.require("task:approve")
+        with self.database.connect() as conn:
+            row = self._approval_row(conn, principal.tenant_id, task_id)
+        if row is None:
+            raise ResourceNotFound("task or approval not found")
+        if row["requested_by"] == principal.user_id:
+            raise PermissionDenied("requester cannot preview or approve their own write task")
+        if row["approval_status"] != "pending" or row["status"] != "awaiting_approval":
+            raise ConflictError("task is not awaiting approval")
+        if datetime.fromisoformat(str(row["expires_at"])) <= datetime.now(timezone.utc):
+            raise ConflictError("approval expired")
+
+        arguments = self._validated_task_arguments(row)
+        self._task_collection_scope(principal, str(row["tool_name"]), arguments)
+        payload = self._validated_staged_payload(str(row["tool_name"]), arguments, row["staged_payload"])
+        preview_arguments = self._preview_arguments(principal, str(row["tool_name"]), arguments)
+        return self._build_approval_preview(row, preview_arguments, payload)
+
+    def approve(self, principal: Principal, task_id: str, preview_hash: str) -> dict[str, Any]:
+        principal.require("task:approve")
+        supplied_preview_hash = preview_hash.strip()
+        if not supplied_preview_hash:
+            raise ValueError("preview_hash is required; fetch the approval preview before approving")
         expired = False
+        execution_scope: frozenset[str] | None = None
         with self.database.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT t.status, t.requested_by, a.status AS approval_status, a.expires_at "
-                "FROM tasks t JOIN approvals a ON a.task_id = t.id "
-                "WHERE t.id = ? AND t.tenant_id = ?",
-                (task_id, principal.tenant_id),
-            ).fetchone()
+            row = self._approval_row(conn, principal.tenant_id, task_id)
             if row is None:
                 raise ResourceNotFound("task or approval not found")
+            if row["requested_by"] == principal.user_id:
+                raise PermissionDenied("requester cannot approve their own write task")
+            arguments = self._validated_task_arguments(row)
+            execution_scope = self._task_collection_scope(
+                principal,
+                str(row["tool_name"]),
+                arguments,
+            )
+            expected_preview_hash = self._approval_preview_hash(row)
+            if not hmac.compare_digest(supplied_preview_hash, expected_preview_hash):
+                raise ConflictError("approval preview is stale or does not match this task")
             if row["status"] == "succeeded":
+                return self.get(principal, task_id)
+            if row["approval_status"] == "approved" and row["status"] in {"queued", "running"}:
                 return self.get(principal, task_id)
             if row["status"] in TERMINAL_STATUSES:
                 raise ConflictError(f"task is already {row['status']}")
-            if row["requested_by"] == principal.user_id:
-                raise PermissionDenied("requester cannot approve their own write task")
             if row["approval_status"] != "pending" or row["status"] != "awaiting_approval":
                 raise ConflictError("task is not awaiting approval")
+            self._validated_staged_payload(
+                str(row["tool_name"]),
+                arguments,
+                row["staged_payload"],
+            )
             expires_at = datetime.fromisoformat(str(row["expires_at"]))
             if expires_at <= datetime.now(timezone.utc):
                 conn.execute(
@@ -183,8 +219,14 @@ class TaskService:
             tenant_id=principal.tenant_id,
             user_id=str(row["requested_by"]),
             roles=frozenset({"editor"}),
+            collection_ids=execution_scope,
         )
-        return self._execute(task_id, execution_principal, approved_by=principal.user_id)
+        return self._execute(
+            task_id,
+            execution_principal,
+            approved_by=principal.user_id,
+            approved_preview_hash=supplied_preview_hash,
+        )
 
     def reject(self, principal: Principal, task_id: str, reason: str = "") -> dict[str, Any]:
         principal.require("task:approve")
@@ -192,7 +234,8 @@ class TaskService:
         with self.database.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT t.status, t.requested_by, a.status AS approval_status FROM tasks t "
+                "SELECT t.status, t.requested_by, t.tool_name, t.arguments_json, t.request_hash, "
+                "a.status AS approval_status FROM tasks t "
                 "JOIN approvals a ON a.task_id = t.id WHERE t.id = ? AND t.tenant_id = ?",
                 (task_id, principal.tenant_id),
             ).fetchone()
@@ -204,6 +247,8 @@ class TaskService:
                 raise ConflictError(f"task is already {row['status']}")
             if row["requested_by"] == principal.user_id:
                 raise PermissionDenied("requester cannot decide their own write task")
+            arguments = self._validated_task_arguments(row)
+            self._task_collection_scope(principal, str(row["tool_name"]), arguments)
             if row["approval_status"] != "pending" or row["status"] != "awaiting_approval":
                 raise ConflictError("task is not awaiting approval")
             decided_at = utc_now()
@@ -235,25 +280,245 @@ class TaskService:
                 (task_id,),
             ).fetchone()
             receipt = conn.execute(
-                "SELECT operation_id, tool_name, approved_by, completed_at FROM operation_receipts "
+                "SELECT operation_id, tool_name, result_json, approved_by, completed_at "
+                "FROM operation_receipts "
                 "WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
         result = dict(row)
-        result["arguments"] = json.loads(result.pop("arguments_json"))
+        result.pop("request_hash")
+        arguments = self._validated_task_arguments(row)
+        self._task_collection_scope(principal, str(result["tool_name"]), arguments)
+        result["arguments"] = arguments
+        result.pop("arguments_json")
         result["result"] = json.loads(result.pop("result_json"))
-        result["approval"] = dict(approval) if approval is not None else None
-        result["receipt"] = dict(receipt) if receipt is not None else None
+        approval_result = dict(approval) if approval is not None else None
+        result["approval"] = approval_result
+        if receipt is None:
+            result["receipt"] = None
+        else:
+            receipt_result = dict(receipt)
+            receipt_record = json.loads(receipt_result.pop("result_json"))
+            if isinstance(receipt_record, dict) and "approved_preview_hash" in receipt_record:
+                receipt_result["approved_preview_hash"] = receipt_record["approved_preview_hash"]
+                receipt_result["arguments"] = receipt_record.get("arguments", arguments)
+                receipt_result["result"] = receipt_record.get("result", result["result"])
+            else:
+                receipt_result["approved_preview_hash"] = None
+                receipt_result["arguments"] = arguments
+                receipt_result["result"] = receipt_record
+            result["receipt"] = receipt_result
         return result
 
     def list(self, principal: Principal, limit: int = 100) -> list[dict[str, Any]]:
         principal.require("task:read")
+        requested_limit = min(max(int(limit), 1), 500)
         with self.database.connect() as conn:
             rows = conn.execute(
-                "SELECT id FROM tasks WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
-                (principal.tenant_id, min(max(int(limit), 1), 500)),
+                "SELECT id FROM tasks WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 500",
+                (principal.tenant_id,),
             ).fetchall()
-        return [self.get(principal, str(row["id"])) for row in rows]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                items.append(self.get(principal, str(row["id"])))
+            except PermissionDenied:
+                continue
+            if len(items) >= requested_limit:
+                break
+        return items
+
+    @staticmethod
+    def _approval_row(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        task_id: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT t.id, t.tenant_id, t.status, t.requested_by, t.tool_name, t.arguments_json, "
+            "t.request_hash, a.id AS approval_id, a.status AS approval_status, a.requested_at, "
+            "a.expires_at, p.payload AS staged_payload FROM tasks t "
+            "JOIN approvals a ON a.task_id = t.id "
+            "LEFT JOIN task_payloads p ON p.task_id = t.id "
+            "WHERE t.id = ? AND t.tenant_id = ?",
+            (task_id, tenant_id),
+        ).fetchone()
+
+    @staticmethod
+    def _validated_task_arguments(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        try:
+            arguments = json.loads(str(row["arguments_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ConflictError("stored task request is invalid") from exc
+        if not isinstance(arguments, dict):
+            raise ConflictError("stored task request is invalid")
+        expected_hash = request_digest(
+            {"tool_name": str(row["tool_name"]), "arguments": arguments}
+        )
+        if not hmac.compare_digest(str(row["request_hash"]), expected_hash):
+            raise ConflictError("stored task request no longer matches its integrity hash")
+        return arguments
+
+    @staticmethod
+    def _approval_preview_hash(row: sqlite3.Row | dict[str, Any]) -> str:
+        return request_digest(
+            {
+                "preview_version": APPROVAL_PREVIEW_VERSION,
+                "task_id": str(row["id"]),
+                "tenant_id": str(row["tenant_id"]),
+                "approval_id": str(row["approval_id"]),
+                "request_hash": str(row["request_hash"]),
+                "expires_at": str(row["expires_at"]),
+            }
+        )
+
+    @staticmethod
+    def _validated_staged_payload(
+        tool_name: str,
+        arguments: dict[str, Any],
+        staged_payload: Any,
+    ) -> bytes | None:
+        if tool_name != "ingest_text":
+            if staged_payload is not None:
+                raise ConflictError("write task contains an unexpected staged payload")
+            return None
+        if staged_payload is None:
+            raise ConflictError("write task payload is missing")
+        payload = bytes(staged_payload)
+        try:
+            expected_size = int(arguments["byte_size"])
+            expected_hash = str(arguments["content_sha256"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConflictError("stored task payload metadata is invalid") from exc
+        if len(payload) != expected_size or not hmac.compare_digest(
+            hashlib.sha256(payload).hexdigest(),
+            expected_hash,
+        ):
+            raise ConflictError("write task payload no longer matches the approval preview")
+        return payload
+
+    def _task_collection_scope(
+        self,
+        principal: Principal,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> frozenset[str] | None:
+        if tool_name == "query_knowledge":
+            raw_collections = arguments.get("collection_ids")
+            if raw_collections is None:
+                if principal.collection_ids is not None:
+                    raise PermissionDenied("task collection scope is broader than the granted scope")
+                return None
+            collections = frozenset(str(item) for item in raw_collections)
+            for collection_id in collections:
+                principal.require_collection(collection_id)
+            return collections
+        if tool_name == "ingest_text":
+            collection_id = str(arguments["collection_id"])
+        elif tool_name == "archive_document":
+            collection_id = str(arguments.get("collection_id", ""))
+            if not collection_id:
+                document = self.documents.get_document(principal, str(arguments["document_id"]))
+                collection_id = str(document["collection_id"])
+        else:
+            raise PermissionDenied("task collection scope cannot be determined")
+        principal.require_collection(collection_id)
+        return frozenset({collection_id})
+
+    def _build_approval_preview(
+        self,
+        row: sqlite3.Row,
+        arguments: dict[str, Any],
+        payload: bytes | None,
+    ) -> dict[str, Any]:
+        tool_name = str(row["tool_name"])
+        if tool_name == "ingest_text":
+            if payload is None:
+                raise ConflictError("write task payload is missing")
+            try:
+                content = payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ConflictError("write task payload is not valid UTF-8") from exc
+            action = {
+                "tool_name": tool_name,
+                "intent": "ensure_indexed",
+                "target": {
+                    "tenant_id": str(row["tenant_id"]),
+                    "collection_id": str(arguments["collection_id"]),
+                    "filename": str(arguments["filename"]),
+                },
+                "parameters": {
+                    "content": content,
+                    "render_as": "plain_text",
+                    "content_sha256": str(arguments["content_sha256"]),
+                    "byte_size": int(arguments["byte_size"]),
+                },
+                "consequences": [
+                    "The exact UTF-8 content will be parsed, chunked, embedded, and made searchable.",
+                    "Identical active content in the same collection may reuse the existing document.",
+                ],
+                "reversibility": "soft_archive_available_after_indexing",
+            }
+        elif tool_name == "archive_document":
+            action = {
+                "tool_name": tool_name,
+                "intent": "ensure_archived",
+                "target": {
+                    "tenant_id": str(row["tenant_id"]),
+                    "collection_id": str(arguments["collection_id"]),
+                    "document_id": str(arguments["document_id"]),
+                    "filename": str(arguments["filename"]),
+                    "checksum": str(arguments["checksum"]),
+                },
+                "parameters": {},
+                "consequences": [
+                    "The document will be excluded from document listings and knowledge retrieval.",
+                    "The current API does not expose a self-service restore operation.",
+                ],
+                "reversibility": "administrative_restore_required",
+            }
+        else:
+            raise ConflictError("task does not support approval preview")
+        return {
+            "preview_version": APPROVAL_PREVIEW_VERSION,
+            "preview_hash": self._approval_preview_hash(row),
+            "task_id": str(row["id"]),
+            "approval_id": str(row["approval_id"]),
+            "requested_at": str(row["requested_at"]),
+            "expires_at": str(row["expires_at"]),
+            "provenance": {
+                "origin": "agent_tool_request",
+                "requested_by": str(row["requested_by"]),
+                "input_trust": "unverified",
+            },
+            "decision": {
+                "requester_separation_required": True,
+                "approve_label": "Approve this exact action",
+                "reject_label": "Reject without side effects",
+            },
+            "action": action,
+        }
+
+    def _preview_arguments(
+        self,
+        principal: Principal,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        if tool_name != "archive_document" or all(
+            key in arguments for key in ("filename", "collection_id", "checksum")
+        ):
+            return arguments
+        document = self.documents.get_document(principal, str(arguments["document_id"]))
+        enriched = dict(arguments)
+        enriched.update(
+            {
+                "filename": str(document["filename"]),
+                "collection_id": str(document["collection_id"]),
+                "checksum": str(document["checksum"]),
+            }
+        )
+        return enriched
 
     def _execute(
         self,
@@ -261,6 +526,7 @@ class TaskService:
         principal: Principal,
         *,
         approved_by: str = "",
+        approved_preview_hash: str = "",
     ) -> dict[str, Any]:
         with self.database.connect() as conn:
             row = conn.execute(
@@ -285,8 +551,13 @@ class TaskService:
                 "SELECT payload FROM task_payloads WHERE task_id = ?", (task_id,)
             ).fetchone()
         tool_name = str(row["tool_name"])
-        arguments = json.loads(row["arguments_json"])
         try:
+            arguments = self._validated_task_arguments(row)
+            payload = self._validated_staged_payload(
+                tool_name,
+                arguments,
+                payload_row["payload"] if payload_row is not None else None,
+            )
             with self.traces.trace("task.execute", principal, {"tool_name": tool_name}) as trace:
                 with trace.span(f"tool.{tool_name}"):
                     result = self._invoke(
@@ -294,7 +565,7 @@ class TaskService:
                         task_id,
                         tool_name,
                         arguments,
-                        bytes(payload_row["payload"]) if payload_row is not None else None,
+                        payload,
                     )
         except Exception as exc:
             finished_at = utc_now()
@@ -320,6 +591,11 @@ class TaskService:
                 (json.dumps(result, ensure_ascii=False), finished_at, finished_at, task_id),
             )
             if approved_by:
+                receipt_record = {
+                    "result": result,
+                    "approved_preview_hash": approved_preview_hash,
+                    "arguments": arguments,
+                }
                 conn.execute(
                     "INSERT OR IGNORE INTO operation_receipts(operation_id, tenant_id, task_id, tool_name, "
                     "result_json, approved_by, completed_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
@@ -328,7 +604,7 @@ class TaskService:
                         principal.tenant_id,
                         task_id,
                         tool_name,
-                        json.dumps(result, ensure_ascii=False),
+                        json.dumps(receipt_record, ensure_ascii=False),
                         approved_by,
                         finished_at,
                     ),
@@ -413,7 +689,11 @@ class TaskService:
         if len(query) < 2 or len(query) > 1000:
             raise ValueError("query must contain 2 to 1000 characters")
         raw_collections = arguments.get("collection_ids")
-        collections = None
+        collections = (
+            sorted(principal.collection_ids)
+            if raw_collections is None and principal.collection_ids is not None
+            else None
+        )
         if raw_collections is not None:
             if not isinstance(raw_collections, list):
                 raise ValueError("collection_ids must be a list")
@@ -456,8 +736,13 @@ class TaskService:
         document_id = str(arguments.get("document_id", "")).strip()
         if not document_id:
             raise ValueError("document_id is required")
-        self.documents.get_document(principal, document_id)
-        return {"document_id": document_id}, None
+        document = self.documents.get_document(principal, document_id)
+        return {
+            "document_id": document_id,
+            "filename": str(document["filename"]),
+            "collection_id": str(document["collection_id"]),
+            "checksum": str(document["checksum"]),
+        }, None
 
     @staticmethod
     def _safe_error(value: str, limit: int) -> str:

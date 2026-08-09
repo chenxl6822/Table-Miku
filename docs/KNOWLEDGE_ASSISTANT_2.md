@@ -124,8 +124,10 @@ stateDiagram-v2
 安全不变量：
 
 - 请求人不能批准或拒绝自己的写任务，即使同时具有 `editor` 和 `approver` 角色。
+- 审批人必须先读取专用 Action Preview，再把该预览的 `preview_hash` 原样提交给批准端点；缺失、错误、过期或与暂存正文不一致时失败关闭。
+- 任务读取、预览、批准、拒绝和最终执行都继承 Principal 的集合 allowlist；执行 Principal 只获得该动作的单一目标集合。
 - 审批默认 10 分钟过期；过期任务被取消并删除暂存正文。
-- 批准只把任务从 `awaiting_approval` 原子推进到 `queued`；并发执行只有一个认领者。
+- 批准只把任务从 `awaiting_approval` 原子推进到 `queued`；同一 `preview_hash` 的并发重复批准返回当前/最终状态，并发执行只有一个认领者和一份收据。
 - 写成功后生成以 `task_id` 为 `operation_id` 的唯一收据。
 - 写失败没有收据，也不会自动重试；操作者审查失败后必须以新幂等键创建新任务。
 - 进程重启时遗留的 `queued`/`running` 任务会以 `interrupted` 失败收口并删除暂存正文；必须先审查可能的局部副作用，再创建新任务。
@@ -322,17 +324,26 @@ $task = Invoke-RestMethod http://127.0.0.1:8080/v1/tasks `
 
 返回的 `arguments` 只包含文件名、集合、大小和 SHA-256，不回显正文。正文暂存在 `task_payloads`。
 
-另一个用户以 `approver` 身份批准：
+另一个用户以 `approver` 身份先读取专用 Action Preview。该端点才会返回待写入的完整 UTF-8 正文，客户端必须将 `action.parameters.content` 当作纯文本显示，不能解释为 HTML/Markdown：
 
 ```powershell
 $approvalHeaders = $headers.Clone()
 $approvalHeaders["X-User-ID"] = "human-reviewer"
 $approvalHeaders["X-Roles"] = "approver"
+$preview = Invoke-RestMethod `
+  "http://127.0.0.1:8080/v1/tasks/$($task.id)/approval-preview" `
+  -Method Get -Headers $approvalHeaders
+
+$approvalBody = @{
+  preview_hash = $preview.preview_hash
+} | ConvertTo-Json
 Invoke-RestMethod "http://127.0.0.1:8080/v1/tasks/$($task.id)/approve" `
-  -Method Post -Headers $approvalHeaders
+  -Method Post -Headers $approvalHeaders -ContentType "application/json" -Body $approvalBody
 ```
 
-拒绝使用 `POST /v1/tasks/{id}/reject`，可提交 `{"reason":"证据不足"}`。
+预览包含准确目标、来源、后果、恢复语义、原文字节数与 SHA-256。`preview_hash` 绑定任务、租户、审批对象、请求哈希和到期时间；普通任务创建、读取、列表、Trace 与错误响应仍不回显正文。拒绝继续使用 `POST /v1/tasks/{id}/reject`，可提交 `{"reason":"证据不足"}`，不要求预览哈希，保持“拒绝即安全”的默认行为。
+
+成功收据会在 `operation_receipts` 中持久化 `approved_preview_hash`、执行结果和不含正文的安全参数；升级前产生且没有预览契约的旧收据将返回 `approved_preview_hash = null`。SQLite 记录不能抵抗数据库管理员篡改，生产环境仍应把批准契约复制到追加写审计存储并签名或发送到 WORM 日志。
 
 ### 7.6 其他端点
 
@@ -342,6 +353,9 @@ Invoke-RestMethod "http://127.0.0.1:8080/v1/tasks/$($task.id)/approve" `
 | `GET /v1/documents/{id}` | 获取文档状态和 chunk 数 |
 | `GET /v1/tasks` | 列出任务 |
 | `GET /v1/tasks/{id}` | 获取任务、审批与收据 |
+| `GET /v1/tasks/{id}/approval-preview` | 仅供独立、同租户且同集合审批人读取精确动作预览 |
+| `POST /v1/tasks/{id}/approve` | 提交 `preview_hash` 批准预览中的精确动作 |
+| `POST /v1/tasks/{id}/reject` | 拒绝任务且不产生写副作用 |
 | `GET /v1/metrics` | 聚合 Trace 数、错误数、延迟、Token |
 | `GET /v1/traces/{id}` | 获取单条 Trace 和嵌套 Span |
 
@@ -496,8 +510,8 @@ docker compose logs --tail 200 knowledge-assistant
 | 威胁 | 当前控制 | 剩余风险/生产要求 |
 |---|---|---|
 | 跨租户读取 | 所有资源查询先过滤 `tenant_id`；跨租户返回 404 | 必须测试每个新增 SQL；生产建议数据库 RLS/独立 schema |
-| 集合越权 | Principal 集合 allowlist；摄取和查询双向检查 | 身份头必须由可信网关注入 |
-| Agent 未经同意写入 | 写工具默认 `awaiting_approval`；自审批禁止 | 需要企业审批策略、通知与人员离职回收 |
+| 集合越权 | Principal 集合 allowlist；摄取、查询、任务读取、预览、决策和执行均检查，执行仅获目标单一集合 | 身份头必须由可信网关注入 |
+| Agent 未经同意写入 | 写工具默认 `awaiting_approval`；自审批禁止；精确 Action Preview 与 `preview_hash` 绑定；成功后返回批准预览哈希 | 需要企业审批策略、通知与人员离职回收 |
 | 重复写入 | 请求哈希 + 幂等键；唯一收据；原子状态认领 | 多节点时需数据库级锁/队列语义 |
 | 失败后重复副作用 | 失败无收据、无自动重试 | 外部非事务工具需补 compensating action 和远端幂等键 |
 | 路径穿越/任意文件读取 | 上传只接受纯文件名；内容由请求体提供 | 未来 multipart/对象存储需重新审计路径和 MIME |
