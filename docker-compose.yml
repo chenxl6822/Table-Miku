@@ -1,0 +1,23 @@
+services:
+  knowledge-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: table-miku-knowledge-assistant:2.0-local
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      KNOWLEDGE_ASSISTANT_API_TOKEN: "${KNOWLEDGE_ASSISTANT_API_TOKEN:?set KNOWLEDGE_ASSISTANT_API_TOKEN}"
+    volumes:
+      - knowledge-assistant-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  knowledge-assistant-data:

@@ -22,6 +22,7 @@ data/*.jsonl
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/*.approval-hmac-key
 data/weather_location_cache.json
 data/applications.json
 data/interviews.json

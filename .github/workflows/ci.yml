@@ -34,8 +34,12 @@ jobs:
         env:
           TABLE_MIKU_DATA_DIR: ${{ runner.temp }}\TableMiku-ci-data
         run: python -m pytest --cov=table_miku --cov-branch --cov-report=term-missing
-      - name: Audit production dependencies
+      - name: Knowledge Assistant offline quality gate
+        run: python evals/run_knowledge_assistant_evals.py
+      - name: Audit desktop production dependencies
         run: python -m pip_audit -r requirements.txt
+      - name: Audit Knowledge Assistant service dependencies
+        run: python -m pip_audit -r requirements-ka2.txt
       - name: Build Windows package
         shell: pwsh
         run: |
@@ -43,3 +47,20 @@ jobs:
           if (-not (Test-Path -LiteralPath .\dist\TableMiku\TableMiku.exe)) {
             throw "PyInstaller smoke build did not create TableMiku.exe"
           }
+
+  knowledge-assistant-container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build Knowledge Assistant container
+        run: docker build --tag table-miku-knowledge-assistant:ci .
+      - name: Smoke-test hardened container runtime
+        run: >-
+          docker run --rm --network none --read-only
+          --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
+          --tmpfs /data:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700
+          --cap-drop ALL --security-opt no-new-privileges
+          table-miku-knowledge-assistant:ci
+          python -c "from table_miku.knowledge_assistant import KnowledgeAssistantService;
+          service=KnowledgeAssistantService(); print(service.embedding.name)"

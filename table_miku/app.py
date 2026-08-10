@@ -51,6 +51,8 @@ from .agent_runtime import AgentRuntime
 from .assistant_log import append_event
 from .goal_parser import ParsedGoalInput, parse_goal_input
 from .knowledge_base import migrate_legacy_record
+from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
+from .knowledge_assistant_ui import KnowledgeAssistantDialog
 from .knowledge_service import (
     answer_key_point_hints,
     due_question_items,
@@ -1151,9 +1153,11 @@ class TableMiku(QWidget):
         self.assistant.start()
         self.agent_runtime = AgentRuntime(parent=self)
         self._agent_center_dialog: AgentCenterDialog | None = None
+        self._knowledge_assistant_dialog: KnowledgeAssistantDialog | None = None
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.agent_runtime.shutdown)
+            app.aboutToQuit.connect(self._shutdown_knowledge_assistant)
         if (self.settings.get("knowledge") or {}).get("enabled", True):
             QTimer.singleShot(1200, self._start_background_knowledge_sync)
 
@@ -1177,15 +1181,24 @@ class TableMiku(QWidget):
         review_action = QAction("今日复习", self)
         brief_action = QAction("生成助手简报", self)
         agent_center_action = QAction("Agent 中心", self)
+        knowledge_assistant_action = QAction("企业知识助手管理台", self)
         pomodoro_action = QAction("开始番茄钟", self)
         quit_action = QAction("关闭 Miku", self)
         show_action.triggered.connect(self.toggle_visible)
         review_action.triggered.connect(self.show_due_reviews)
         brief_action.triggered.connect(self.show_assistant_brief)
         agent_center_action.triggered.connect(self.show_agent_center)
+        knowledge_assistant_action.triggered.connect(self.show_knowledge_assistant)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
         quit_action.triggered.connect(QApplication.instance().quit)
-        for action in (show_action, review_action, agent_center_action, brief_action, pomodoro_action):
+        for action in (
+            show_action,
+            review_action,
+            agent_center_action,
+            knowledge_assistant_action,
+            brief_action,
+            pomodoro_action,
+        ):
             menu.addAction(action)
         menu.addSeparator()
         menu.addAction(quit_action)
@@ -1293,6 +1306,7 @@ class TableMiku(QWidget):
         cancel_command_action = QAction("取消正在监视的命令", self)
         ai_plan_action = QAction("AI 规划/汇报（可选）", self)
         agent_center_action = QAction("Agent 中心", self)
+        knowledge_assistant_action = QAction("企业知识助手管理台", self)
         toggle_ai_action = QAction(
             "关闭 AI 助理" if (self.settings.get("assistant") or {}).get("ai_agent_enabled", False) else "开启 AI 助理",
             self,
@@ -1334,6 +1348,7 @@ class TableMiku(QWidget):
         cancel_command_action.triggered.connect(self.cancel_watched_commands)
         ai_plan_action.triggered.connect(self.show_ai_plan)
         agent_center_action.triggered.connect(self.show_agent_center)
+        knowledge_assistant_action.triggered.connect(self.show_knowledge_assistant)
         toggle_ai_action.triggered.connect(self.toggle_ai_agent)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
         view_timetable_action.triggered.connect(self.show_timetable)
@@ -1384,6 +1399,7 @@ class TableMiku(QWidget):
         tools_menu.addSeparator()
         tools_menu.addAction(brief_action)
         tools_menu.addAction(agent_center_action)
+        tools_menu.addAction(knowledge_assistant_action)
         tools_menu.addAction(ai_plan_action)
         tools_menu.addAction(watch_command_action)
         tools_menu.addAction(cancel_command_action)
@@ -1607,6 +1623,29 @@ class TableMiku(QWidget):
         self._agent_center_dialog.show()
         self._agent_center_dialog.raise_()
         self._agent_center_dialog.activateWindow()
+
+    def show_knowledge_assistant(self) -> None:
+        if self._knowledge_assistant_dialog is None:
+            controller: KnowledgeAssistantDesktopController | None = None
+            try:
+                controller = KnowledgeAssistantDesktopController()
+                self._knowledge_assistant_dialog = KnowledgeAssistantDialog(controller, self)
+            except Exception as exc:
+                if controller is not None:
+                    controller.close()
+                self.pet.set_expression("surprised")
+                self.say(f"企业知识助手管理台启动失败：{exc}")
+                return
+        self._knowledge_assistant_dialog.show()
+        self._knowledge_assistant_dialog.raise_()
+        self._knowledge_assistant_dialog.activateWindow()
+
+    def _shutdown_knowledge_assistant(self) -> None:
+        if self._knowledge_assistant_dialog is None:
+            return
+        self._knowledge_assistant_dialog.controller.close()
+        self._knowledge_assistant_dialog.close()
+        self._knowledge_assistant_dialog = None
 
     def toggle_ai_agent(self) -> None:
         self.settings = load_settings()
