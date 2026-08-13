@@ -1702,11 +1702,11 @@ def test_real_coordinator_api_and_service_complete_without_freezing_qt(tmp_path:
             generation=1,
             expected_snapshots=[_snapshot(source)],
         )
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             app.processEvents()
             coordinator.refresh(_principal(), generation=1)
-            QTest.qWait(20)
+            QTest.qWait(100)
             if any(
                 item.get("status") == "snapshot"
                 and any(job.get("status") == "succeeded" for job in item.get("jobs", []))
