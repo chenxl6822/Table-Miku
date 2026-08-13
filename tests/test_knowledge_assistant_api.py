@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import table_miku.knowledge_assistant.api as api_module
 from table_miku.knowledge_assistant.api import KnowledgeAssistantApi
 from table_miku.knowledge_assistant.service import KnowledgeAssistantService
 
@@ -45,16 +46,201 @@ def auth_headers(role: str = "editor", user: str = "user-1") -> dict[str, str]:
 
 
 def test_health_is_public_but_data_routes_require_identity(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    service.start()
+    try:
+        api = KnowledgeAssistantApi(service)
+
+        health_status, health = call_api(api, "GET", "/health")
+        denied_status, denied = call_api(api, "GET", "/v1/documents")
+
+        assert health_status == "200 OK"
+        assert health["status"] == "ok"
+        assert health["schema_version"] == 2
+        assert health["service_instance_id"].startswith("ka-")
+        assert health["embedding_model"] == "local-hash-v1-384"
+        assert health["ingestion"] == {
+            "status": "ready",
+            "started": True,
+            "worker_alive": True,
+            "heartbeat_alive": True,
+            "lease_owned": True,
+        }
+        assert denied_status == "403 Forbidden"
+        assert denied["error"]["code"] == "permission_denied"
+    finally:
+        service.close()
+
+
+def test_health_is_503_before_service_start(tmp_path: Path):
     api = KnowledgeAssistantApi(KnowledgeAssistantService(tmp_path / "assistant.db"))
 
-    health_status, health = call_api(api, "GET", "/health")
-    denied_status, denied = call_api(api, "GET", "/v1/documents")
+    status, health = call_api(api, "GET", "/health")
 
-    assert health_status == "200 OK"
-    assert health["status"] == "ok"
-    assert health["embedding_model"] == "local-hash-v1-384"
-    assert denied_status == "403 Forbidden"
-    assert denied["error"]["code"] == "permission_denied"
+    assert status == "503 Service Unavailable"
+    assert health["status"] == "degraded"
+    assert health["ingestion"]["status"] == "degraded"
+    assert health["ingestion"]["started"] is False
+
+
+def test_health_is_503_when_started_worker_stops(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    service.start()
+    worker = service.ingestion._worker
+    assert worker is not None
+    service.ingestion._stop.set()
+    worker.join(timeout=3)
+    try:
+        status, health = call_api(KnowledgeAssistantApi(service), "GET", "/health")
+
+        assert status == "503 Service Unavailable"
+        assert health["status"] == "degraded"
+        assert health["ingestion"]["started"] is True
+        assert health["ingestion"]["worker_alive"] is False
+    finally:
+        service.close()
+
+
+def test_health_is_503_when_worker_lease_is_lost(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    service.start()
+    try:
+        with service.database.connect() as conn:
+            conn.execute(
+                "UPDATE worker_leases SET owner_id = 'fenced-worker' "
+                "WHERE name = 'knowledge-assistant-ingestion'"
+            )
+
+        status, health = call_api(KnowledgeAssistantApi(service), "GET", "/health")
+
+        assert status == "503 Service Unavailable"
+        assert health["status"] == "degraded"
+        assert health["ingestion"]["lease_owned"] is False
+    finally:
+        service.close()
+
+
+def test_explicit_empty_collection_scope_is_deny_all_not_unrestricted(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    unrestricted = auth_headers("editor", "editor-a")
+    unrestricted["Idempotency-Key"] = "empty-scope-seed-001"
+    upload_status, _ = call_api(
+        KnowledgeAssistantApi(service),
+        "POST",
+        "/v1/documents",
+        body={
+            "filename": "visible.txt",
+            "content_base64": base64.b64encode(b"visible only when unrestricted").decode(),
+        },
+        headers=unrestricted,
+    )
+    deny_all = auth_headers("viewer", "viewer-empty")
+    deny_all["X-Collection-Scope"] = "restricted"
+    list_status, listed = call_api(
+        KnowledgeAssistantApi(service), "GET", "/v1/documents", headers=deny_all
+    )
+
+    assert upload_status == "201 Created"
+    assert list_status == "200 OK"
+    assert listed["items"] == []
+
+
+def test_api_main_explicitly_starts_and_closes_service(tmp_path: Path, monkeypatch):
+    events: list[str] = []
+
+    class FakeService:
+        def __init__(self, _database_path):
+            self.embedding = type("Embedding", (), {"name": "fake"})()
+
+        def start(self):
+            events.append("start")
+
+        def close(self):
+            events.append("close")
+
+    class FakeServer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            events.append("server-close")
+
+        @staticmethod
+        def serve_forever():
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(api_module, "KnowledgeAssistantService", FakeService)
+    monkeypatch.setattr(api_module, "make_server", lambda *_args, **_kwargs: FakeServer())
+
+    assert api_module.main(["--database", str(tmp_path / "unused.db")]) == 0
+    assert events == ["start", "server-close", "close"]
+
+
+def test_api_persistent_ingestion_create_get_list_cancel_contract(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    api = KnowledgeAssistantApi(service)
+    headers = auth_headers("editor", "editor-a")
+    headers["Idempotency-Key"] = "api-ingestion-001"
+    created_status, created = call_api(
+        api,
+        "POST",
+        "/v1/ingestion-jobs",
+        body={
+            "filename": "queued.md",
+            "collection_id": "engineering",
+            "content_base64": base64.b64encode(b"queued content").decode(),
+        },
+        headers=headers,
+    )
+    replay_status, replay = call_api(
+        api,
+        "POST",
+        "/v1/ingestion-jobs",
+        body={
+            "filename": "queued.md",
+            "collection_id": "engineering",
+            "content_base64": base64.b64encode(b"queued content").decode(),
+        },
+        headers=headers,
+    )
+    get_status, fetched = call_api(
+        api,
+        "GET",
+        f"/v1/ingestion-jobs/{created['id']}",
+        headers=auth_headers("viewer", "viewer-a"),
+    )
+    list_status, listed = call_api(
+        api,
+        "GET",
+        "/v1/ingestion-jobs",
+        headers=auth_headers("viewer", "viewer-a"),
+    )
+    wrong_requester_status, _ = call_api(
+        api,
+        "POST",
+        f"/v1/ingestion-jobs/{created['id']}/cancel",
+        body={},
+        headers=auth_headers("editor", "editor-b"),
+    )
+    cancel_status, cancelled = call_api(
+        api,
+        "POST",
+        f"/v1/ingestion-jobs/{created['id']}/cancel",
+        body={},
+        headers=auth_headers("editor", "editor-a"),
+    )
+
+    assert created_status == "202 Accepted"
+    assert created["status"] == "queued"
+    assert replay_status == "202 Accepted"
+    assert replay["id"] == created["id"]
+    assert replay["idempotent_replay"] is True
+    assert get_status == "200 OK" and fetched["id"] == created["id"]
+    assert list_status == "200 OK" and listed["items"][0]["id"] == created["id"]
+    assert wrong_requester_status == "403 Forbidden"
+    assert cancel_status == "200 OK"
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancel_outcome"] == "cancelled"
 
 
 def test_api_upload_query_metrics_and_trace_round_trip(tmp_path: Path):

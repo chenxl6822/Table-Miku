@@ -22,6 +22,8 @@ _TASK_PATH = re.compile(r"^/v1/tasks/([^/]+)$")
 _TASK_APPROVAL_PREVIEW_PATH = re.compile(r"^/v1/tasks/([^/]+)/approval-preview$")
 _TASK_DECISION_PATH = re.compile(r"^/v1/tasks/([^/]+)/(approve|reject)$")
 _DOCUMENT_PATH = re.compile(r"^/v1/documents/([^/]+)$")
+_INGESTION_JOB_PATH = re.compile(r"^/v1/ingestion-jobs/([^/]+)$")
+_INGESTION_CANCEL_PATH = re.compile(r"^/v1/ingestion-jobs/([^/]+)/cancel$")
 _TRACE_PATH = re.compile(r"^/v1/traces/([^/]+)$")
 
 
@@ -72,11 +74,10 @@ class KnowledgeAssistantApi:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
         path = str(environ.get("PATH_INFO", "/"))
         if method == "GET" and path == "/health":
-            return "200 OK", {
-                "status": "ok",
-                "schema_version": SCHEMA_VERSION,
-                "embedding_model": self.service.embedding.name,
-            }
+            health = self.service.health()
+            health["schema_version"] = SCHEMA_VERSION
+            status = "200 OK" if health["status"] == "ok" else "503 Service Unavailable"
+            return status, health
         self._check_api_token(environ)
         principal = self._principal(environ)
         if method == "POST" and path == "/v1/documents":
@@ -95,6 +96,28 @@ class KnowledgeAssistantApi:
         document_match = _DOCUMENT_PATH.match(path)
         if method == "GET" and document_match:
             return "200 OK", self.service.documents.get_document(principal, document_match.group(1))
+        if method == "POST" and path == "/v1/ingestion-jobs":
+            body = self._json_body(environ)
+            result = self.service.ingestion.create(
+                principal,
+                filename=str(body.get("filename", "")),
+                content=self.service.documents.decode_base64(str(body.get("content_base64", ""))),
+                collection_id=str(body.get("collection_id", "default")),
+                idempotency_key=str(environ.get("HTTP_IDEMPOTENCY_KEY", "")),
+            )
+            return "202 Accepted", result
+        if method == "GET" and path == "/v1/ingestion-jobs":
+            return "200 OK", {"items": self.service.ingestion.list(principal)}
+        ingestion_cancel_match = _INGESTION_CANCEL_PATH.match(path)
+        if method == "POST" and ingestion_cancel_match:
+            return "200 OK", self.service.ingestion.cancel(
+                principal, ingestion_cancel_match.group(1)
+            )
+        ingestion_job_match = _INGESTION_JOB_PATH.match(path)
+        if method == "GET" and ingestion_job_match:
+            return "200 OK", self.service.ingestion.get(
+                principal, ingestion_job_match.group(1)
+            )
         if method == "POST" and path == "/v1/query":
             body = self._json_body(environ)
             result = self.service.rag.query(
@@ -208,18 +231,21 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     service = KnowledgeAssistantService(args.database)
+    service.start()
     application = KnowledgeAssistantApi(service)
-    with make_server(
-        args.host,
-        args.port,
-        application,
-        server_class=ThreadingWSGIServer,
-    ) as server:
-        LOGGER.info("Knowledge Assistant API listening on http://%s:%s", args.host, args.port)
-        try:
+    try:
+        with make_server(
+            args.host,
+            args.port,
+            application,
+            server_class=ThreadingWSGIServer,
+        ) as server:
+            LOGGER.info("Knowledge Assistant API listening on http://%s:%s", args.host, args.port)
             server.serve_forever()
-        except KeyboardInterrupt:
-            LOGGER.info("Knowledge Assistant API stopped")
+    except KeyboardInterrupt:
+        LOGGER.info("Knowledge Assistant API stopped")
+    finally:
+        service.close()
     return 0
 
 

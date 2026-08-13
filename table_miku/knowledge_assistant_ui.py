@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import stat
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -36,7 +41,9 @@ from PySide6.QtWidgets import (
 
 from .knowledge_assistant.auth import Principal
 from .knowledge_assistant.client import KnowledgeAssistantApiError
+from .knowledge_assistant.documents import MAX_DOCUMENT_BYTES
 from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
+from .knowledge_assistant_desktop import MAX_BATCH_FILES
 
 
 CONSOLE_STYLE = """
@@ -275,6 +282,193 @@ class UploadDocumentDialog(QDialog):
         super().accept()
 
 
+class BatchUploadDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("批量添加知识资料")
+        self.resize(760, 470)
+        self.setStyleSheet(CONSOLE_STYLE)
+        self._paths: list[Path] = []
+        self._file_snapshots: list[dict[str, int | str]] = []
+        layout = QVBoxLayout(self)
+        self.intro_label = QLabel(
+            f"这是当前 Editor 身份的直接写入，一次最多选择 {MAX_BATCH_FILES} 个文件，"
+            "无需审批。每个文件独立摄取，部分成功不会回滚；PDF 仅支持文本层，不支持 OCR。",
+            self,
+        )
+        self.intro_label.setWordWrap(True)
+        self.intro_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.intro_label)
+        choose = QPushButton("选择文件…", self)
+        choose.setObjectName("chooseIngestionFiles")
+        choose.clicked.connect(self._choose)
+        layout.addWidget(choose)
+        self.file_table = QTableWidget(0, 4, self)
+        self.file_table.setObjectName("batchUploadFiles")
+        self.file_table.setHorizontalHeaderLabels(
+            ["规范路径", "大小", "修改时间快照", "SHA-256 摘要"]
+        )
+        self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.file_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.file_table, 1)
+        self.count_label = QLabel("尚未选择文件。", self)
+        self.count_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.count_label)
+        form = QFormLayout()
+        self.collection_edit = QLineEdit("default", self)
+        self.collection_edit.setObjectName("batchUploadCollection")
+        form.addRow("目标集合", self.collection_edit)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        self.submit_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        self.submit_button.setText("加入摄取队列（0）")
+        cancel = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel.setDefault(True)
+        cancel.setFocus()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @property
+    def paths(self) -> list[Path]:
+        return list(self._paths)
+
+    @property
+    def file_snapshots(self) -> list[dict[str, int | str]]:
+        return [dict(item) for item in self._file_snapshots]
+
+    def _choose(self) -> None:
+        filenames, _selected_filter = QFileDialog.getOpenFileNames(
+            self,
+            "选择知识资料",
+            "",
+            "支持的文档 (*.txt *.md *.markdown *.rst *.json *.pdf);;所有文件 (*)",
+        )
+        if not filenames:
+            return
+        unique: list[Path] = []
+        snapshots: list[dict[str, int | str]] = []
+        seen: set[str] = set()
+        for filename in filenames:
+            try:
+                path, snapshot = self._snapshot(Path(filename))
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "文件不可读取",
+                    f"无法为所选文件建立安全快照，本次没有加入队列：{exc}",
+                )
+                return
+            key = str(path).casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append(path)
+                snapshots.append(snapshot)
+        if len(unique) > MAX_BATCH_FILES:
+            QMessageBox.warning(
+                self,
+                "文件过多",
+                f"一次最多选择 {MAX_BATCH_FILES} 个文件；本次没有加入队列。",
+            )
+            return
+        self._paths = unique
+        self._file_snapshots = snapshots
+        self.file_table.setRowCount(len(unique))
+        total = 0
+        for row, (path, snapshot) in enumerate(zip(unique, snapshots, strict=True)):
+            size = int(snapshot["size"])
+            total += size
+            self.file_table.setItem(row, 0, QTableWidgetItem(str(path)))
+            self.file_table.setItem(
+                row,
+                1,
+                QTableWidgetItem(f"{size:,} B"),
+            )
+            modified = datetime.fromtimestamp(
+                int(snapshot["mtime_ns"]) / 1_000_000_000
+            ).astimezone()
+            self.file_table.setItem(
+                row,
+                2,
+                QTableWidgetItem(
+                    f"{modified.isoformat(timespec='seconds')} (ns={snapshot['mtime_ns']})"
+                ),
+            )
+            digest = str(snapshot["sha256"])
+            digest_item = QTableWidgetItem(f"{digest[:16]}…")
+            digest_item.setToolTip(digest)
+            self.file_table.setItem(row, 3, digest_item)
+        self.count_label.setText(f"已选择 {len(unique)} 个文件，共 {total:,} 字节。")
+        self.submit_button.setText(f"加入摄取队列（{len(unique)}）")
+
+    def accept(self) -> None:
+        if not self._paths:
+            QMessageBox.warning(self, "尚未选择文件", "请先选择至少一个知识资料文件。")
+            return
+        if not self.collection_edit.text().strip():
+            QMessageBox.warning(self, "缺少集合", "请填写目标集合。")
+            return
+        try:
+            current = [self._snapshot(path)[1] for path in self._paths]
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "文件已变化", f"文件无法按确认快照读取：{exc}")
+            return
+        if current != self._file_snapshots:
+            QMessageBox.warning(
+                self,
+                "文件已变化",
+                "至少一个文件在预览后发生变化。本次没有加入队列，请重新选择并确认。",
+            )
+            return
+        super().accept()
+
+    @staticmethod
+    def _snapshot(path: Path) -> tuple[Path, dict[str, int | str]]:
+        resolved = Path(path).resolve(strict=True)
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("请选择普通文件")
+            if before.st_size > MAX_DOCUMENT_BYTES:
+                raise ValueError(f"文件超过 {MAX_DOCUMENT_BYTES} 字节上限")
+            bytes_read = 0
+            while chunk := handle.read(1024 * 1024):
+                bytes_read += len(chunk)
+                if bytes_read > MAX_DOCUMENT_BYTES:
+                    raise ValueError(f"文件超过 {MAX_DOCUMENT_BYTES} 字节上限")
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+        before_identity = (
+            int(before.st_dev),
+            int(before.st_ino),
+            int(before.st_size),
+            int(before.st_mtime_ns),
+        )
+        after_identity = (
+            int(after.st_dev),
+            int(after.st_ino),
+            int(after.st_size),
+            int(after.st_mtime_ns),
+        )
+        if before_identity != after_identity or bytes_read != int(after.st_size):
+            raise ValueError("文件在建立快照时发生变化")
+        return resolved, {
+            "canonical_path": str(resolved),
+            "size": int(after.st_size),
+            "mtime_ns": int(after.st_mtime_ns),
+            "device": int(after.st_dev),
+            "inode": int(after.st_ino),
+            "sha256": digest.hexdigest(),
+        }
+
+
 class IngestTaskDialog(QDialog):
     def __init__(
         self,
@@ -368,6 +562,24 @@ class KnowledgeAssistantDialog(QDialog):
         "rejected": "已拒绝",
         "expired": "已过期",
     }
+    _INGESTION_STATUS_LABELS = {
+        "queued": "等待处理",
+        "reading": "读取文件",
+        "persisted": "已安全保存",
+        "sending": "正在提交",
+        "running": "正在处理",
+        "cancelling": "取消请求中",
+        "succeeded": "已完成",
+        "failed": "失败",
+        "cancelled": "已取消",
+        "outcome_unknown": "结果待确认",
+        "cancel_rejected": "取消被拒，需核查",
+        "reconciliation_required": "需人工对账",
+        "unavailable": "恢复记录不可用",
+        "pending": "待安全重试",
+        "tracking": "等待状态确认",
+        "abandoned": "已明确放弃",
+    }
 
     def __init__(
         self,
@@ -386,6 +598,18 @@ class KnowledgeAssistantDialog(QDialog):
         self._ingest_task_draft: dict[str, Any] | None = None
         self._archive_task_draft: dict[str, Any] | None = None
         self._needs_refresh_on_show = False
+        self._ingestion_generation = 0
+        self._ingestion_items: dict[str, dict[str, Any]] = {}
+        self._ingestion_recovery: dict[str, dict[str, Any]] = {}
+        self._ingestion_coordinator = None
+        self._ingestion_unavailable_reason = ""
+        self._ingestion_views_active = True
+        try:
+            self._ingestion_coordinator = self.controller.create_ingestion_coordinator()
+        except Exception:
+            self._ingestion_unavailable_reason = (
+                "可恢复摄取暂不可用：需要 Windows DPAPI 和稳定的服务实例标识。"
+            )
         self.setObjectName("knowledgeAssistantDialog")
         self.setWindowTitle("Table Miku · Knowledge Assistant 管理台")
         self.resize(1180, 790)
@@ -393,7 +617,7 @@ class KnowledgeAssistantDialog(QDialog):
         self.setStyleSheet(CONSOLE_STYLE)
 
         root = QVBoxLayout(self)
-        self.title_label = QLabel("Knowledge Assistant 2.2 · 日常可信工作台", self)
+        self.title_label = QLabel("Knowledge Assistant 2.3 · 可恢复知识摄取工作台", self)
         self.title_label.setObjectName("knowledgeAssistantTitle")
         self.title_label.setFont(QFont("Microsoft YaHei UI", 16, QFont.Weight.Bold))
         root.addWidget(self.title_label)
@@ -436,6 +660,7 @@ class KnowledgeAssistantDialog(QDialog):
         self.tabs.addTab(self._build_query_tab(), "RAG 查询")
         self.tabs.addTab(self._build_tasks_tab(), "任务与审批")
         self.tabs.addTab(self._build_observability_tab(), "观测")
+        self.tabs.addTab(self._build_ingestion_tab(), "摄取中心")
         self.tabs.currentChanged.connect(self._tab_changed)
         self.tabs.setCurrentIndex(1)
         root.addWidget(self.tabs, 1)
@@ -452,6 +677,13 @@ class KnowledgeAssistantDialog(QDialog):
         root.addLayout(footer)
 
         self._update_action_permissions()
+        self._ingestion_timer = QTimer(self)
+        self._ingestion_timer.setInterval(2000)
+        self._ingestion_timer.timeout.connect(self._refresh_ingestion_jobs)
+        if self._ingestion_coordinator is not None:
+            self._ingestion_coordinator.updated.connect(self._on_ingestion_update)
+            self._ingestion_coordinator.recovery_updated.connect(self._on_recovery_update)
+            self._ingestion_coordinator.scan_recovery()
         self.refresh_all()
 
     def _build_identity_panel(self) -> QGroupBox:
@@ -497,9 +729,9 @@ class KnowledgeAssistantDialog(QDialog):
         actions = QHBoxLayout()
         refresh = QPushButton("刷新文档", tab)
         refresh.clicked.connect(self._refresh_documents)
-        self.upload_button = QPushButton("上传并索引…", tab)
+        self.upload_button = QPushButton("批量添加资料…", tab)
         self.upload_button.setObjectName("uploadDocument")
-        self.upload_button.clicked.connect(self._upload_document)
+        self.upload_button.clicked.connect(self._choose_batch_upload)
         self.archive_task_button = QPushButton("为所选文档创建归档审批任务", tab)
         self.archive_task_button.setObjectName("createArchiveTask")
         self.archive_task_button.clicked.connect(self._create_archive_task)
@@ -521,6 +753,63 @@ class KnowledgeAssistantDialog(QDialog):
         self.document_detail.setReadOnly(True)
         self.document_detail.setMaximumHeight(145)
         layout.addWidget(self.document_detail)
+        return tab
+
+    def _build_ingestion_tab(self) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        intro = QLabel(
+            "这里展示后台摄取和失败恢复。进度只显示真实阶段；“取消请求中”不等于已经取消。",
+            tab,
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(intro)
+        actions = QHBoxLayout()
+        refresh = QPushButton("刷新", tab)
+        refresh.clicked.connect(self._refresh_ingestion_jobs)
+        self.ingestion_cancel_button = QPushButton("取消所选任务", tab)
+        self.ingestion_cancel_button.setObjectName("cancelIngestion")
+        self.ingestion_cancel_button.clicked.connect(self._cancel_selected_ingestion)
+        self.ingestion_retry_button = QPushButton("安全重试原请求", tab)
+        self.ingestion_retry_button.setObjectName("retryIngestion")
+        self.ingestion_retry_button.clicked.connect(self._retry_selected_ingestion)
+        self.ingestion_abandon_button = QPushButton("放弃恢复记录", tab)
+        self.ingestion_abandon_button.setObjectName("abandonIngestionRecovery")
+        self.ingestion_abandon_button.clicked.connect(self._abandon_selected_recovery)
+        self.ingestion_filter = QComboBox(tab)
+        self.ingestion_filter.addItem("全部", "all")
+        self.ingestion_filter.addItem("进行中", "active")
+        self.ingestion_filter.addItem("失败与待确认", "attention")
+        self.ingestion_filter.currentIndexChanged.connect(self._render_ingestion_items)
+        actions.addWidget(refresh)
+        actions.addWidget(self.ingestion_cancel_button)
+        actions.addWidget(self.ingestion_retry_button)
+        actions.addWidget(self.ingestion_abandon_button)
+        actions.addStretch(1)
+        actions.addWidget(QLabel("筛选", tab))
+        actions.addWidget(self.ingestion_filter)
+        layout.addLayout(actions)
+        self.ingestion_table = self._table(
+            ["状态", "文件", "集合", "真实阶段/说明", "任务 ID"], tab
+        )
+        self.ingestion_table.setObjectName("ingestionTable")
+        self.ingestion_table.itemSelectionChanged.connect(self._ingestion_selected)
+        layout.addWidget(self.ingestion_table, 1)
+        self.ingestion_progress = QProgressBar(tab)
+        self.ingestion_progress.setObjectName("ingestionProgress")
+        self.ingestion_progress.setRange(0, 1)
+        self.ingestion_progress.setValue(0)
+        self.ingestion_progress.setFormat("没有进行中的摄取")
+        layout.addWidget(self.ingestion_progress)
+        self.ingestion_detail = QPlainTextEdit(tab)
+        self.ingestion_detail.setObjectName("ingestionDetail")
+        self.ingestion_detail.setReadOnly(True)
+        self.ingestion_detail.setMaximumHeight(150)
+        self.ingestion_detail.setPlainText(
+            self._ingestion_unavailable_reason or "选择一个摄取任务查看安全详情。"
+        )
+        layout.addWidget(self.ingestion_detail)
         return tab
 
     def _build_query_tab(self) -> QWidget:
@@ -867,6 +1156,7 @@ class KnowledgeAssistantDialog(QDialog):
         if not hasattr(self, "_active_principal"):
             return
         self._identity_dirty = True
+        self._ingestion_generation += 1
         self._clear_identity_scoped_views()
         self.tabs.setEnabled(False)
         self._update_role_summary()
@@ -884,6 +1174,7 @@ class KnowledgeAssistantDialog(QDialog):
             self._show_error("身份无效", exc)
             return
         self._active_principal = principal
+        self._ingestion_generation += 1
         self._identity_dirty = False
         self.tabs.setEnabled(True)
         self._clear_identity_scoped_views()
@@ -894,6 +1185,8 @@ class KnowledgeAssistantDialog(QDialog):
         )
         self._update_action_permissions()
         self.refresh_all()
+        if self._ingestion_coordinator is not None:
+            self._ingestion_coordinator.scan_recovery()
 
     def refresh_all(self) -> None:
         self._refresh_documents(show_error=False)
@@ -988,6 +1281,522 @@ class KnowledgeAssistantDialog(QDialog):
         self._refresh_documents(show_error=False)
         self._refresh_metrics(show_error=False)
         self._select_row(self.document_table, str(result.get("id") or ""))
+
+    def _choose_batch_upload(self) -> None:
+        coordinator = self._ingestion_coordinator
+        if coordinator is None:
+            self._show_error(
+                "可恢复摄取不可用",
+                OSError(self._ingestion_unavailable_reason or "本机安全存储不可用"),
+            )
+            return
+        dialog = BatchUploadDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            local_ids = coordinator.submit_files(
+                self._principal(),
+                dialog.paths,
+                collection_id=dialog.collection_edit.text().strip(),
+                generation=self._ingestion_generation,
+                expected_snapshots=dialog.file_snapshots,
+            )
+        except Exception as exc:
+            self._show_error("无法加入摄取队列", exc)
+            return
+        self.tabs.setCurrentIndex(4)
+        self._set_status(
+            f"已将 {len(local_ids)} 个文件加入后台摄取队列；关闭管理台后任务仍会继续。"
+        )
+
+    def _refresh_ingestion_jobs(self, _checked: bool = False) -> None:
+        del _checked
+        if self._identity_dirty or self._ingestion_coordinator is None:
+            return
+        self._ingestion_coordinator.refresh(
+            self._principal(), generation=self._ingestion_generation
+        )
+
+    def _on_ingestion_update(self, update: object) -> None:
+        if not self._ingestion_views_active:
+            return
+        if not isinstance(update, dict):
+            return
+        if int(update.get("generation", -1)) != self._ingestion_generation:
+            return
+        if update.get("principal_signature") != self._principal_signature(self._principal()):
+            return
+        status = str(update.get("status") or "")
+        if status == "snapshot":
+            jobs = update.get("jobs") if isinstance(update.get("jobs"), list) else []
+            server_items = {
+                f"job:{job_id}": self._safe_ingestion_server_item(item, job_id)
+                for item in jobs
+                if isinstance(item, dict)
+                and (job_id := str(item.get("id") or item.get("job_id") or "").strip())
+            }
+            server_job_ids = {
+                str(value.get("job_id") or "") for value in server_items.values()
+            }
+            recovery_items: dict[str, dict[str, Any]] = {}
+            for entry_id, record in self._ingestion_recovery.items():
+                recovery_job_id = str(record.get("job_id") or "")
+                server_key = f"job:{recovery_job_id}" if recovery_job_id else ""
+                if server_key and server_key in server_items:
+                    server_items[server_key]["entry_id"] = entry_id
+                    server_items[server_key]["cancel_delivery_state"] = str(
+                        record.get("cancel_delivery_state") or "none"
+                    )
+                else:
+                    recovery_items[entry_id] = dict(record)
+            local_attention = {
+                key: value
+                for key, value in self._ingestion_items.items()
+                if (
+                    (
+                        str(value.get("status"))
+                        in {
+                            "outcome_unknown",
+                            "cancel_rejected",
+                            "reconciliation_required",
+                            "unavailable",
+                            "pending",
+                            "tracking",
+                        }
+                        and str(value.get("job_id") or "") not in server_job_ids
+                    )
+                    or (
+                        key.startswith("local-")
+                        and str(value.get("job_id") or "") not in server_job_ids
+                    )
+                )
+            }
+            self._ingestion_items = {
+                **recovery_items,
+                **local_attention,
+                **server_items,
+            }
+        elif status == "poll_failed":
+            self._set_status(str(update.get("message") or "摄取任务刷新失败"), error=True)
+            return
+        else:
+            key_value = update.get("local_id") or update.get("entry_id")
+            if not key_value and update.get("job_id"):
+                key_value = f"job:{update['job_id']}"
+            if not key_value:
+                return
+            key = str(key_value)
+            existing = self._ingestion_items.get(key, {})
+            merged = {**existing, **update}
+            if merged.get("job_id") and not merged.get("requested_by"):
+                merged["requested_by"] = self._principal().user_id
+            if status == "abandoned":
+                self._ingestion_items.pop(key, None)
+                entry_id = str(update.get("entry_id") or "")
+                self._ingestion_recovery.pop(entry_id, None)
+            else:
+                self._ingestion_items[key] = merged
+                if key in self._ingestion_recovery or key.startswith("outbox-"):
+                    self._ingestion_recovery[key] = dict(merged)
+        self._render_ingestion_items()
+
+    @classmethod
+    def _safe_ingestion_server_item(
+        cls,
+        item: dict[str, Any],
+        job_id: str,
+    ) -> dict[str, Any]:
+        progress_value = item.get("progress")
+        progress = dict(progress_value) if isinstance(progress_value, dict) else {}
+        safe = {
+            "job_id": job_id,
+            "requested_by": str(item.get("requested_by") or ""),
+            "filename": str(item.get("filename") or ""),
+            "collection_id": str(item.get("collection_id") or ""),
+            "status": str(item.get("status") or "queued"),
+            "progress": {
+                "phase": str(progress.get("phase") or ""),
+                "current": max(0, int(progress.get("current") or 0)),
+                "total": max(0, int(progress.get("total") or 0)),
+            },
+            "error_code": str(item.get("error_code") or ""),
+            "error_message": str(item.get("error_message") or ""),
+            "attempt_count": max(0, int(item.get("attempt_count") or 0)),
+            "max_attempts": max(0, int(item.get("max_attempts") or 0)),
+            "trace_id": str(item.get("trace_id") or ""),
+            "document_id": str(item.get("document_id") or ""),
+            "cancel_outcome": str(item.get("cancel_outcome") or ""),
+            "cancel_requested_at": str(item.get("cancel_requested_at") or ""),
+        }
+        safe["message"] = cls._ingestion_server_message(safe)
+        return safe
+
+    @staticmethod
+    def _ingestion_server_message(item: dict[str, Any]) -> str:
+        status = str(item.get("status") or "")
+        if status == "succeeded" and item.get("cancel_outcome") == "too_late":
+            return "取消过晚，文档已写入。"
+        error_message = str(item.get("error_message") or "").strip()
+        if status == "failed" and error_message:
+            return f"摄取失败：{error_message}"
+        return {
+            "queued": "服务端已接收，等待处理。",
+            "running": "服务端正在处理。",
+            "cancelling": "取消请求中；尚不能断言任务已取消。",
+            "succeeded": "摄取完成。",
+            "failed": "摄取失败；核查原因后请重新选择文件创建新任务。",
+            "cancelled": "服务端已确认取消。",
+            "cancel_rejected": "服务端已明确拒绝取消；请核查权限与任务状态。",
+            "reconciliation_required": "服务端未返回该跟踪任务；本地记录已保留。",
+        }.get(status, "任务状态已更新。")
+
+    def _on_recovery_update(self, records: object) -> None:
+        if not self._ingestion_views_active:
+            return
+        if not isinstance(records, list):
+            return
+        active = self._principal_signature(self._principal())
+        filtered: dict[str, dict[str, Any]] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            entry_id = str(record.get("entry_id") or "")
+            if not entry_id:
+                continue
+            if record.get("status") == "unavailable":
+                filtered[entry_id] = record
+                continue
+            principal = record.get("principal")
+            if not isinstance(principal, dict):
+                continue
+            signature = (
+                str(principal.get("tenant_id") or ""),
+                str(principal.get("user_id") or ""),
+                tuple(sorted(principal.get("roles") or [])),
+                (
+                    tuple(sorted(principal.get("collection_ids") or []))
+                    if principal.get("collection_ids") is not None
+                    else None
+                ),
+            )
+            if signature == active:
+                safe_record = dict(record)
+                safe_record["outbox_state"] = str(record.get("status") or "")
+                delivery_state = str(record.get("cancel_delivery_state") or "none")
+                if delivery_state == "rejected":
+                    safe_record["status"] = "cancel_rejected"
+                    safe_record["message"] = (
+                        "上次取消请求被明确拒绝；记录已保留，请核查后再决定。"
+                    )
+                elif delivery_state == "unknown":
+                    safe_record["status"] = "outcome_unknown"
+                    safe_record["message"] = "取消结果待确认；不会自动重新发送写操作。"
+                filtered[entry_id] = safe_record
+        self._ingestion_recovery = filtered
+        for entry_id in tuple(self._ingestion_items):
+            if entry_id.startswith("outbox-"):
+                self._ingestion_items.pop(entry_id, None)
+        for entry_id, record in filtered.items():
+            self._ingestion_items[entry_id] = dict(record)
+        self._render_ingestion_items()
+
+    def _render_ingestion_items(self, *_args) -> None:
+        if not hasattr(self, "ingestion_table"):
+            return
+        filter_name = str(self.ingestion_filter.currentData() or "all")
+        terminal = {"succeeded", "failed", "cancelled", "abandoned"}
+        attention = {
+            "failed",
+            "outcome_unknown",
+            "cancel_rejected",
+            "reconciliation_required",
+            "unavailable",
+            "pending",
+            "tracking",
+        }
+        visible: list[tuple[str, dict[str, Any]]] = []
+        for key, item in self._ingestion_items.items():
+            status = str(item.get("status") or "")
+            if filter_name == "active" and status in terminal | attention:
+                continue
+            if filter_name == "attention" and status not in attention:
+                continue
+            visible.append((key, item))
+        selected = self._selected_ingestion()
+        selected_key = selected[0] if selected is not None else ""
+        self.ingestion_table.setRowCount(len(visible))
+        for row, (key, item) in enumerate(visible):
+            status = str(item.get("status") or "")
+            values = (
+                self._INGESTION_STATUS_LABELS.get(status, status),
+                item.get("filename", ""),
+                item.get("collection_id", ""),
+                item.get("message", self._ingestion_server_message(item)),
+                item.get("job_id", ""),
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                if column == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, key)
+                self.ingestion_table.setItem(row, column, cell)
+        self._restore_selection(self.ingestion_table, selected_key)
+        self._ingestion_selected()
+
+    def _selected_ingestion(self) -> tuple[str, dict[str, Any]] | None:
+        row = self.ingestion_table.currentRow()
+        if row < 0:
+            return None
+        cell = self.ingestion_table.item(row, 0)
+        key = str(cell.data(Qt.ItemDataRole.UserRole) or "") if cell is not None else ""
+        item = self._ingestion_items.get(key)
+        return (key, item) if item is not None else None
+
+    def _ingestion_selected(self) -> None:
+        selected = self._selected_ingestion()
+        if selected is None:
+            self.ingestion_detail.setPlainText("选择一个摄取任务查看安全详情。")
+            self.ingestion_progress.setRange(0, 1)
+            self.ingestion_progress.setValue(0)
+            self.ingestion_progress.setFormat("选择任务查看真实阶段")
+            for button in (
+                self.ingestion_cancel_button,
+                self.ingestion_retry_button,
+                self.ingestion_abandon_button,
+            ):
+                button.setEnabled(False)
+            return
+        key, item = selected
+        status = str(item.get("status") or "")
+        progress_value = item.get("progress")
+        progress = progress_value if isinstance(progress_value, dict) else {}
+        phase = str(progress.get("phase") or status or "unknown")
+        current = max(0, int(progress.get("current") or 0))
+        total = max(0, int(progress.get("total") or 0))
+        if total:
+            self.ingestion_progress.setRange(0, total)
+            self.ingestion_progress.setValue(min(current, total))
+            self.ingestion_progress.setFormat(f"当前任务：{phase} · {current}/{total}")
+        else:
+            self.ingestion_progress.setRange(0, 1)
+            self.ingestion_progress.setValue(1 if status in {"succeeded", "failed", "cancelled"} else 0)
+            self.ingestion_progress.setFormat(f"当前任务阶段：{phase}")
+        cancel_receipt = (
+            "取消过晚，文档已写入。"
+            if status == "succeeded" and item.get("cancel_outcome") == "too_late"
+            else str(item.get("cancel_outcome") or "—")
+        )
+        delivery_label = {
+            "none": "未请求",
+            "requested": "已持久化，等待投递",
+            "delivered": "已投递，等待服务端终态",
+            "unknown": "投递结果待确认",
+            "rejected": "服务端明确拒绝",
+        }.get(str(item.get("cancel_delivery_state") or "none"), "未知")
+        self.ingestion_detail.setPlainText(
+            "\n".join(
+                (
+                    f"状态：{self._INGESTION_STATUS_LABELS.get(status, status)}",
+                    f"文件：{item.get('filename') or '—'}",
+                    f"集合：{item.get('collection_id') or '—'}",
+                    f"请求人：{item.get('requested_by') or '—'}",
+                    f"任务 ID：{item.get('job_id') or '—'}",
+                    f"恢复记录：{item.get('entry_id') or '—'}",
+                    f"阶段：{phase}",
+                    f"进度：{current}/{total}" if total else "进度：未提供计数",
+                    (
+                        f"尝试：{item.get('attempt_count') or 0}/"
+                        f"{item.get('max_attempts') or 0}"
+                    ),
+                    f"错误代码：{item.get('error_code') or '—'}",
+                    f"错误说明：{item.get('error_message') or '—'}",
+                    f"Trace：{item.get('trace_id') or '—'}",
+                    f"文档 ID：{item.get('document_id') or '—'}",
+                    f"取消结果：{cancel_receipt}",
+                    f"取消投递：{delivery_label}",
+                    f"说明：{item.get('message') or self._ingestion_server_message(item)}",
+                )
+            )
+        )
+        principal = self._principal()
+        can_write = "knowledge:write" in principal.permissions
+        job_id = str(item.get("job_id") or "")
+        requester = str(item.get("requested_by") or "")
+        local_or_recovery = not job_id and (
+            key.startswith("local-") or key.startswith("outbox-")
+        )
+        active = status in {
+            "queued",
+            "reading",
+            "persisted",
+            "sending",
+            "running",
+            "outcome_unknown",
+            "pending",
+            "cancel_rejected",
+        }
+        owns_request = local_or_recovery or requester == principal.user_id
+        can_cancel = can_write and active and owns_request and (local_or_recovery or bool(requester))
+        self.ingestion_cancel_button.setEnabled(can_cancel)
+        if not can_write:
+            cancel_reason = "当前身份没有 knowledge:write 写入权限，不能取消摄取。"
+        elif job_id and not requester:
+            cancel_reason = "任务没有可核验的发起人信息，已安全禁用取消。"
+        elif job_id and requester != principal.user_id:
+            cancel_reason = f"只有任务发起人 {requester} 可以取消该摄取任务。"
+        elif str(item.get("cancel_delivery_state") or "") == "rejected":
+            cancel_reason = "上次取消被明确拒绝；核查后可再次明确请求一次取消。"
+        elif not active:
+            cancel_reason = "任务不再处于可请求取消的状态。"
+        else:
+            cancel_reason = "查看精确取消预览后，可请求取消当前任务。"
+        self.ingestion_cancel_button.setToolTip(cancel_reason)
+        is_pending_request = str(item.get("outbox_state") or "pending") == "pending"
+        can_recover = (
+            can_write
+            and status in {"outcome_unknown", "pending"}
+            and is_pending_request
+            and not job_id
+        )
+        self.ingestion_retry_button.setEnabled(can_recover)
+        if str(item.get("outbox_state") or "") == "tracking":
+            retry_reason = "该记录已绑定服务端任务；请刷新状态或明确再次请求取消，不能重传原请求。"
+        elif can_recover:
+            retry_reason = "使用同一冻结内容和同一幂等键重试；不会创建新的请求意图。"
+        else:
+            retry_reason = "当前记录不允许重试原请求。"
+        self.ingestion_retry_button.setToolTip(retry_reason)
+        can_abandon = can_recover and bool(item.get("entry_id") or key)
+        self.ingestion_abandon_button.setEnabled(can_abandon)
+        if not can_write:
+            abandon_reason = "当前身份没有 knowledge:write 写入权限，不能放弃恢复记录。"
+        elif str(item.get("outbox_state") or "") == "tracking":
+            abandon_reason = "该记录已绑定服务端任务；请刷新状态或再次请求取消，不能当作未提交请求放弃。"
+        elif can_abandon:
+            abandon_reason = "明确删除本地恢复记录；不会自动重试，也不会撤销服务端可能已完成的写入。"
+        else:
+            abandon_reason = "只有尚未绑定服务端任务的待确认恢复记录可以明确放弃。"
+        self.ingestion_abandon_button.setToolTip(abandon_reason)
+
+    def _cancel_selected_ingestion(self) -> None:
+        selected = self._selected_ingestion()
+        if selected is None or self._ingestion_coordinator is None:
+            return
+        key, item = selected
+        if not self._confirm_ingestion_cancel(item):
+            return
+        job_id = str(item.get("job_id") or "")
+        if job_id:
+            item["status"] = "cancelling"
+            item["message"] = "取消请求中；尚不能断言任务已取消。"
+            self._ingestion_coordinator.request_cancel_job(
+                self._principal(), job_id, generation=self._ingestion_generation
+            )
+        elif str(item.get("status") or "") in {"outcome_unknown", "pending"}:
+            entry_id = str(item.get("entry_id") or (key if key.startswith("outbox-") else ""))
+            if not entry_id:
+                return
+            item["status"] = "cancelling"
+            item["message"] = "取消意图已保留，结果仍待确认。"
+            self._ingestion_coordinator.request_cancel_recovery(
+                self._principal(), entry_id, generation=self._ingestion_generation
+            )
+        else:
+            status = self._ingestion_coordinator.request_cancel_local(key)
+            item["status"] = status
+            item["message"] = (
+                "已在发送前取消。"
+                if status == "cancelled"
+                else "取消请求中；尚不能断言任务已取消。"
+            )
+        self._render_ingestion_items()
+
+    def _confirm_ingestion_cancel(self, item: dict[str, Any]) -> bool:
+        principal = self._principal()
+        job_id = str(item.get("job_id") or "")
+        status = str(item.get("status") or "")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setWindowTitle("核对取消摄取请求")
+        box.setText(
+            "\n".join(
+                (
+                    f"任务：{job_id or item.get('entry_id') or '本地待发送任务'}",
+                    f"文件：{item.get('filename') or '—'}",
+                    f"集合：{item.get('collection_id') or '—'}",
+                    f"当前身份：{principal.user_id}",
+                    f"当前状态：{self._INGESTION_STATUS_LABELS.get(status, status)}",
+                )
+            )
+        )
+        if status in {"outcome_unknown", "pending"} and not job_id:
+            consequence = (
+                "将持久化取消意图并继续核对原请求；不会宣称任务已经取消，也不会创建新请求。"
+            )
+        elif job_id:
+            consequence = (
+                "将请求服务端停止任务。任务可能在请求到达前完成；只有服务端确认后才算取消成功。"
+            )
+        else:
+            consequence = (
+                "若请求尚未发送，将停止并清理本地记录；若已经发送，只能请求服务端取消。"
+            )
+        box.setInformativeText(consequence)
+        cancel_action = box.addButton("请求取消", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("保留任务", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() is cancel_action
+
+    def _retry_selected_ingestion(self) -> None:
+        selected = self._selected_ingestion()
+        if selected is None or self._ingestion_coordinator is None:
+            return
+        key, item = selected
+        entry_id = str(item.get("entry_id") or (key if key.startswith("outbox-") else ""))
+        box = QMessageBox(self)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setWindowTitle("确认安全重试")
+        if not entry_id:
+            return
+        box.setText("使用已加密保留的原内容和原幂等键重试？")
+        box.setInformativeText("不会重新读取原文件，也不会创建新意图。")
+        retry = box.addButton("确认重试", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("暂不处理", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        if box.clickedButton() is not retry:
+            return
+        self._ingestion_coordinator.safe_replay(
+            self._principal(), entry_id, generation=self._ingestion_generation
+        )
+
+    def _abandon_selected_recovery(self) -> None:
+        selected = self._selected_ingestion()
+        if selected is None or self._ingestion_coordinator is None:
+            return
+        key, item = selected
+        entry_id = str(item.get("entry_id") or (key if key.startswith("outbox-") else ""))
+        if not entry_id:
+            return
+        box = QMessageBox(self)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setWindowTitle("保留还是放弃恢复记录")
+        box.setText("明确放弃该结果待确认的请求？")
+        box.setInformativeText(
+            "放弃不会撤回可能已经发生的服务端写入；以后使用新请求可能产生重复结果。"
+        )
+        abandon = box.addButton("明确放弃", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("保留待处理", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        if box.clickedButton() is abandon:
+            self._ingestion_coordinator.abandon_recovery(
+                self._principal(), entry_id, generation=self._ingestion_generation
+            )
 
     def _document_selected(self) -> None:
         document = self._selected_document()
@@ -1864,11 +2673,24 @@ class KnowledgeAssistantDialog(QDialog):
         self.trace_detail.clear()
         self.reject_reason_edit.clear()
         self._clear_metrics("身份已改变，等待刷新")
+        self._ingestion_items = {}
+        self._ingestion_recovery = {}
+        if hasattr(self, "ingestion_table"):
+            self.ingestion_table.setRowCount(0)
+            self.ingestion_detail.clear()
         self._set_status("受保护视图已清空。")
 
     def _tab_changed(self, index: int) -> None:
         if index != 2 and self._approval_preview is not None:
             self._defer_preview()
+        if hasattr(self, "_ingestion_timer"):
+            if index == 4 and self.isVisible() and not self._identity_dirty:
+                self._ingestion_timer.start()
+                self._refresh_ingestion_jobs()
+                if self._ingestion_coordinator is not None:
+                    self._ingestion_coordinator.scan_recovery()
+            else:
+                self._ingestion_timer.stop()
 
     def _defer_preview(self) -> None:
         if self._approval_preview is None:
@@ -1979,11 +2801,16 @@ class KnowledgeAssistantDialog(QDialog):
             and archive_retry.get("principal_signature")
             == self._principal_signature(principal)
         )
-        self.upload_button.setEnabled(can_write)
+        ingestion_available = self._ingestion_coordinator is not None
+        self.upload_button.setEnabled(can_write and ingestion_available)
         self.upload_button.setToolTip(
-            "上传并索引文档。"
-            if can_write
-            else "当前 Viewer 没有上传权限；请使用 Editor 身份。"
+            "选择最多 20 个文件，加入可恢复的后台摄取队列。"
+            if can_write and ingestion_available
+            else (
+                self._ingestion_unavailable_reason
+                if can_write
+                else "当前 Viewer 没有上传权限；请使用 Editor 身份。"
+            )
         )
         self.archive_task_button.setText(
             "重试/处理未确认归档任务"
@@ -2101,11 +2928,15 @@ class KnowledgeAssistantDialog(QDialog):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
+        self._ingestion_views_active = False
+        if hasattr(self, "_ingestion_timer"):
+            self._ingestion_timer.stop()
         self._clear_identity_scoped_views()
         self._needs_refresh_on_show = True
         super().closeEvent(event)
 
     def showEvent(self, event) -> None:
+        self._ingestion_views_active = True
         super().showEvent(event)
         if self._needs_refresh_on_show:
             self._needs_refresh_on_show = False
@@ -2113,3 +2944,19 @@ class KnowledgeAssistantDialog(QDialog):
                 self._set_status("身份字段尚未应用；受保护视图保持清空，请先应用身份。")
             else:
                 self.refresh_all()
+        if (
+            hasattr(self, "_ingestion_timer")
+            and self.tabs.currentIndex() == 4
+            and not self._identity_dirty
+        ):
+            self._ingestion_timer.start()
+            self._refresh_ingestion_jobs()
+            if self._ingestion_coordinator is not None:
+                self._ingestion_coordinator.scan_recovery()
+
+    def shutdown_ingestion(self, timeout_ms: int = 2000) -> bool:
+        """Stop desktop ingestion workers before closing the owned API endpoint."""
+        if hasattr(self, "_ingestion_timer"):
+            self._ingestion_timer.stop()
+        coordinator = self._ingestion_coordinator
+        return True if coordinator is None else coordinator.shutdown(timeout_ms)

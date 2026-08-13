@@ -352,6 +352,106 @@ def test_pdf_parser_rejects_excessive_page_count():
         DocumentParser().parse("too-many-pages.pdf", output.getvalue())
 
 
+def test_pdf_parser_checks_cancel_between_pages(monkeypatch: pytest.MonkeyPatch):
+    extracted: list[int] = []
+    checks = 0
+
+    class Page:
+        def __init__(self, number: int) -> None:
+            self.number = number
+
+        def extract_text(self, *, visitor_text=None) -> str:
+            extracted.append(self.number)
+            text = f"page {self.number}"
+            if visitor_text is not None:
+                visitor_text(text, None, None, None, None)
+            return text
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page(1), Page(2), Page(3)]
+
+    def check_cancel() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("cancelled at a page boundary")
+
+    monkeypatch.setattr("pypdf.PdfReader", lambda _stream: Reader())
+
+    with pytest.raises(RuntimeError, match="page boundary"):
+        DocumentParser().parse(
+            "cancel.pdf",
+            b"%PDF fake",
+            cancel_check=check_cancel,
+            max_extracted_characters=1_000,
+        )
+
+    assert extracted == [1]
+
+
+def test_pdf_parser_stops_when_cumulative_extracted_text_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    extracted: list[int] = []
+
+    class Page:
+        def __init__(self, number: int) -> None:
+            self.number = number
+
+        def extract_text(self, *, visitor_text=None) -> str:
+            extracted.append(self.number)
+            text = "1234"
+            if visitor_text is not None:
+                visitor_text(text, None, None, None, None)
+            return text
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page(1), Page(2), Page(3)]
+
+    monkeypatch.setattr("pypdf.PdfReader", lambda _stream: Reader())
+
+    with pytest.raises(ValueError, match="extracted text limit"):
+        DocumentParser().parse(
+            "bounded.pdf",
+            b"%PDF fake",
+            max_extracted_characters=5,
+        )
+
+    assert extracted == [1, 2]
+
+
+def test_pdf_parser_stops_inside_one_page_after_multiple_fragments_exceed_limit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    visited: list[str] = []
+
+    class Page:
+        @staticmethod
+        def extract_text(*, visitor_text=None) -> str:
+            for fragment in ("123", "456", "must-not-run"):
+                visited.append(fragment)
+                if visitor_text is not None:
+                    visitor_text(fragment, None, None, None, None)
+            return "123456must-not-run"
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page()]
+
+    monkeypatch.setattr("pypdf.PdfReader", lambda _stream: Reader())
+
+    with pytest.raises(ValueError, match="extracted text limit"):
+        DocumentParser().parse(
+            "one-large-page.pdf",
+            b"%PDF fake",
+            max_extracted_characters=5,
+        )
+
+    assert visited == ["123", "456"]
+
+
 def test_chunker_rejects_empty_units():
     with pytest.raises(ValueError, match="indexable"):
         TextChunker().split([ParsedUnit(text="   ")])

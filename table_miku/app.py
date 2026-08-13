@@ -1190,7 +1190,7 @@ class TableMiku(QWidget):
         agent_center_action.triggered.connect(self.show_agent_center)
         knowledge_assistant_action.triggered.connect(self.show_knowledge_assistant)
         pomodoro_action.triggered.connect(self.toggle_pomodoro)
-        quit_action.triggered.connect(QApplication.instance().quit)
+        quit_action.triggered.connect(self._request_quit)
         for action in (
             show_action,
             review_action,
@@ -1364,7 +1364,7 @@ class TableMiku(QWidget):
         startup_action.triggered.connect(self.toggle_startup)
         toggle_monitor_action.triggered.connect(self.toggle_system_monitor)
         toggle_action.triggered.connect(self.toggle_reminders)
-        quit_action.triggered.connect(QApplication.instance().quit)
+        quit_action.triggered.connect(self._request_quit)
 
         review_action = QAction("今日复习", self)
         review_action.triggered.connect(self.show_due_reviews)
@@ -1640,12 +1640,36 @@ class TableMiku(QWidget):
         self._knowledge_assistant_dialog.raise_()
         self._knowledge_assistant_dialog.activateWindow()
 
-    def _shutdown_knowledge_assistant(self) -> None:
+    def _shutdown_knowledge_assistant(self) -> bool:
         if self._knowledge_assistant_dialog is None:
-            return
-        self._knowledge_assistant_dialog.controller.close()
-        self._knowledge_assistant_dialog.close()
+            return True
+        dialog = self._knowledge_assistant_dialog
+        try:
+            closed = dialog.controller.close()
+        except Exception as exc:
+            safe_detail = str(exc).translate(str.maketrans({"<": "＜", ">": "＞", "&": "＆"}))
+            self.pet.set_expression("surprised")
+            self.say(f"企业知识助手安全关闭失败，管理台仍保留：{safe_detail}")
+            return False
+        if closed is False:
+            self.pet.set_expression("surprised")
+            self.say(
+                "企业知识助手后台摄取仍在结束，未在安全时限内关闭；"
+                "管理台仍保留，请稍后重试关闭。"
+            )
+            return False
+        dialog.close()
         self._knowledge_assistant_dialog = None
+        return True
+
+    def _request_quit(self) -> bool:
+        """Quit only after the Knowledge Assistant worker and endpoint stop safely."""
+        if not self._shutdown_knowledge_assistant():
+            return False
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+        return True
 
     def toggle_ai_agent(self) -> None:
         self.settings = load_settings()

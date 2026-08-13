@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from .auth import ConflictError, Principal, ResourceNotFound
 from .database import AssistantDatabase
@@ -49,8 +49,25 @@ class DocumentChunk:
     page_number: int | None = None
 
 
+@dataclass(frozen=True)
+class PreparedDocument:
+    """Parsed and embedded document data with no database side effects."""
+
+    content_type: str
+    embedded: tuple[tuple[DocumentChunk, bytes], ...]
+
+
 class DocumentParser:
-    def parse(self, filename: str, content: bytes) -> tuple[str, list[ParsedUnit]]:
+    def parse(
+        self,
+        filename: str,
+        content: bytes,
+        *,
+        cancel_check: Callable[[], None] | None = None,
+        max_extracted_characters: int | None = None,
+    ) -> tuple[str, list[ParsedUnit]]:
+        check = cancel_check or (lambda: None)
+        check()
         safe_name = self.safe_filename(filename)
         if not content:
             raise ValueError("document must not be empty")
@@ -61,14 +78,21 @@ class DocumentParser:
             raise ValueError(f"unsupported document type: {suffix or '<none>'}")
         content_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
         if suffix == ".pdf":
-            return "application/pdf", self._parse_pdf(content)
+            return "application/pdf", self._parse_pdf(
+                content,
+                cancel_check=check,
+                max_extracted_characters=max_extracted_characters,
+            )
         text = self._decode_text(content)
+        self._check_extracted_limit(text, max_extracted_characters)
+        check()
         if suffix == ".json":
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"invalid JSON document at line {exc.lineno}") from exc
             text = json.dumps(payload, ensure_ascii=False, indent=2)
+            self._check_extracted_limit(text, max_extracted_characters)
             content_type = "application/json"
         if suffix in {".md", ".markdown"}:
             return content_type, self._parse_markdown(text)
@@ -82,7 +106,14 @@ class DocumentParser:
             raise ValueError("filename must be a plain file name without a path")
         if any(character in path.name for character in ("\x00", "\r", "\n")):
             raise ValueError("filename contains invalid characters")
-        return path.name[:240]
+        if len(path.name) > 240:
+            raise ValueError("filename must not exceed 240 characters")
+        return path.name
+
+    @staticmethod
+    def _check_extracted_limit(text: str, maximum: int | None) -> None:
+        if maximum is not None and len(text) > maximum:
+            raise ValueError("document exceeds the extracted text limit")
 
     @staticmethod
     def _decode_text(content: bytes) -> str:
@@ -114,7 +145,13 @@ class DocumentParser:
         return units or [ParsedUnit(text=text.strip())]
 
     @staticmethod
-    def _parse_pdf(content: bytes) -> list[ParsedUnit]:
+    def _parse_pdf(
+        content: bytes,
+        *,
+        cancel_check: Callable[[], None] | None = None,
+        max_extracted_characters: int | None = None,
+    ) -> list[ParsedUnit]:
+        check = cancel_check or (lambda: None)
         try:
             from pypdf import PdfReader
         except ImportError as exc:
@@ -132,12 +169,44 @@ class DocumentParser:
         if len(reader.pages) > MAX_PDF_PAGES:
             raise ValueError(f"PDF exceeds the {MAX_PDF_PAGES} page limit")
         units = []
+        extracted_characters = 0
         for page_number, page in enumerate(reader.pages, start=1):
+            # Cancellation is checked at page boundaries. pypdf's visitor callback also lets
+            # us abort text growth inside a page before accepting its complete return value.
+            if page_number > 1:
+                check()
+            limit_error: ValueError | None = None
+            page_extracted_characters = 0
+
+            def visit_text(fragment: str, *_args: Any) -> None:
+                nonlocal limit_error, page_extracted_characters
+                page_extracted_characters += len(fragment)
+                if (
+                    max_extracted_characters is not None
+                    and extracted_characters + page_extracted_characters
+                    > max_extracted_characters
+                ):
+                    limit_error = ValueError("document exceeds the extracted text limit")
+                    raise limit_error
+
             try:
-                text = (page.extract_text() or "").strip()
+                extract_kwargs = (
+                    {"visitor_text": visit_text}
+                    if max_extracted_characters is not None
+                    else {}
+                )
+                text = (page.extract_text(**extract_kwargs) or "").strip()
             except Exception as exc:
+                if limit_error is not None:
+                    raise limit_error from exc
                 raise ValueError(f"failed to extract PDF page {page_number}") from exc
             if text:
+                extracted_characters += len(text)
+                if (
+                    max_extracted_characters is not None
+                    and extracted_characters > max_extracted_characters
+                ):
+                    raise ValueError("document exceeds the extracted text limit")
                 units.append(ParsedUnit(text=text, page_number=page_number))
         if not units:
             raise ValueError("PDF does not contain extractable text; OCR is not enabled")
@@ -207,6 +276,124 @@ class DocumentService:
         self.traces = traces
         self.parser = parser or DocumentParser()
         self.chunker = chunker or TextChunker()
+
+    def prepare_index(
+        self,
+        filename: str,
+        content: bytes,
+        *,
+        max_extracted_characters: int,
+        max_chunks: int,
+        cancel_check: Callable[[], None] | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> PreparedDocument:
+        """Prepare an index result without reserving or mutating database rows."""
+
+        check = cancel_check or (lambda: None)
+        report = progress or (lambda _phase, _current, _total: None)
+        check()
+        content_type, units = self.parser.parse(
+            filename,
+            content,
+            cancel_check=check,
+            max_extracted_characters=max_extracted_characters,
+        )
+        extracted_characters = sum(len(unit.text) for unit in units)
+        if extracted_characters > max_extracted_characters:
+            raise ValueError("document exceeds the extracted text limit")
+        report("parsed", extracted_characters, max(1, extracted_characters))
+        check()
+        chunks = self.chunker.split(units)
+        if len(chunks) > max_chunks:
+            raise ValueError("document exceeds the chunk count limit")
+        report("embedding", 0, len(chunks))
+        embedded: list[tuple[DocumentChunk, bytes]] = []
+        for index, chunk in enumerate(chunks, start=1):
+            check()
+            embedded.append((chunk, self.embedding.pack(self.embedding.embed(chunk.content))))
+            report("embedding", index, len(chunks))
+        check()
+        return PreparedDocument(content_type=content_type, embedded=tuple(embedded))
+
+    def persist_prepared(
+        self,
+        conn: sqlite3.Connection,
+        principal: Principal,
+        *,
+        filename: str,
+        content: bytes,
+        collection_id: str,
+        checksum: str,
+        prepared: PreparedDocument,
+    ) -> tuple[str, bool]:
+        """Persist prepared data in the caller's transaction and return id/dedup status."""
+
+        now = utc_now()
+        existing = conn.execute(
+            "SELECT id, status FROM documents WHERE tenant_id = ? AND collection_id = ? "
+            "AND checksum = ? AND archived = 0",
+            (principal.tenant_id, collection_id, checksum),
+        ).fetchone()
+        if existing is not None and existing["status"] == "indexed":
+            return str(existing["id"]), True
+        if existing is not None and existing["status"] == "processing":
+            raise ConflictError("the same document is already being processed")
+        document_id = str(existing["id"]) if existing is not None else f"doc-{uuid.uuid4().hex}"
+        if existing is None:
+            conn.execute(
+                "INSERT INTO documents(id, tenant_id, collection_id, filename, content_type, checksum, "
+                "byte_size, status, created_by, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, 'indexed', ?, ?, ?)",
+                (
+                    document_id,
+                    principal.tenant_id,
+                    collection_id,
+                    filename,
+                    prepared.content_type,
+                    checksum,
+                    len(content),
+                    principal.user_id,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+            conn.execute(
+                "UPDATE documents SET filename = ?, content_type = ?, byte_size = ?, status = 'indexed', "
+                "error = '', created_by = ?, updated_at = ? WHERE id = ?",
+                (filename, prepared.content_type, len(content), principal.user_id, now, document_id),
+            )
+        conn.execute(
+            "INSERT INTO document_blobs(document_id, content) VALUES(?, ?) "
+            "ON CONFLICT(document_id) DO UPDATE SET content = excluded.content",
+            (document_id, content),
+        )
+        conn.executemany(
+            "INSERT INTO chunks(id, document_id, tenant_id, collection_id, ordinal, heading, page_number, "
+            "content, content_hash, embedding, embedding_model, embedding_dimension, token_count, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    f"chunk-{uuid.uuid4().hex}",
+                    document_id,
+                    principal.tenant_id,
+                    collection_id,
+                    chunk.ordinal,
+                    chunk.heading,
+                    chunk.page_number,
+                    chunk.content,
+                    hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
+                    blob,
+                    self.embedding.name,
+                    self.embedding.dimension,
+                    estimate_tokens(chunk.content),
+                    now,
+                )
+                for chunk, blob in prepared.embedded
+            ],
+        )
+        return document_id, False
 
     def upload(
         self,

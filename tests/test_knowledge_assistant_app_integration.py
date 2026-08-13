@@ -103,3 +103,76 @@ def test_app_cleans_controller_when_console_construction_fails(monkeypatch):
     assert host._knowledge_assistant_dialog is None
     assert host.pet.expressions == ["surprised"]
     assert host.messages == ["企业知识助手管理台启动失败：synthetic dialog failure"]
+
+
+def test_app_keeps_console_alive_when_ingestion_worker_cannot_stop_safely():
+    host = _host()
+
+    class Controller:
+        close_count = 0
+
+        def close(self) -> bool:
+            self.close_count += 1
+            return False
+
+    class Dialog:
+        def __init__(self) -> None:
+            self.controller = Controller()
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    dialog = Dialog()
+    host._knowledge_assistant_dialog = dialog
+
+    result = app_module.TableMiku._shutdown_knowledge_assistant(host)
+
+    assert result is False
+    assert dialog.controller.close_count == 1
+    assert dialog.close_count == 0
+    assert host._knowledge_assistant_dialog is dialog
+    assert host.pet.expressions == ["surprised"]
+    assert "后台摄取仍在结束" in host.messages[-1]
+
+
+def test_app_keeps_console_alive_when_shutdown_raises():
+    host = _host()
+
+    class Controller:
+        @staticmethod
+        def close() -> bool:
+            raise RuntimeError("synthetic shutdown failure")
+
+    class Dialog:
+        controller = Controller()
+        close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    dialog = Dialog()
+    host._knowledge_assistant_dialog = dialog
+
+    result = app_module.TableMiku._shutdown_knowledge_assistant(host)
+
+    assert result is False
+    assert dialog.close_count == 0
+    assert host._knowledge_assistant_dialog is dialog
+    assert host.pet.expressions == ["surprised"]
+    assert "synthetic shutdown failure" in host.messages[-1]
+
+
+def test_quit_is_not_requested_until_knowledge_assistant_stops(monkeypatch):
+    host = _host()
+    quit_calls: list[str] = []
+    fake_app = SimpleNamespace(quit=lambda: quit_calls.append("quit"))
+    monkeypatch.setattr(app_module.QApplication, "instance", lambda: fake_app)
+    host._shutdown_knowledge_assistant = lambda: False
+
+    assert app_module.TableMiku._request_quit(host) is False
+    assert quit_calls == []
+
+    host._shutdown_knowledge_assistant = lambda: True
+    assert app_module.TableMiku._request_quit(host) is True
+    assert quit_calls == ["quit"]

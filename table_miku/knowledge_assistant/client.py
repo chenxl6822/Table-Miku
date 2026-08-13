@@ -94,6 +94,55 @@ class KnowledgeAssistantApiClient:
             "document",
         )
 
+    def create_ingestion_job(
+        self,
+        principal: Principal,
+        *,
+        filename: str,
+        content: bytes,
+        collection_id: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self._validated_resource(
+            self._request(
+                "POST",
+                "/v1/ingestion-jobs",
+                principal=principal,
+                body={
+                    "filename": filename,
+                    "collection_id": collection_id,
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                },
+                idempotency_key=idempotency_key,
+            ),
+            "ingestion job",
+        )
+
+    def list_ingestion_jobs(self, principal: Principal) -> list[dict[str, Any]]:
+        payload = self._request("GET", "/v1/ingestion-jobs", principal=principal)
+        return self._validated_items(payload.get("items"), "ingestion jobs")
+
+    def get_ingestion_job(self, principal: Principal, job_id: str) -> dict[str, Any]:
+        return self._validated_resource(
+            self._request(
+                "GET",
+                f"/v1/ingestion-jobs/{quote(job_id, safe='')}",
+                principal=principal,
+            ),
+            "ingestion job",
+        )
+
+    def cancel_ingestion_job(self, principal: Principal, job_id: str) -> dict[str, Any]:
+        return self._validated_resource(
+            self._request(
+                "POST",
+                f"/v1/ingestion-jobs/{quote(job_id, safe='')}/cancel",
+                principal=principal,
+                body={},
+            ),
+            "ingestion job",
+        )
+
     def query(
         self,
         principal: Principal,
@@ -209,6 +258,7 @@ class KnowledgeAssistantApiClient:
                 }
             )
             if principal.collection_ids is not None:
+                headers["X-Collection-Scope"] = "restricted"
                 headers["X-Collection-IDs"] = ",".join(sorted(principal.collection_ids))
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import threading
 import stat
 from contextlib import contextmanager
@@ -24,6 +25,41 @@ from table_miku.knowledge_assistant_desktop import (
     KnowledgeAssistantDesktopController,
     ManagedKnowledgeAssistantEndpoint,
 )
+from table_miku.knowledge_assistant.auth import Principal
+
+
+def test_client_ingestion_job_contract_uses_bounded_json_routes(monkeypatch):
+    client = KnowledgeAssistantApiClient("http://127.0.0.1:8080", "token")
+    principal = KnowledgeAssistantDesktopController.principal(
+        "tenant-a", "editor-a", "editor", "engineering"
+    )
+    calls: list[tuple[str, str, dict]] = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if method == "GET" and path == "/v1/ingestion-jobs":
+            return {"items": [{"id": "ingest-1", "status": "queued"}]}
+        return {"id": "ingest-1", "status": "queued"}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    created = client.create_ingestion_job(
+        principal,
+        filename="safe.md",
+        content=b"exact bytes",
+        collection_id="engineering",
+        idempotency_key="client-ingestion-001",
+    )
+    listed = client.list_ingestion_jobs(principal)
+    fetched = client.get_ingestion_job(principal, "ingest-1")
+    cancelled = client.cancel_ingestion_job(principal, "ingest-1")
+
+    assert created["id"] == listed[0]["id"] == fetched["id"] == cancelled["id"]
+    assert calls[0][0:2] == ("POST", "/v1/ingestion-jobs")
+    assert base64.b64decode(calls[0][2]["body"]["content_base64"], validate=True) == b"exact bytes"
+    assert calls[0][2]["idempotency_key"] == "client-ingestion-001"
+    assert calls[2][1] == "/v1/ingestion-jobs/ingest-1"
+    assert calls[3][1] == "/v1/ingestion-jobs/ingest-1/cancel"
 
 
 @contextmanager
@@ -32,9 +68,12 @@ def _response_server(
     *,
     headers: dict[str, str] | None = None,
     status: int = 200,
+    request_headers: dict[str, str] | None = None,
 ) -> Iterator[str]:
     class Handler(BaseHTTPRequestHandler):
         def _respond(self):
+            if request_headers is not None:
+                request_headers.update(dict(self.headers.items()))
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             for key, value in (headers or {}).items():
@@ -67,6 +106,22 @@ def _response_server(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_client_round_trips_empty_collection_scope_as_explicit_deny_all():
+    captured: dict[str, str] = {}
+    with _response_server(b'{"items":[]}', request_headers=captured) as base_url:
+        client = KnowledgeAssistantApiClient(base_url, "token")
+        principal = Principal(
+            tenant_id="tenant-a",
+            user_id="viewer-a",
+            roles=frozenset({"viewer"}),
+            collection_ids=frozenset(),
+        )
+
+        assert client.list_documents(principal) == []
+
+    assert captured["X-Collection-Scope"] == "restricted"
 
 
 def test_client_rejects_unsafe_or_ambiguous_base_urls():
@@ -639,7 +694,7 @@ def test_explicit_external_endpoint_uses_short_health_timeout(
 
         def health(self) -> dict[str, str]:
             observed_health_timeouts.append(self.timeout_seconds)
-            return {"status": "ok"}
+            return {"status": "ok", "service_instance_id": "external-instance-1"}
 
     monkeypatch.setenv("KNOWLEDGE_ASSISTANT_DESKTOP_URL", "https://knowledge.example.test")
     monkeypatch.setenv("KNOWLEDGE_ASSISTANT_API_TOKEN", "synthetic-external-token")
@@ -648,10 +703,38 @@ def test_explicit_external_endpoint_uses_short_health_timeout(
     endpoint = ManagedKnowledgeAssistantEndpoint()
     try:
         assert endpoint.mode == "external"
+        assert endpoint.service_instance_id == "external-instance-1"
+        assert endpoint.recovery_binding_id.startswith("external-")
         assert observed_health_timeouts
         assert max(observed_health_timeouts) <= 5.0
     finally:
         endpoint.close()
+
+
+def test_explicit_external_endpoint_without_stable_instance_id_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MissingInstanceClient:
+        def __init__(
+            self,
+            base_url: str,
+            api_token: str,
+            *,
+            timeout_seconds: float = 60.0,
+        ) -> None:
+            del api_token, timeout_seconds
+            self.base_url = base_url
+
+        @staticmethod
+        def health() -> dict[str, str]:
+            return {"status": "ok"}
+
+    monkeypatch.setenv("KNOWLEDGE_ASSISTANT_DESKTOP_URL", "https://knowledge.example.test")
+    monkeypatch.setenv("KNOWLEDGE_ASSISTANT_API_TOKEN", "synthetic-external-token")
+    monkeypatch.setattr(desktop_module, "KnowledgeAssistantApiClient", MissingInstanceClient)
+
+    with pytest.raises(ValueError, match="service_instance_id"):
+        ManagedKnowledgeAssistantEndpoint()
 
 
 def test_default_endpoint_refuses_implicit_healthy_8080_without_sending_token(
