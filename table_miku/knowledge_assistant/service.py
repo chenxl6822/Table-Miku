@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from .database import AssistantDatabase
+from .database import SCHEMA_VERSION, AssistantDatabase
 from .documents import DocumentService
 from .embeddings import HashingEmbedding
+from .ingestion import IngestionService
 from .observability import TraceRecorder
 from .rag import RagService
 from .tasks import TaskService
@@ -25,6 +27,7 @@ class KnowledgeAssistantService:
         self.embedding = HashingEmbedding(embedding_dimension)
         self.traces = TraceRecorder(self.database)
         self.documents = DocumentService(self.database, self.embedding, self.traces)
+        self.ingestion = IngestionService(self.database, self.documents, self.traces)
         self.rag = RagService(
             self.database,
             self.embedding,
@@ -38,3 +41,23 @@ class KnowledgeAssistantService:
             self.traces,
             approval_ttl_minutes=approval_ttl_minutes,
         )
+
+    @property
+    def service_instance_id(self) -> str:
+        return self.database.service_instance_id
+
+    def start(self) -> None:
+        self.ingestion.start()
+
+    def close(self, timeout: float = 1.0) -> bool:
+        return self.ingestion.close(timeout=timeout)
+
+    def health(self) -> dict[str, Any]:
+        ingestion = self.ingestion.health()
+        return {
+            "status": "ok" if ingestion["status"] == "ready" else "degraded",
+            "schema_version": SCHEMA_VERSION,
+            "service_instance_id": self.service_instance_id,
+            "embedding_model": self.embedding.name,
+            "ingestion": ingestion,
+        }

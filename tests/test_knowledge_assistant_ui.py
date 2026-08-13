@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -10,13 +11,14 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QUrl, Qt
+from PySide6.QtCore import QObject, QUrl, Qt, Signal
 from PySide6.QtGui import QTextDocument
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QMessageBox,
     QTableWidgetItem,
 )
@@ -26,11 +28,64 @@ from table_miku.knowledge_assistant.client import KnowledgeAssistantApiError
 from table_miku.knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 import table_miku.knowledge_assistant_ui as ui_module
 from table_miku.knowledge_assistant_ui import (
+    BatchUploadDialog,
     IngestTaskDialog,
     KnowledgeAssistantDialog,
     SafeMarkdownBrowser,
     UploadDocumentDialog,
 )
+
+
+class _FakeIngestionCoordinator(QObject):
+    updated = Signal(object)
+    recovery_updated = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.submissions: list[tuple[object, list[Path], str, int, list[dict]]] = []
+        self.refreshes: list[tuple[object, int]] = []
+        self.replays: list[tuple[object, str, int]] = []
+        self.cancelled_jobs: list[tuple[object, str, int]] = []
+        self.cancelled_recoveries: list[tuple[object, str, int]] = []
+        self.scan_count = 0
+
+    def submit_files(
+        self,
+        principal,
+        paths,
+        *,
+        collection_id,
+        generation,
+        expected_snapshots,
+    ):
+        self.submissions.append(
+            (principal, list(paths), collection_id, generation, list(expected_snapshots))
+        )
+        return ["local-1"]
+
+    def refresh(self, principal, *, generation):
+        self.refreshes.append((principal, generation))
+
+    def scan_recovery(self):
+        self.scan_count += 1
+
+    def request_cancel_local(self, _local_id):
+        return "cancelling"
+
+    def request_cancel_job(self, principal, job_id, *, generation):
+        self.cancelled_jobs.append((principal, job_id, generation))
+
+    def request_cancel_recovery(self, principal, entry_id, *, generation):
+        self.cancelled_recoveries.append((principal, entry_id, generation))
+
+    def safe_replay(self, principal, entry_id, *, generation):
+        self.replays.append((principal, entry_id, generation))
+
+    def abandon_recovery(self, *_args, **_kwargs):
+        return None
+
+    def shutdown(self, _timeout_ms=2000):
+        return True
 
 
 def _app() -> QApplication:
@@ -1342,5 +1397,782 @@ def test_uncertain_archive_task_retry_reuses_the_same_key(tmp_path: Path, monkey
         assert dialog._archive_task_draft is None
         assert "不能据此断言" in dialog.status_label.text()
         assert "尚未归档" not in dialog.status_label.text()
+    finally:
+        _close(dialog, controller)
+
+
+def test_batch_upload_dialog_defaults_to_cancel_and_limits_the_batch(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    dialog = BatchUploadDialog()
+    try:
+        buttons = dialog.findChild(QDialogButtonBox)
+        assert buttons is not None
+        assert buttons.button(QDialogButtonBox.StandardButton.Cancel).isDefault()
+        paths = [tmp_path / f"doc-{index}.md" for index in range(20)]
+        for path in paths:
+            path.write_text("content", encoding="utf-8")
+        monkeypatch.setattr(
+            QFileDialog,
+            "getOpenFileNames",
+            lambda *_args, **_kwargs: ([str(path) for path in paths], ""),
+        )
+        dialog._choose()
+        dialog.collection_edit.setText("engineering")
+        dialog.accept()
+        assert dialog.result() == QDialog.DialogCode.Accepted
+    finally:
+        dialog.close()
+
+
+def test_batch_upload_preview_is_specific_and_fails_closed_if_a_file_changes(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = first_dir / "same.md"
+    second = second_dir / "same.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *_args, **_kwargs: ([str(first), str(second)], ""),
+    )
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    dialog = BatchUploadDialog()
+    try:
+        dialog._choose()
+
+        paths = [dialog.file_table.item(row, 0).text() for row in range(2)]
+        assert paths == [str(first.resolve()), str(second.resolve())]
+        assert len(dialog.file_snapshots) == 2
+        assert set(dialog.file_snapshots[0]) == {
+            "canonical_path",
+            "size",
+            "mtime_ns",
+            "device",
+            "inode",
+            "sha256",
+        }
+        assert dialog.file_snapshots[0]["sha256"] == hashlib.sha256(b"first").hexdigest()
+        assert dialog.file_table.horizontalHeaderItem(3).text() == "SHA-256 摘要"
+        expected_digest = hashlib.sha256(b"first").hexdigest()
+        assert dialog.file_table.item(0, 3).text() == f"{expected_digest[:16]}…"
+        assert dialog.file_table.item(0, 3).toolTip() == expected_digest
+        assert dialog.submit_button.text() == "加入摄取队列（2）"
+        assert "直接写入" in dialog.intro_label.text()
+        assert "无需审批" in dialog.intro_label.text()
+        assert "部分成功" in dialog.intro_label.text()
+        assert "不支持 OCR" in dialog.intro_label.text()
+
+        first.write_text("changed after preview", encoding="utf-8")
+        dialog.collection_edit.setText("engineering")
+        dialog.accept()
+
+        assert dialog.result() == QDialog.DialogCode.Rejected
+        assert warnings and warnings[-1][0] == "文件已变化"
+    finally:
+        dialog.close()
+
+
+def test_batch_upload_rejects_same_size_rewrite_even_if_mtime_is_restored(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    source = tmp_path / "stable.md"
+    source.write_bytes(b"first")
+    original = source.stat()
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *_args, **_kwargs: ([str(source)], ""),
+    )
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    dialog = BatchUploadDialog()
+    try:
+        dialog._choose()
+        accepted_hash = dialog.file_snapshots[0]["sha256"]
+        source.write_bytes(b"other")
+        os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+        assert source.stat().st_size == original.st_size
+        assert source.stat().st_mtime_ns == original.st_mtime_ns
+
+        dialog.accept()
+
+        assert dialog.result() == QDialog.DialogCode.Rejected
+        assert warnings and warnings[-1][0] == "文件已变化"
+        assert hashlib.sha256(source.read_bytes()).hexdigest() != accepted_hash
+    finally:
+        dialog.close()
+
+
+def test_batch_upload_rejects_oversized_file_during_selection(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    oversized = tmp_path / "oversized.pdf"
+    with oversized.open("wb") as handle:
+        handle.truncate(ui_module.MAX_DOCUMENT_BYTES + 1)
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *_args, **_kwargs: ([str(oversized)], ""),
+    )
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    dialog = BatchUploadDialog()
+    try:
+        dialog._choose()
+
+        assert dialog.paths == []
+        assert dialog.file_snapshots == []
+        assert dialog.file_table.rowCount() == 0
+        assert warnings and warnings[-1][0] == "文件不可读取"
+        assert str(ui_module.MAX_DOCUMENT_BYTES) in warnings[-1][1]
+    finally:
+        dialog.close()
+
+
+def test_ingestion_surfaces_remain_visible_at_minimum_supported_size(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        dialog.resize(980, 680)
+        dialog.tabs.setCurrentIndex(4)
+        dialog.show()
+        _app().processEvents()
+
+        for widget in (
+            dialog.ingestion_table,
+            dialog.ingestion_progress,
+            dialog.ingestion_detail,
+            dialog.ingestion_cancel_button,
+            dialog.ingestion_retry_button,
+            dialog.ingestion_abandon_button,
+        ):
+            assert widget.isVisibleTo(dialog)
+            top_left = widget.mapTo(dialog, widget.rect().topLeft())
+            bottom_right = widget.mapTo(dialog, widget.rect().bottomRight())
+            assert top_left.x() >= 0
+            assert top_left.y() >= 0
+            assert bottom_right.x() < dialog.width()
+            assert bottom_right.y() < dialog.height()
+    finally:
+        _close(dialog, controller)
+
+
+def test_batch_upload_enters_background_queue_without_blocking_ui(tmp_path: Path, monkeypatch):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    source = tmp_path / "guide.md"
+    source.write_text("guide", encoding="utf-8")
+
+    class AcceptedBatchDialog:
+        paths = [source]
+        file_snapshots = [
+            {
+                "canonical_path": str(source.resolve()),
+                "size": source.stat().st_size,
+                "mtime_ns": source.stat().st_mtime_ns,
+                "device": source.stat().st_dev,
+                "inode": source.stat().st_ino,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        ]
+        collection_edit = SimpleNamespace(text=lambda: "engineering")
+
+        def __init__(self, _parent=None):
+            pass
+
+        @staticmethod
+        def exec():
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ui_module, "BatchUploadDialog", AcceptedBatchDialog)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        dialog._choose_batch_upload()
+
+        assert len(coordinator.submissions) == 1
+        principal, paths, collection, generation, snapshots = coordinator.submissions[0]
+        assert principal.user_id == "editor-a"
+        assert paths == [source]
+        assert collection == "engineering"
+        assert generation == dialog._ingestion_generation
+        assert snapshots == AcceptedBatchDialog.file_snapshots
+        assert dialog.tabs.currentIndex() == 4
+    finally:
+        _close(dialog, controller)
+
+
+def test_ingestion_snapshot_keeps_safe_job_details_and_recovery_across_refresh(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        generation = dialog._ingestion_generation
+        signature = dialog._principal_signature(dialog._principal())
+        principal = {
+            "tenant_id": "tenant-a",
+            "user_id": "editor-a",
+            "roles": ["editor"],
+            "collection_ids": ["engineering"],
+        }
+        recovery_id = "outbox-" + "a" * 32
+        tracking_id = "outbox-" + "c" * 32
+        dialog._on_recovery_update(
+            [
+                {
+                    "entry_id": recovery_id,
+                    "status": "pending",
+                    "principal": principal,
+                    "filename": "pending.md",
+                    "collection_id": "engineering",
+                },
+                {
+                    "entry_id": tracking_id,
+                    "status": "tracking",
+                    "principal": principal,
+                    "filename": "guide.md",
+                    "collection_id": "engineering",
+                    "job_id": "job-1",
+                },
+            ]
+        )
+        dialog._on_ingestion_update(
+            {
+                "status": "snapshot",
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "requested_by": "editor-a",
+                        "filename": "guide.md",
+                        "collection_id": "engineering",
+                        "status": "failed",
+                        "progress": {"phase": "embedding", "current": 2, "total": 4},
+                        "error_code": "invalid_document",
+                        "error_message": "Document validation failed.",
+                        "attempt_count": 2,
+                        "max_attempts": 3,
+                        "trace_id": "trace-1",
+                        "document_id": None,
+                        "cancel_outcome": "already_terminal",
+                    }
+                ],
+                "generation": generation,
+                "principal_signature": signature,
+            }
+        )
+
+        assert recovery_id in dialog._ingestion_items
+        job = dialog._ingestion_items["job:job-1"]
+        assert job["entry_id"] == tracking_id
+        assert job["requested_by"] == "editor-a"
+        assert job["progress"] == {"phase": "embedding", "current": 2, "total": 4}
+        assert job["error_code"] == "invalid_document"
+        assert job["error_message"] == "Document validation failed."
+        assert job["attempt_count"] == 2
+        assert job["max_attempts"] == 3
+        assert job["trace_id"] == "trace-1"
+        assert "document_id" in job
+        assert job["cancel_outcome"] == "already_terminal"
+
+        dialog._select_row(dialog.ingestion_table, "job:job-1")
+        dialog._ingestion_selected()
+        assert "embedding" in dialog.ingestion_progress.format()
+        assert "2/4" in dialog.ingestion_progress.format()
+        assert "Document validation failed." in dialog.ingestion_detail.toPlainText()
+    finally:
+        _close(dialog, controller)
+
+
+def test_ingestion_cancel_respects_role_and_requester_and_previews_exact_action(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    captured: list[QMessageBox] = []
+
+    def keep_default(box: QMessageBox):
+        captured.append(box)
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", keep_default)
+    try:
+        generation = dialog._ingestion_generation
+        signature = dialog._principal_signature(dialog._principal())
+        dialog._on_ingestion_update(
+            {
+                "status": "snapshot",
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "requested_by": "editor-a",
+                        "filename": "guide.md",
+                        "collection_id": "engineering",
+                        "status": "queued",
+                    }
+                ],
+                "generation": generation,
+                "principal_signature": signature,
+            }
+        )
+        dialog.ingestion_table.selectRow(0)
+        dialog._ingestion_selected()
+        assert not dialog.ingestion_cancel_button.isEnabled()
+        assert "写入权限" in dialog.ingestion_cancel_button.toolTip()
+
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-b",
+            role="editor",
+            collections="engineering",
+        )
+        generation = dialog._ingestion_generation
+        signature = dialog._principal_signature(dialog._principal())
+        dialog._on_ingestion_update(
+            {
+                "status": "snapshot",
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "requested_by": "editor-a",
+                        "filename": "guide.md",
+                        "collection_id": "engineering",
+                        "status": "queued",
+                    }
+                ],
+                "generation": generation,
+                "principal_signature": signature,
+            }
+        )
+        dialog.ingestion_table.selectRow(0)
+        dialog._ingestion_selected()
+        assert not dialog.ingestion_cancel_button.isEnabled()
+        assert "发起人 editor-a" in dialog.ingestion_cancel_button.toolTip()
+
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        generation = dialog._ingestion_generation
+        signature = dialog._principal_signature(dialog._principal())
+        dialog._on_ingestion_update(
+            {
+                "status": "snapshot",
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "requested_by": "editor-a",
+                        "filename": "guide.md",
+                        "collection_id": "engineering",
+                        "status": "queued",
+                    }
+                ],
+                "generation": generation,
+                "principal_signature": signature,
+            }
+        )
+        dialog.ingestion_table.selectRow(0)
+        dialog._cancel_selected_ingestion()
+
+        assert coordinator.cancelled_jobs == []
+        box = captured[-1]
+        assert box.textFormat() == Qt.TextFormat.PlainText
+        rendered = box.text() + "\n" + box.informativeText()
+        assert "job-1" in rendered
+        assert "guide.md" in rendered
+        assert "engineering" in rendered
+        assert "editor-a" in rendered
+        assert box.defaultButton() is box.escapeButton()
+        assert box.defaultButton().text() == "保留任务"
+    finally:
+        _close(dialog, controller)
+
+
+def test_uncertain_recovery_cancel_uses_durable_cancel_intent_and_too_late_is_a_receipt(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    monkeypatch.setattr(dialog, "_confirm_ingestion_cancel", lambda *_args: True)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        entry_id = "outbox-" + "b" * 32
+        dialog._ingestion_items[entry_id] = {
+            "entry_id": entry_id,
+            "filename": "uncertain.md",
+            "collection_id": "engineering",
+            "status": "outcome_unknown",
+            "requested_by": "editor-a",
+        }
+        dialog._render_ingestion_items()
+        dialog.ingestion_table.selectRow(0)
+        dialog._cancel_selected_ingestion()
+
+        assert coordinator.cancelled_recoveries == [
+            (dialog._principal(), entry_id, dialog._ingestion_generation)
+        ]
+        assert "取消意图已保留" in dialog.ingestion_detail.toPlainText()
+
+        signature = dialog._principal_signature(dialog._principal())
+        dialog._on_ingestion_update(
+            {
+                "status": "snapshot",
+                "jobs": [
+                    {
+                        "id": "job-late",
+                        "requested_by": "editor-a",
+                        "filename": "late.md",
+                        "collection_id": "engineering",
+                        "status": "succeeded",
+                        "document_id": "doc-late",
+                        "cancel_outcome": "too_late",
+                    }
+                ],
+                "generation": dialog._ingestion_generation,
+                "principal_signature": signature,
+            }
+        )
+        dialog._select_row(dialog.ingestion_table, "job:job-late")
+        dialog._ingestion_selected()
+        assert "取消过晚，文档已写入" in dialog.ingestion_detail.toPlainText()
+    finally:
+        _close(dialog, controller)
+
+
+def test_rejected_cancel_recovery_is_visible_and_only_retries_after_user_consent(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    monkeypatch.setattr(dialog, "_confirm_ingestion_cancel", lambda *_args: True)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        principal = {
+            "tenant_id": "tenant-a",
+            "user_id": "editor-a",
+            "roles": ["editor"],
+            "collection_ids": ["engineering"],
+        }
+        entry_id = "outbox-" + "d" * 32
+        dialog._on_recovery_update(
+            [
+                {
+                    "entry_id": entry_id,
+                    "status": "tracking",
+                    "principal": principal,
+                    "requested_by": "editor-a",
+                    "filename": "guide.md",
+                    "collection_id": "engineering",
+                    "job_id": "job-rejected",
+                    "cancel_delivery_state": "rejected",
+                }
+            ]
+        )
+        assert dialog._ingestion_items[entry_id]["status"] == "cancel_rejected"
+
+        dialog._on_ingestion_update(
+            {
+                "status": "snapshot",
+                "jobs": [
+                    {
+                        "id": "job-rejected",
+                        "requested_by": "editor-a",
+                        "filename": "guide.md",
+                        "collection_id": "engineering",
+                        "status": "running",
+                    }
+                ],
+                "generation": dialog._ingestion_generation,
+                "principal_signature": dialog._principal_signature(dialog._principal()),
+            }
+        )
+
+        assert dialog.ingestion_table.rowCount() == 1
+        dialog._select_row(dialog.ingestion_table, "job:job-rejected")
+        dialog._ingestion_selected()
+        assert "服务端明确拒绝" in dialog.ingestion_detail.toPlainText()
+        assert dialog.ingestion_cancel_button.isEnabled()
+        assert "上次取消被明确拒绝" in dialog.ingestion_cancel_button.toolTip()
+
+        dialog._cancel_selected_ingestion()
+        assert coordinator.cancelled_jobs == [
+            (dialog._principal(), "job-rejected", dialog._ingestion_generation)
+        ]
+    finally:
+        _close(dialog, controller)
+
+
+def test_reconciliation_required_survives_server_snapshot_as_attention(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        entry_id = "outbox-" + "e" * 32
+        dialog._on_recovery_update(
+            [
+                {
+                    "entry_id": entry_id,
+                    "status": "tracking",
+                    "principal": {
+                        "tenant_id": "tenant-a",
+                        "user_id": "editor-a",
+                        "roles": ["editor"],
+                        "collection_ids": ["engineering"],
+                    },
+                    "requested_by": "editor-a",
+                    "filename": "missing.md",
+                    "collection_id": "engineering",
+                    "job_id": "job-missing",
+                    "cancel_delivery_state": "none",
+                }
+            ]
+        )
+        common = {
+            "generation": dialog._ingestion_generation,
+            "principal_signature": dialog._principal_signature(dialog._principal()),
+        }
+        dialog._on_ingestion_update(
+            {
+                **common,
+                "entry_id": entry_id,
+                "job_id": "job-missing",
+                "status": "reconciliation_required",
+                "message": "服务端未返回该跟踪任务；本地记录已保留，请人工核查。",
+            }
+        )
+        dialog._on_ingestion_update({**common, "status": "snapshot", "jobs": []})
+
+        assert dialog._ingestion_items[entry_id]["status"] == "reconciliation_required"
+        attention_index = dialog.ingestion_filter.findData("attention")
+        assert attention_index >= 0
+        dialog.ingestion_filter.setCurrentIndex(attention_index)
+        dialog._render_ingestion_items()
+        assert dialog.ingestion_table.rowCount() == 1
+        assert dialog.ingestion_table.item(0, 0).text() == "需人工对账"
+        dialog.ingestion_table.selectRow(0)
+        dialog._ingestion_selected()
+        assert not dialog.ingestion_cancel_button.isEnabled()
+        assert "本地记录已保留" in dialog.ingestion_detail.toPlainText()
+    finally:
+        _close(dialog, controller)
+
+
+def test_unknown_tracking_cancel_never_offers_replay_of_the_original_upload(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        entry_id = "outbox-" + "f" * 32
+        dialog._on_recovery_update(
+            [
+                {
+                    "entry_id": entry_id,
+                    "status": "tracking",
+                    "principal": {
+                        "tenant_id": "tenant-a",
+                        "user_id": "editor-a",
+                        "roles": ["editor"],
+                        "collection_ids": ["engineering"],
+                    },
+                    "requested_by": "editor-a",
+                    "filename": "guide.md",
+                    "collection_id": "engineering",
+                    "job_id": "job-unknown-cancel",
+                    "cancel_delivery_state": "unknown",
+                }
+            ]
+        )
+
+        dialog.ingestion_table.selectRow(0)
+        dialog._ingestion_selected()
+        assert dialog._ingestion_items[entry_id]["status"] == "outcome_unknown"
+        assert not dialog.ingestion_retry_button.isEnabled()
+        assert "不能重传原请求" in dialog.ingestion_retry_button.toolTip()
+        assert dialog.ingestion_cancel_button.isEnabled()
+        assert not dialog.ingestion_abandon_button.isEnabled()
+        assert "已绑定服务端任务" in dialog.ingestion_abandon_button.toolTip()
+    finally:
+        _close(dialog, controller)
+
+
+def test_ingestion_ui_distinguishes_cancelling_and_ignores_stale_identity_results(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        generation = dialog._ingestion_generation
+        signature = dialog._principal_signature(dialog._principal())
+        dialog._on_ingestion_update(
+            {
+                "local_id": "local-1",
+                "filename": "guide.md",
+                "collection_id": "engineering",
+                "status": "cancelling",
+                "message": "取消请求中；尚不能断言任务已取消。",
+                "generation": generation,
+                "principal_signature": signature,
+            }
+        )
+
+        assert dialog.ingestion_table.item(0, 0).text() == "取消请求中"
+        assert "尚不能断言" in dialog.ingestion_table.item(0, 3).text()
+        dialog._on_ingestion_update(
+            {
+                "local_id": "local-1",
+                "status": "succeeded",
+                "generation": generation - 1,
+                "principal_signature": signature,
+            }
+        )
+        assert dialog.ingestion_table.item(0, 0).text() == "取消请求中"
+
+        dialog._identity_draft_changed()
+        assert dialog.ingestion_table.rowCount() == 0
+    finally:
+        _close(dialog, controller)
+
+
+def test_close_clears_ingestion_view_without_replaying_or_stopping_coordinator(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        dialog._ingestion_items["local-1"] = {
+            "status": "outcome_unknown",
+            "filename": "private.md",
+            "collection_id": "engineering",
+            "entry_id": "outbox-" + "a" * 32,
+            "message": "结果待确认",
+        }
+        dialog._render_ingestion_items()
+        assert dialog.ingestion_table.rowCount() == 1
+
+        dialog.close()
+        _app().processEvents()
+
+        assert dialog.ingestion_table.rowCount() == 0
+        assert coordinator.replays == []
+        assert coordinator.scan_count >= 1
     finally:
         _close(dialog, controller)

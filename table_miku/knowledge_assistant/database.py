@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 
 from table_miku.paths import runtime_path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -42,6 +43,19 @@ class AssistantDatabase:
                 CREATE TABLE IF NOT EXISTS schema_versions(
                     version INTEGER PRIMARY KEY,
                     applied_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS service_metadata(
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_leases(
+                    name TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    process_boot_id TEXT NOT NULL,
+                    heartbeat_at REAL NOT NULL,
+                    lease_expires_at REAL NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS documents(
@@ -184,9 +198,67 @@ class AssistantDatabase:
                     FOREIGN KEY(trace_id) REFERENCES traces(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_ka2_spans_trace ON spans(trace_id, started_at);
+
+                CREATE TABLE IF NOT EXISTS ingestion_jobs(
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    collection_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    progress_phase TEXT NOT NULL DEFAULT 'queued',
+                    progress_current INTEGER NOT NULL DEFAULT 0,
+                    progress_total INTEGER NOT NULL DEFAULT 1,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    run_token TEXT NOT NULL DEFAULT '',
+                    worker_instance_id TEXT NOT NULL DEFAULT '',
+                    retryable INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    trace_id TEXT,
+                    document_id TEXT,
+                    deduplicated INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    cancel_requested_at TEXT,
+                    cancel_outcome TEXT NOT NULL DEFAULT '',
+                    UNIQUE(tenant_id, idempotency_key),
+                    FOREIGN KEY(document_id) REFERENCES documents(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ka2_ingestion_jobs_scope
+                    ON ingestion_jobs(tenant_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ka2_ingestion_jobs_dispatch
+                    ON ingestion_jobs(status, created_at, id);
+
+                CREATE TABLE IF NOT EXISTS ingestion_payloads(
+                    job_id TEXT PRIMARY KEY,
+                    content BLOB NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES ingestion_jobs(id) ON DELETE CASCADE
+                );
                 """
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO service_metadata(key, value) VALUES('service_instance_id', ?)",
+                (f"ka-{uuid.uuid4().hex}",),
             )
             conn.execute(
                 "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES(?, datetime('now'))",
                 (SCHEMA_VERSION,),
             )
+
+    @property
+    def service_instance_id(self) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM service_metadata WHERE key = 'service_instance_id'"
+            ).fetchone()
+        if row is None or not str(row["value"]).strip():
+            raise RuntimeError("Knowledge Assistant service identity is unavailable")
+        return str(row["value"])
