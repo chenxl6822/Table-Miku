@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QUrl, Qt
+from PySide6.QtGui import QTextDocument
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QMessageBox,
+    QTableWidgetItem,
+)
 
 from table_miku.knowledge_assistant import KnowledgeAssistantService
 from table_miku.knowledge_assistant.client import KnowledgeAssistantApiError
@@ -17,6 +28,7 @@ import table_miku.knowledge_assistant_ui as ui_module
 from table_miku.knowledge_assistant_ui import (
     IngestTaskDialog,
     KnowledgeAssistantDialog,
+    SafeMarkdownBrowser,
     UploadDocumentDialog,
 )
 
@@ -55,6 +67,145 @@ def _close(dialog: KnowledgeAssistantDialog, controller: KnowledgeAssistantDeskt
     controller.close()
 
 
+def test_safe_markdown_browser_renders_commonmark_without_active_resources():
+    _app()
+    browser = SafeMarkdownBrowser()
+    browser.set_safe_markdown(
+        "# 标题\n\n**重点**与 `code`\n\n- 第一项\n- 第二项\n\n"
+        "| 列 A | 列 B |\n| --- | --- |\n| 值 1 | 值 2 |\n\n"
+        "`![代码示例](file:///C:/private/code.png)`\n\n"
+        "```markdown\n![围栏示例](https://example.invalid/code.png)\n```\n\n"
+        "<script>alert('no')</script>\n\n"
+        "[外部链接](https://example.invalid/path)\n\n"
+        "![远程图片](https://example.invalid/image.png)\n"
+        "![本地图片](file:///C:/private/secret.png)\n"
+        "![内嵌图片](data:image/png;base64,AAAA)\n"
+        "![Qt 资源](qrc:/private/icon.png)\n"
+        "![相对路径](../private/icon.png)"
+    )
+
+    plain = browser.toPlainText()
+    html = browser.document().toHtml()
+    assert browser.document().begin().blockFormat().headingLevel() == 1
+    assert "标题" in plain
+    assert "**重点**" not in plain
+    assert "第一项" in plain
+    assert "值 1" in plain
+    assert "![代码示例](file:///C:/private/code.png)" in plain
+    assert "![围栏示例](https://example.invalid/code.png)" in plain
+    assert plain.count("［图片已禁用］") == 5
+    assert "<table" in html
+    assert "<script>" not in html
+    assert "href=" not in html
+    assert "<img" not in html
+    assert not browser.openLinks()
+    assert not browser.openExternalLinks()
+    assert not (
+        browser.textInteractionFlags()
+        & Qt.TextInteractionFlag.LinksAccessibleByMouse
+    )
+    assert browser.loadResource(
+        QTextDocument.ResourceType.ImageResource,
+        QUrl("file:///C:/private/secret.png"),
+    ) is None
+    browser.deleteLater()
+
+
+@pytest.mark.parametrize(
+    ("pattern", "count"),
+    [("![", 10_000), ("![alt](", 5_000)],
+    ids=["unclosed-alt", "unclosed-destination"],
+)
+def test_safe_markdown_handles_large_malformed_image_syntax_quickly(
+    pattern: str,
+    count: int,
+):
+    browser = SafeMarkdownBrowser()
+    malformed = pattern * count
+    started = time.perf_counter()
+    browser.set_safe_markdown(malformed)
+    elapsed = time.perf_counter() - started
+
+    assert browser.toPlainText()
+    assert elapsed < 2.0
+    browser.deleteLater()
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("awaiting_approval", "等待另一位审批人"),
+        ("queued", "已进入执行队列"),
+        ("running", "正在执行"),
+        ("succeeded", "已成功执行"),
+        ("rejected", "写操作未执行"),
+        ("cancelled", "任务已取消"),
+        ("failed", "局部副作用"),
+    ],
+)
+def test_task_summary_explains_each_supported_status(status: str, expected: str):
+    summary = KnowledgeAssistantDialog.format_task_summary(
+        {
+            "id": "task-1",
+            "tool_name": "ingest_text",
+            "status": status,
+            "requested_by": "requester-a",
+            "created_at": "2026-08-13T10:00:00Z",
+            "updated_at": "2026-08-13T10:01:00Z",
+            "started_at": "2026-08-13T10:00:30Z",
+            "finished_at": "2026-08-13T10:01:00Z",
+            "error_code": "interrupted" if status == "failed" else "",
+            "error_message": "worker stopped" if status == "failed" else "",
+            "arguments": {
+                "filename": "status.md",
+                "collection_id": "engineering",
+                "byte_size": 123,
+                "content_sha256": "abc123",
+            },
+            "approval": {
+                "status": "pending" if status == "awaiting_approval" else "approved",
+                "requested_at": "2026-08-13T10:00:00Z",
+                "expires_at": "2026-08-13T10:10:00Z",
+                "decided_by": "approver-b",
+            },
+        }
+    )
+
+    assert expected in summary
+    assert "批准依据是右侧加载的精确 Action Preview" in summary
+
+
+def test_safe_task_metadata_allowlists_each_contract_and_drops_staged_content():
+    safe = KnowledgeAssistantDialog._safe_task_metadata(
+        {
+            "id": "task-1",
+            "tool_name": "ingest_text",
+            "arguments": {"filename": "safe.md", "content": "TOP SECRET"},
+            "receipt": {
+                "operation_id": "op-1",
+                "result": {"payload": "TOP SECRET", "id": "doc-1"},
+            },
+        }
+    )
+
+    safe_text = json.dumps(safe, ensure_ascii=False, default=str)
+    assert "TOP SECRET" not in safe_text
+    assert "safe.md" in safe_text
+    assert "doc-1" in safe_text
+
+    unknown = KnowledgeAssistantDialog._safe_task_metadata(
+        {
+            "id": "task-2",
+            "tool_name": "future_tool",
+            "arguments": {"body": "TOP SECRET", "safe_looking": "TOP SECRET"},
+            "result": {"text": "TOP SECRET"},
+        }
+    )
+    assert unknown["arguments"] == {}
+    assert unknown["result"] == {}
+    assert "TOP SECRET" not in json.dumps(unknown, ensure_ascii=False)
+
+
 def test_console_opens_in_safe_read_only_state(tmp_path: Path):
     _app()
     controller = _controller(tmp_path)
@@ -69,6 +220,12 @@ def test_console_opens_in_safe_read_only_state(tmp_path: Path):
         assert not dialog.reject_button.isEnabled()
         assert not dialog.defer_button.isEnabled()
         assert dialog.task_table.rowCount() == 0
+        assert dialog.tabs.currentIndex() == 1
+        assert dialog.identity_panel.isHidden()
+        assert "Viewer" in dialog.role_summary_label.text()
+        assert "只读" in dialog.role_summary_label.text()
+        assert "上传需 Editor" in dialog.onboarding_label.text()
+        assert "Viewer" in dialog.upload_button.toolTip()
         assert dialog.status_label.textFormat() == Qt.TextFormat.PlainText
         assert "不是生产登录" in dialog.findChild(
             type(dialog.status_label), "localIdentityWarning"
@@ -109,6 +266,11 @@ def test_console_renders_citations_then_clears_them_on_refusal(tmp_path: Path):
         assert "有据回答" in dialog.answer_state.text()
         assert dialog.citation_table.rowCount() >= 1
         assert dialog.citation_table.item(0, 1).text() == "spring.md"
+        dialog.citation_table.selectRow(0)
+        _app().processEvents()
+        assert "spring.md" in dialog.citation_detail.toPlainText()
+        assert "engineering" in dialog.citation_detail.toPlainText()
+        assert "相关度" in dialog.citation_detail.toPlainText()
         assert dialog.trace_id_edit.text().startswith("trace-")
 
         dialog.query_edit.setPlainText("公司火星基地的门禁密码是什么？")
@@ -116,6 +278,8 @@ def test_console_renders_citations_then_clears_them_on_refusal(tmp_path: Path):
 
         assert "已拒答" in dialog.answer_state.text()
         assert dialog.citation_table.rowCount() == 0
+        assert dialog._citations == []
+        assert "暂无证据详情" in dialog.citation_detail.toPlainText()
         assert "没有找到足够可靠的证据" in dialog.answer_edit.toPlainText()
 
         dialog._load_trace()
@@ -235,7 +399,244 @@ def test_console_approval_executes_once_and_shows_receipt_without_content(tmp_pa
         assert content not in str(completed["receipt"])
         assert content not in dialog.receipt_detail.toPlainText()
         assert "operation_id" in dialog.receipt_detail.toPlainText()
+        assert not dialog.task_detail.toPlainText().lstrip().startswith("{")
+        assert "已成功执行" in dialog.task_detail.toPlainText()
+        assert "批准依据是右侧加载的精确 Action Preview" in dialog.task_detail.toPlainText()
+        assert dialog.task_technical_detail.isHidden()
+        assert dialog.task_technical_detail.toPlainText().lstrip().startswith("{")
+        assert content not in dialog.task_technical_detail.toPlainText()
         assert len(controller.list_documents(editor)) == 1
+    finally:
+        _close(dialog, controller)
+
+
+@pytest.mark.parametrize("size", [(1180, 790), (980, 680)])
+def test_console_keeps_guidance_and_task_actions_visible_at_supported_sizes(
+    tmp_path: Path,
+    size: tuple[int, int],
+):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        dialog.resize(*size)
+        dialog.tabs.setCurrentIndex(2)
+        dialog.show()
+        _app().processEvents()
+
+        assert dialog.size().width() == size[0]
+        assert dialog.size().height() == size[1]
+        for widget in (
+            dialog.title_label,
+            dialog.findChild(type(dialog.status_label), "localIdentityWarning"),
+            dialog.role_summary_label,
+            dialog.identity_toggle,
+            dialog.tabs,
+            dialog.task_table,
+            dialog.task_detail,
+            dialog.receipt_detail,
+            dialog.approval_hint_label,
+            dialog.preview_button,
+            dialog.approve_button,
+            dialog.reject_button,
+            dialog.defer_button,
+            dialog.status_label,
+        ):
+            assert widget is not None
+            assert widget.isVisibleTo(dialog)
+            top_left = widget.mapTo(dialog, widget.rect().topLeft())
+            bottom_right = widget.mapTo(dialog, widget.rect().bottomRight())
+            assert top_left.x() >= 0
+            assert top_left.y() >= 0
+            assert bottom_right.x() < dialog.width()
+            assert bottom_right.y() < dialog.height()
+        assert dialog.task_table.height() >= 90
+        assert dialog.task_detail.height() >= 70
+        assert dialog.receipt_detail.height() >= 70
+        for button in (
+            dialog.preview_button,
+            dialog.approve_button,
+            dialog.reject_button,
+            dialog.defer_button,
+        ):
+            assert button.width() >= button.sizeHint().width()
+    finally:
+        _close(dialog, controller)
+
+
+def test_query_failure_clears_previous_answer_and_evidence(tmp_path: Path, monkeypatch):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        dialog.answer_edit.set_safe_markdown("# Previous answer\nSensitive evidence")
+        dialog._citations = [{"id": "S1", "filename": "old.md"}]
+        dialog.citation_table.setRowCount(1)
+        dialog.citation_table.setItem(0, 0, QTableWidgetItem("S1"))
+        dialog.citation_detail.setPlainText("old.md\nSensitive evidence")
+        dialog.query_edit.setPlainText("new question")
+        def fail_query(*_args, **_kwargs):
+            raise ConnectionError("lost")
+
+        monkeypatch.setattr(controller, "query", fail_query)
+        monkeypatch.setattr(dialog, "_show_error", lambda *_args, **_kwargs: None)
+
+        dialog._run_query()
+
+        assert "Previous answer" not in dialog.answer_edit.toPlainText()
+        assert "Sensitive evidence" not in dialog.answer_edit.toPlainText()
+        assert dialog.citation_table.rowCount() == 0
+        assert dialog._citations == []
+        assert "暂无证据详情" in dialog.citation_detail.toPlainText()
+        assert "旧答案与引用已清除" in dialog.answer_state.text()
+    finally:
+        _close(dialog, controller)
+
+
+def test_rag_state_forces_untrusted_retrieval_metadata_to_plain_text(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    malicious = '<img src="data:image/png;base64,AAAA">'
+    try:
+        monkeypatch.setattr(
+            controller,
+            "query",
+            lambda *_args, **_kwargs: {
+                "answer": "Grounded answer",
+                "refused": False,
+                "citations": [],
+                "retrieval": {"accepted_count": malicious, "top_score": malicious},
+                "trace_id": "trace-safe-state",
+            },
+        )
+        monkeypatch.setattr(dialog, "_refresh_metrics", lambda *args, **kwargs: None)
+        dialog.query_edit.setPlainText("question")
+
+        dialog._run_query()
+
+        assert dialog.answer_state.textFormat() == Qt.TextFormat.PlainText
+        assert malicious in dialog.answer_state.text()
+    finally:
+        _close(dialog, controller)
+
+
+def test_task_card_explains_self_approval_and_preview_requirements(tmp_path: Path):
+    _app()
+    controller = _controller(tmp_path)
+    requester = controller.principal("tenant-a", "requester-a", "editor", "engineering")
+    content = "# Pending\nOnly the exact preview may authorize this content."
+    task = controller.create_ingest_task(
+        requester,
+        filename="pending.md",
+        collection_id="engineering",
+        content=content,
+        idempotency_key="ui-task-card-001",
+    )
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="requester-a",
+            role="approver",
+            collections="engineering",
+        )
+        KnowledgeAssistantDialog._select_row(dialog.task_table, task["id"])
+
+        summary = dialog.task_detail.toPlainText()
+        assert "写入并索引文档" in summary
+        assert "pending.md" in summary
+        assert "等待另一位审批人" in summary
+        assert content not in summary
+        assert not dialog.preview_button.isEnabled()
+        assert not dialog.reject_button.isEnabled()
+        assert "请求人不能审批自己的任务" in dialog.approval_hint_label.text()
+        assert "请求人不能审批自己的任务" in dialog.preview_button.toolTip()
+
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="approver-b",
+            role="approver",
+            collections="engineering",
+        )
+        KnowledgeAssistantDialog._select_row(dialog.task_table, task["id"])
+        assert dialog.preview_button.isEnabled()
+        assert dialog.reject_button.isEnabled()
+        assert not dialog.approve_button.isEnabled()
+        assert "批准前必须加载" in dialog.approval_hint_label.text()
+        assert "结束任务" in dialog.reject_button.toolTip()
+        assert "删除暂存正文" in dialog.reject_button.toolTip()
+
+        dialog._load_approval_preview()
+        assert dialog.approve_button.isEnabled()
+        assert dialog.defer_button.isEnabled()
+        assert "精确预览已加载" in dialog.approval_hint_label.text()
+    finally:
+        _close(dialog, controller)
+
+
+def test_preview_and_task_refresh_failures_clear_stale_action_state(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _app()
+    controller = _controller(tmp_path)
+    requester = controller.principal("tenant-a", "requester-a", "editor", "engineering")
+    task = controller.create_ingest_task(
+        requester,
+        filename="failure.md",
+        collection_id="engineering",
+        content="staged content must not remain visible",
+        idempotency_key="ui-failure-state-001",
+    )
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="approver-b",
+            role="approver",
+            collections="engineering",
+        )
+        KnowledgeAssistantDialog._select_row(dialog.task_table, task["id"])
+        dialog._load_approval_preview()
+        assert dialog.defer_button.isEnabled()
+
+        def fail_preview(*_args, **_kwargs):
+            raise ConnectionError("preview unavailable")
+
+        monkeypatch.setattr(controller, "approval_preview", fail_preview)
+        monkeypatch.setattr(dialog, "_show_error", lambda *_args, **_kwargs: None)
+        dialog._load_approval_preview()
+
+        assert dialog._approval_preview is None
+        assert not dialog.approve_button.isEnabled()
+        assert not dialog.defer_button.isEnabled()
+        assert "精确预览已加载" not in dialog.approval_hint_label.text()
+        assert "批准前必须加载" in dialog.approval_hint_label.text()
+
+        def fail_list(*_args, **_kwargs):
+            raise ConnectionError("task list unavailable")
+
+        monkeypatch.setattr(controller, "list_tasks", fail_list)
+        dialog._refresh_tasks()
+
+        assert dialog.task_table.rowCount() == 0
+        assert dialog._tasks == {}
+        assert "任务列表不可用" in dialog.task_detail.toPlainText()
+        assert "没有可核查的操作收据" in dialog.receipt_detail.toPlainText()
+        assert dialog.task_technical_detail.toPlainText() == ""
+        assert not dialog.task_technical_toggle.isEnabled()
+        assert not dialog.preview_button.isEnabled()
+        assert not dialog.reject_button.isEnabled()
+        assert not dialog.approve_button.isEnabled()
+        assert not dialog.defer_button.isEnabled()
+        assert "请先选择一个任务" in dialog.approval_hint_label.text()
     finally:
         _close(dialog, controller)
 
@@ -270,7 +671,9 @@ def test_identity_edit_clears_scoped_state_freezes_actions_and_apply_switches_id
         dialog.show()
         _app().processEvents()
         dialog.answer_edit.setPlainText("tenant-local answer")
+        dialog._citations = [{"id": "S1", "filename": "tenant-local.md"}]
         dialog.citation_table.setRowCount(1)
+        dialog.citation_detail.setPlainText("tenant-local evidence")
         dialog.trace_id_edit.setText("trace-tenant-local")
         dialog.trace_detail.setPlainText("tenant-local trace")
         dialog.document_table.setRowCount(1)
@@ -286,11 +689,14 @@ def test_identity_edit_clears_scoped_state_freezes_actions_and_apply_switches_id
 
         assert dialog._identity_dirty is True
         assert not dialog.tabs.isEnabled()
+        assert "尚未应用" in dialog.role_summary_label.text()
         assert dialog._approval_preview is None
         assert dialog.document_table.rowCount() == 0
         assert dialog.task_table.rowCount() == 0
         assert dialog.answer_edit.toPlainText() == ""
+        assert dialog._citations == []
         assert dialog.citation_table.rowCount() == 0
+        assert "tenant-local evidence" not in dialog.citation_detail.toPlainText()
         assert dialog.trace_id_edit.text() == ""
         assert dialog.trace_detail.toPlainText() == ""
         assert "staged content" not in dialog.preview_content_editor.toPlainText()
@@ -308,6 +714,7 @@ def test_identity_edit_clears_scoped_state_freezes_actions_and_apply_switches_id
         assert applied.user_id == "viewer-b"
         assert applied.roles == frozenset({"viewer"})
         assert applied.collection_ids == frozenset({"engineering"})
+        assert "Viewer" in dialog.role_summary_label.text()
     finally:
         _close(dialog, controller)
 
@@ -382,7 +789,9 @@ def test_close_and_reopen_clears_sensitive_views(tmp_path: Path):
         KnowledgeAssistantDialog._select_row(dialog.task_table, task["id"])
         dialog._load_approval_preview()
         dialog.answer_edit.setPlainText("sensitive answer")
+        dialog._citations = [{"id": "S1", "filename": "sensitive.md"}]
         dialog.citation_table.setRowCount(1)
+        dialog.citation_detail.setPlainText("sensitive evidence")
         dialog.trace_detail.setPlainText("sensitive trace")
         retry_capsule = {
             "principal_signature": dialog._principal_signature(dialog._principal()),
@@ -402,7 +811,9 @@ def test_close_and_reopen_clears_sensitive_views(tmp_path: Path):
         assert dialog._approval_preview is None
         assert content not in dialog.preview_content_editor.toPlainText()
         assert dialog.answer_edit.toPlainText() == ""
+        assert dialog._citations == []
         assert dialog.citation_table.rowCount() == 0
+        assert "sensitive evidence" not in dialog.citation_detail.toPlainText()
         assert dialog.trace_detail.toPlainText() == ""
         assert dialog._upload_draft is retry_capsule
         assert "sensitive-filename.md" not in dialog.status_label.text()

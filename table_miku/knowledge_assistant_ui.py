@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -55,7 +56,7 @@ QGroupBox::title {
     left: 10px;
     padding: 0 4px;
 }
-QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QTableWidget {
+QLineEdit, QPlainTextEdit, QTextBrowser, QComboBox, QSpinBox, QTableWidget {
     background: #ffffff;
     border: 1px solid #c7d2e2;
     border-radius: 6px;
@@ -66,7 +67,7 @@ QLineEdit, QComboBox, QSpinBox {
     min-height: 28px;
     padding: 2px 7px;
 }
-QPlainTextEdit {
+QPlainTextEdit, QTextBrowser {
     padding: 7px;
 }
 QPushButton {
@@ -113,6 +114,82 @@ QHeaderView::section {
 
 def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+class SafeMarkdownBrowser(QTextBrowser):
+    """Render answer Markdown without navigation or external resource loading."""
+
+    _MARKDOWN_FEATURES = (
+        QTextDocument.MarkdownFeature.MarkdownNoHTML
+        | QTextDocument.MarkdownFeature.MarkdownDialectGitHub
+    )
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setOpenLinks(False)
+        self.setOpenExternalLinks(False)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.document().setDocumentMargin(12)
+        self.document().setDefaultStyleSheet(
+            "h1 { font-size: 20px; margin: 8px 0 5px 0; }"
+            "h2 { font-size: 17px; margin: 7px 0 4px 0; }"
+            "h3 { font-size: 15px; margin: 6px 0 3px 0; }"
+            "p { margin: 4px 0; }"
+            "pre { background-color: #f2f5f9; color: #203247; padding: 8px; }"
+            "code { font-family: Consolas, 'Courier New', monospace; background-color: #f2f5f9; }"
+            "blockquote { color: #526176; margin-left: 12px; }"
+        )
+
+    def loadResource(self, _resource_type, _name):  # noqa: N802 - Qt virtual method
+        return None
+
+    def set_safe_markdown(self, markdown: str) -> None:
+        self.document().setMarkdown(str(markdown or ""), self._MARKDOWN_FEATURES)
+        self._sanitize_document(self.document())
+
+    @classmethod
+    def markdown_to_plain_text(cls, markdown: str) -> str:
+        document = QTextDocument()
+        document.setMarkdown(str(markdown or ""), cls._MARKDOWN_FEATURES)
+        cls._sanitize_document(document)
+        return document.toPlainText().strip()
+
+    @staticmethod
+    def _sanitize_document(document: QTextDocument) -> None:
+        anchors: list[tuple[int, int, QTextCharFormat]] = []
+        images: list[tuple[int, int]] = []
+        block = document.begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    char_format = fragment.charFormat()
+                    if char_format.isImageFormat():
+                        images.append((fragment.position(), fragment.length()))
+                    elif char_format.isAnchor():
+                        anchors.append(
+                            (fragment.position(), fragment.length(), char_format)
+                        )
+                iterator += 1
+            block = block.next()
+        for position, length, char_format in anchors:
+            clean_format = QTextCharFormat(char_format)
+            clean_format.setAnchor(False)
+            clean_format.setAnchorHref("")
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            cursor.setPosition(position + length, QTextCursor.MoveMode.KeepAnchor)
+            cursor.setCharFormat(clean_format)
+        for position, length in reversed(images):
+            cursor = QTextCursor(document)
+            cursor.setPosition(position)
+            cursor.setPosition(position + length, QTextCursor.MoveMode.KeepAnchor)
+            cursor.insertText("［图片已禁用］")
 
 
 class UploadDocumentDialog(QDialog):
@@ -271,6 +348,27 @@ class IngestTaskDialog(QDialog):
 class KnowledgeAssistantDialog(QDialog):
     """Local visual console for the enterprise Knowledge Assistant vertical slice."""
 
+    _TOOL_LABELS = {
+        "ingest_text": "写入并索引文档",
+        "archive_document": "归档文档",
+        "query_knowledge": "知识检索（只读）",
+    }
+    _TASK_STATUS_LABELS = {
+        "awaiting_approval": "待另一位审批人",
+        "queued": "已批准，待执行",
+        "running": "执行中",
+        "succeeded": "执行成功",
+        "rejected": "已拒绝",
+        "cancelled": "已取消",
+        "failed": "失败，需核查",
+    }
+    _APPROVAL_STATUS_LABELS = {
+        "pending": "待决定",
+        "approved": "已批准",
+        "rejected": "已拒绝",
+        "expired": "已过期",
+    }
+
     def __init__(
         self,
         controller: KnowledgeAssistantDesktopController | None = None,
@@ -280,6 +378,7 @@ class KnowledgeAssistantDialog(QDialog):
         self.controller = controller or KnowledgeAssistantDesktopController()
         self._documents: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._citations: list[dict[str, Any]] = []
         self._approval_preview: dict[str, Any] | None = None
         self._approval_task_id = ""
         self._last_trace_id = ""
@@ -294,9 +393,10 @@ class KnowledgeAssistantDialog(QDialog):
         self.setStyleSheet(CONSOLE_STYLE)
 
         root = QVBoxLayout(self)
-        title = QLabel("Knowledge Assistant 2.1 · 本地可视化管理台", self)
-        title.setFont(QFont("Microsoft YaHei UI", 16, QFont.Weight.Bold))
-        root.addWidget(title)
+        self.title_label = QLabel("Knowledge Assistant 2.2 · 日常可信工作台", self)
+        self.title_label.setObjectName("knowledgeAssistantTitle")
+        self.title_label.setFont(QFont("Microsoft YaHei UI", 16, QFont.Weight.Bold))
+        root.addWidget(self.title_label)
         notice = QLabel(
             f"连接：{self.controller.connection_label}。默认由桌面应用托管私有 loopback API，不需要启动 PowerShell。"
             "身份选择仅用于本地验收 RBAC，不是生产登录；生产仍必须使用可信身份网关。"
@@ -305,7 +405,7 @@ class KnowledgeAssistantDialog(QDialog):
         notice.setWordWrap(True)
         notice.setStyleSheet("background:#fff5d9;border:1px solid #e4c978;border-radius:6px;padding:8px;")
         root.addWidget(notice)
-        root.addWidget(self._build_identity_panel())
+        self.identity_panel = self._build_identity_panel()
         self._active_principal = self.controller.principal(
             self.tenant_edit.text(),
             self.user_edit.text(),
@@ -313,6 +413,22 @@ class KnowledgeAssistantDialog(QDialog):
             self.collections_edit.text(),
         )
         self._identity_dirty = False
+        self.role_summary_label = QLabel(self)
+        self.role_summary_label.setObjectName("activeRoleSummary")
+        self.role_summary_label.setWordWrap(True)
+        self.role_summary_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.role_summary_label.setStyleSheet(
+            "background:#eaf7f9;border:1px solid #9dd4dd;border-radius:6px;padding:7px;"
+        )
+        root.addWidget(self.role_summary_label)
+        self.identity_toggle = QPushButton("展开本地验收身份设置", self)
+        self.identity_toggle.setObjectName("toggleLocalIdentity")
+        self.identity_toggle.setCheckable(True)
+        self.identity_toggle.toggled.connect(self._toggle_identity_panel)
+        root.addWidget(self.identity_toggle)
+        self.identity_panel.setVisible(False)
+        root.addWidget(self.identity_panel)
+        self._update_role_summary()
 
         self.tabs = QTabWidget(self)
         self.tabs.setObjectName("knowledgeAssistantTabs")
@@ -321,6 +437,7 @@ class KnowledgeAssistantDialog(QDialog):
         self.tabs.addTab(self._build_tasks_tab(), "任务与审批")
         self.tabs.addTab(self._build_observability_tab(), "观测")
         self.tabs.currentChanged.connect(self._tab_changed)
+        self.tabs.setCurrentIndex(1)
         root.addWidget(self.tabs, 1)
 
         footer = QHBoxLayout()
@@ -409,6 +526,26 @@ class KnowledgeAssistantDialog(QDialog):
     def _build_query_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
+        onboarding = QWidget(tab)
+        onboarding.setObjectName("ragOnboarding")
+        onboarding.setStyleSheet(
+            "#ragOnboarding { background:#eef8ff;border:1px solid #b8d8ee;border-radius:7px; }"
+        )
+        onboarding_layout = QHBoxLayout(onboarding)
+        self.onboarding_label = QLabel(
+            "首次使用：1. 上传并索引资料（上传需 Editor）  "
+            "2. 用 Viewer 提问  3. 选择引用核查证据",
+            onboarding,
+        )
+        self.onboarding_label.setObjectName("ragOnboardingText")
+        self.onboarding_label.setWordWrap(True)
+        self.onboarding_label.setTextFormat(Qt.TextFormat.PlainText)
+        onboarding_layout.addWidget(self.onboarding_label, 1)
+        documents_button = QPushButton("前往文档", onboarding)
+        documents_button.setObjectName("goToDocuments")
+        documents_button.clicked.connect(self._go_to_documents)
+        onboarding_layout.addWidget(documents_button)
+        layout.addWidget(onboarding)
         form = QGridLayout()
         self.query_edit = QPlainTextEdit(tab)
         self.query_edit.setObjectName("ragQuery")
@@ -435,17 +572,37 @@ class KnowledgeAssistantDialog(QDialog):
         self.answer_state = QLabel("尚未查询", tab)
         self.answer_state.setObjectName("ragAnswerState")
         self.answer_state.setWordWrap(True)
+        self.answer_state.setTextFormat(Qt.TextFormat.PlainText)
         self.answer_state.setStyleSheet("font-weight:600;padding:5px;")
         layout.addWidget(self.answer_state)
         splitter = QSplitter(Qt.Orientation.Vertical, tab)
-        self.answer_edit = QPlainTextEdit(splitter)
+        self.answer_edit = SafeMarkdownBrowser(splitter)
         self.answer_edit.setObjectName("ragAnswer")
-        self.answer_edit.setReadOnly(True)
+        self.answer_edit.setMinimumHeight(130)
+        evidence_panel = QWidget(splitter)
+        evidence_layout = QVBoxLayout(evidence_panel)
+        evidence_layout.setContentsMargins(0, 0, 0, 0)
+        evidence_hint = QLabel(
+            "引用可核查：选择一行查看索引位置与纯文本证据；相关度仅用于排序，不代表事实正确率。",
+            evidence_panel,
+        )
+        evidence_hint.setWordWrap(True)
+        evidence_hint.setTextFormat(Qt.TextFormat.PlainText)
+        evidence_layout.addWidget(evidence_hint)
         self.citation_table = self._table(
-            ["引用", "文件", "集合", "位置", "得分", "证据摘录"], parent=splitter
+            ["引用", "文件", "集合", "位置", "得分", "证据摘录"], parent=evidence_panel
         )
         self.citation_table.setObjectName("citationTable")
-        splitter.setSizes([230, 260])
+        self.citation_table.setMinimumHeight(95)
+        self.citation_table.itemSelectionChanged.connect(self._citation_selected)
+        evidence_layout.addWidget(self.citation_table, 1)
+        self.citation_detail = QPlainTextEdit(evidence_panel)
+        self.citation_detail.setObjectName("citationDetail")
+        self.citation_detail.setReadOnly(True)
+        self.citation_detail.setMaximumHeight(100)
+        self.citation_detail.setPlainText("暂无证据详情。完成查询后选择一条引用。")
+        evidence_layout.addWidget(self.citation_detail)
+        splitter.setSizes([250, 310])
         layout.addWidget(splitter, 1)
         return tab
 
@@ -469,12 +626,14 @@ class KnowledgeAssistantDialog(QDialog):
             ["状态", "工具", "请求人", "审批", "创建时间", "任务 ID"], parent=left
         )
         self.task_table.setObjectName("taskTable")
+        self.task_table.setMinimumHeight(135)
         self.task_table.itemSelectionChanged.connect(self._task_selected)
         left_layout.addWidget(self.task_table, 1)
-        left_layout.addWidget(QLabel("任务安全元数据"))
+        left_layout.addWidget(QLabel("任务概览与状态进度（非审批依据）"))
         self.task_detail = QPlainTextEdit(left)
+        self.task_detail.setObjectName("taskSummary")
         self.task_detail.setReadOnly(True)
-        self.task_detail.setMaximumHeight(155)
+        self.task_detail.setMaximumHeight(195)
         left_layout.addWidget(self.task_detail)
         left_layout.addWidget(QLabel("操作收据"))
         self.receipt_detail = QPlainTextEdit(left)
@@ -482,6 +641,17 @@ class KnowledgeAssistantDialog(QDialog):
         self.receipt_detail.setReadOnly(True)
         self.receipt_detail.setMaximumHeight(145)
         left_layout.addWidget(self.receipt_detail)
+        self.task_technical_toggle = QPushButton("显示技术详情（JSON）", left)
+        self.task_technical_toggle.setObjectName("toggleTaskTechnicalDetail")
+        self.task_technical_toggle.setCheckable(True)
+        self.task_technical_toggle.toggled.connect(self._toggle_task_technical_detail)
+        left_layout.addWidget(self.task_technical_toggle)
+        self.task_technical_detail = QPlainTextEdit(left)
+        self.task_technical_detail.setObjectName("taskTechnicalDetail")
+        self.task_technical_detail.setReadOnly(True)
+        self.task_technical_detail.setMaximumHeight(165)
+        self.task_technical_detail.setVisible(False)
+        left_layout.addWidget(self.task_technical_detail)
 
         approval = QGroupBox("人工 Action Preview", splitter)
         approval_layout = QVBoxLayout(approval)
@@ -508,6 +678,14 @@ class KnowledgeAssistantDialog(QDialog):
         self.reject_reason_edit.setObjectName("rejectReason")
         self.reject_reason_edit.setPlaceholderText("拒绝原因（可选，不执行写操作）")
         approval_layout.addWidget(self.reject_reason_edit)
+        self.approval_hint_label = QLabel("请先选择一个任务。", approval)
+        self.approval_hint_label.setObjectName("approvalActionHint")
+        self.approval_hint_label.setWordWrap(True)
+        self.approval_hint_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.approval_hint_label.setStyleSheet(
+            "background:#eef3f8;border:1px solid #cbd6e4;border-radius:6px;padding:6px;"
+        )
+        approval_layout.addWidget(self.approval_hint_label)
         approval_actions = QHBoxLayout()
         self.preview_button = QPushButton("加载精确预览", approval)
         self.preview_button.setObjectName("loadApprovalPreview")
@@ -605,9 +783,58 @@ class KnowledgeAssistantDialog(QDialog):
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         table.horizontalHeader().setStretchLastSection(True)
         return table
+
+    def _toggle_identity_panel(self, expanded: bool) -> None:
+        self.identity_panel.setVisible(expanded)
+        self.identity_toggle.setText(
+            "收起本地验收身份设置" if expanded else "展开本地验收身份设置"
+        )
+
+    def _update_role_summary(self) -> None:
+        if self._identity_dirty:
+            self.role_summary_label.setText(
+                "身份草稿尚未应用：受保护视图和业务操作已冻结。应用后才会切换权限。"
+            )
+            return
+        principal = self._principal()
+        if "admin" in principal.roles:
+            role_name = "Admin"
+            capability = "可读、上传、创建任务和审批；仍严格禁止审批自己请求的任务。"
+        elif "approver" in principal.roles:
+            role_name = "Approver"
+            capability = "可读取并处理其他用户的待审批任务；不能审批自己的任务。"
+        elif "editor" in principal.roles:
+            role_name = "Editor"
+            capability = "可上传资料和创建写任务；自己创建的任务必须由另一位 Approver 审批。"
+        else:
+            role_name = "Viewer"
+            capability = "只读：可查询知识和核查引用，不能上传、创建写任务或审批。"
+        collections = (
+            "全部集合"
+            if principal.collection_ids is None
+            else "、".join(sorted(principal.collection_ids))
+        )
+        self.role_summary_label.setText(
+            f"当前身份：{principal.user_id} · {role_name} · {collections}。{capability}"
+        )
+
+    def _go_to_documents(self) -> None:
+        self.tabs.setCurrentIndex(0)
+        if not self.upload_button.isEnabled():
+            self._set_status(
+                "当前身份没有上传权限。本地验收可展开身份设置，选择 Editor 后应用；"
+                "生产环境应由可信登录身份授权。"
+            )
+
+    def _toggle_task_technical_detail(self, visible: bool) -> None:
+        self.task_technical_detail.setVisible(visible)
+        self.task_technical_toggle.setText(
+            "隐藏技术详情（JSON）" if visible else "显示技术详情（JSON）"
+        )
 
     def _principal(self) -> Principal:
         return self._active_principal
@@ -642,6 +869,7 @@ class KnowledgeAssistantDialog(QDialog):
         self._identity_dirty = True
         self._clear_identity_scoped_views()
         self.tabs.setEnabled(False)
+        self._update_role_summary()
         self._set_status("身份字段已修改。请先点击“应用身份并刷新”，所有业务操作已暂时冻结。")
 
     def _apply_identity(self) -> None:
@@ -659,6 +887,7 @@ class KnowledgeAssistantDialog(QDialog):
         self._identity_dirty = False
         self.tabs.setEnabled(True)
         self._clear_identity_scoped_views()
+        self._update_role_summary()
         self._set_status(
             f"已应用身份：tenant={principal.tenant_id}，user={principal.user_id}，"
             f"roles={','.join(sorted(principal.roles))}。"
@@ -775,11 +1004,56 @@ class KnowledgeAssistantDialog(QDialog):
     def _selected_document(self) -> dict[str, Any] | None:
         return self._documents.get(self._selected_document_id())
 
+    def _clear_citations(self) -> None:
+        self._citations = []
+        self.citation_table.clearSelection()
+        self.citation_table.setRowCount(0)
+        self.citation_detail.setPlainText("暂无证据详情。完成查询后选择一条引用。")
+
+    def _clear_query_result(self, *, state: str, message: str = "") -> None:
+        self.answer_state.setText(state)
+        if message:
+            self.answer_edit.setPlainText(message)
+        else:
+            self.answer_edit.clear()
+        self._clear_citations()
+        self._last_trace_id = ""
+        self.trace_id_edit.clear()
+        self.trace_detail.clear()
+
+    def _citation_selected(self) -> None:
+        row = self.citation_table.currentRow()
+        if row < 0 or row >= len(self._citations):
+            self.citation_detail.setPlainText("暂无证据详情。完成查询后选择一条引用。")
+            return
+        citation = self._citations[row]
+        page = citation.get("page_number")
+        heading = self._summary_value(citation.get("heading"))
+        position = heading
+        if page is not None:
+            page_text = f"第 {self._summary_value(page)} 页"
+            position = f"{heading} / {page_text}" if heading != "—" else page_text
+        excerpt = SafeMarkdownBrowser.markdown_to_plain_text(
+            str(citation.get("excerpt") or "")
+        )
+        self.citation_detail.setPlainText(
+            "证据详情（纯文本，不作为操作指令）\n"
+            f"引用：{self._summary_value(citation.get('id'))}\n"
+            f"文件：{self._summary_value(citation.get('filename'))}\n"
+            f"集合：{self._summary_value(citation.get('collection_id'))}\n"
+            f"位置：{position}\n"
+            f"相关度：{self._summary_value(citation.get('score'))}（仅用于排序）\n"
+            f"文档 ID：{self._summary_value(citation.get('document_id'))}\n"
+            f"Chunk ID：{self._summary_value(citation.get('chunk_id'))}\n\n"
+            f"索引原文摘录：\n{excerpt or '—'}"
+        )
+
     def _run_query(self) -> None:
         query = self.query_edit.toPlainText().strip()
         if not query:
             self._show_error("查询为空", ValueError("请输入至少 2 个字符的问题"))
             return
+        self._clear_query_result(state="正在检索当前知识库…")
         try:
             with self._busy():
                 result = self.controller.query(
@@ -789,10 +1063,16 @@ class KnowledgeAssistantDialog(QDialog):
                     top_k=self.top_k_spin.value(),
                 )
         except Exception as exc:
+            self._clear_query_result(
+                state="查询失败：旧答案与引用已清除。",
+                message="本次查询未完成。为避免混淆，上一次答案与证据已清除。",
+            )
             self._show_error("RAG 查询失败", exc)
             return
-        self.answer_edit.setPlainText(str(result.get("answer") or ""))
-        citations = result.get("citations") if isinstance(result.get("citations"), list) else []
+        self.answer_edit.set_safe_markdown(str(result.get("answer") or ""))
+        raw_citations = result.get("citations") if isinstance(result.get("citations"), list) else []
+        citations = [dict(item) for item in raw_citations if isinstance(item, dict)]
+        self._citations = citations
         retrieval = result.get("retrieval") if isinstance(result.get("retrieval"), dict) else {}
         if result.get("refused"):
             self.answer_state.setText(
@@ -815,10 +1095,17 @@ class KnowledgeAssistantDialog(QDialog):
                 citation.get("collection_id", ""),
                 location,
                 citation.get("score", ""),
-                citation.get("excerpt", ""),
+                SafeMarkdownBrowser.markdown_to_plain_text(
+                    str(citation.get("excerpt") or "")
+                ),
             )
             for column, value in enumerate(values):
                 self.citation_table.setItem(row, column, QTableWidgetItem(str(value)))
+        if citations:
+            self.citation_table.selectRow(0)
+            self.citation_table.setCurrentCell(0, 0)
+        else:
+            self._citation_selected()
         self._last_trace_id = str(result.get("trace_id") or "")
         if self._last_trace_id:
             self.trace_id_edit.setText(self._last_trace_id)
@@ -834,8 +1121,11 @@ class KnowledgeAssistantDialog(QDialog):
             with self._busy():
                 tasks = self.controller.list_tasks(self._principal())
         except Exception as exc:
-            self._tasks = {}
-            self.task_table.setRowCount(0)
+            self._clear_task_views(
+                "任务列表不可用。旧任务概览已清除，请检查连接后重试。",
+                "没有可核查的操作收据。",
+            )
+            self._update_action_permissions()
             if show_error:
                 self._show_error("无法读取任务", exc)
             else:
@@ -845,11 +1135,14 @@ class KnowledgeAssistantDialog(QDialog):
         self.task_table.setRowCount(len(tasks))
         for row, task in enumerate(tasks):
             approval = task.get("approval") if isinstance(task.get("approval"), dict) else {}
+            task_status = str(task.get("status") or "")
+            tool_name = str(task.get("tool_name") or "")
+            approval_status = str(approval.get("status") or "")
             values = (
-                task.get("status", ""),
-                task.get("tool_name", ""),
+                self._TASK_STATUS_LABELS.get(task_status, task_status),
+                self._TOOL_LABELS.get(tool_name, tool_name),
                 task.get("requested_by", ""),
-                approval.get("status", "—"),
+                self._APPROVAL_STATUS_LABELS.get(approval_status, approval_status or "—"),
                 task.get("created_at", ""),
                 task.get("id", ""),
             )
@@ -990,23 +1283,303 @@ class KnowledgeAssistantDialog(QDialog):
         box.exec()
         return box.clickedButton() is create
 
+    @staticmethod
+    def _summary_value(value: object) -> str:
+        if value is None or value == "":
+            return "—"
+        if isinstance(value, (dict, list, tuple)):
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        else:
+            text = str(value)
+        text = " ".join(text.replace("\x00", "").splitlines()).strip()
+        return text[:500] + ("…" if len(text) > 500 else "") if text else "—"
+
+    @classmethod
+    def _safe_task_metadata(cls, task: dict[str, Any]) -> dict[str, Any]:
+        safe_fields = (
+            "id",
+            "tenant_id",
+            "requested_by",
+            "tool_name",
+            "idempotency_key",
+            "status",
+            "error_code",
+            "error_message",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "finished_at",
+            "arguments_integrity",
+        )
+        safe: dict[str, Any] = {
+            key: task.get(key) for key in safe_fields if key in task
+        }
+        tool_name = str(task.get("tool_name") or "")
+        arguments = task.get("arguments") if isinstance(task.get("arguments"), dict) else {}
+        allowed_arguments = {
+            "ingest_text": ("filename", "collection_id", "content_sha256", "byte_size"),
+            "archive_document": (
+                "document_id",
+                "filename",
+                "collection_id",
+                "checksum",
+            ),
+            "query_knowledge": ("query", "collection_ids", "top_k"),
+        }.get(tool_name, ())
+        safe["arguments"] = {
+            key: arguments.get(key) for key in allowed_arguments if key in arguments
+        }
+        approval = task.get("approval") if isinstance(task.get("approval"), dict) else None
+        if approval is not None:
+            allowed_approval = (
+                "id",
+                "status",
+                "requested_by",
+                "decided_by",
+                "requested_at",
+                "decided_at",
+                "expires_at",
+                "reason",
+            )
+            safe["approval"] = {
+                key: approval.get(key) for key in allowed_approval if key in approval
+            }
+        result = task.get("result") if isinstance(task.get("result"), dict) else None
+        if result is not None:
+            safe["result"] = cls._allowlisted_result(tool_name, result)
+        receipt = task.get("receipt") if isinstance(task.get("receipt"), dict) else None
+        if receipt is not None:
+            safe["receipt"] = cls._safe_receipt_metadata(tool_name, receipt)
+        return safe
+
+    @staticmethod
+    def _allowlisted_result(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+        allowed_results = {
+            "ingest_text": (
+                "id",
+                "document_id",
+                "filename",
+                "collection_id",
+                "status",
+                "chunk_count",
+                "deduplicated",
+            ),
+            "archive_document": (
+                "id",
+                "document_id",
+                "filename",
+                "collection_id",
+                "status",
+                "archived",
+            ),
+            "query_knowledge": ("refused", "trace_id"),
+        }.get(tool_name, ())
+        return {key: result.get(key) for key in allowed_results if key in result}
+
+    @classmethod
+    def _safe_receipt_metadata(
+        cls, tool_name: str, receipt: dict[str, Any]
+    ) -> dict[str, Any]:
+        allowed_receipt = (
+            "operation_id",
+            "tool_name",
+            "approved_by",
+            "completed_at",
+            "approved_preview_hash",
+        )
+        safe = {key: receipt.get(key) for key in allowed_receipt if key in receipt}
+        arguments = receipt.get("arguments") if isinstance(receipt.get("arguments"), dict) else {}
+        allowed_arguments = {
+            "ingest_text": ("filename", "collection_id", "content_sha256", "byte_size"),
+            "archive_document": (
+                "document_id",
+                "filename",
+                "collection_id",
+                "checksum",
+            ),
+            "query_knowledge": ("query", "collection_ids", "top_k"),
+        }.get(tool_name, ())
+        safe["arguments"] = {
+            key: arguments.get(key) for key in allowed_arguments if key in arguments
+        }
+        result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+        safe["result"] = cls._allowlisted_result(tool_name, result)
+        return safe
+
+    @classmethod
+    def _task_target_lines(cls, task: dict[str, Any]) -> list[str]:
+        raw_arguments = task.get("arguments")
+        tool_name = str(task.get("tool_name") or "")
+        arguments = cls._safe_task_metadata(task).get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+        if tool_name == "ingest_text":
+            return [
+                f"- 文件：{cls._summary_value(arguments.get('filename'))}",
+                f"- 集合：{cls._summary_value(arguments.get('collection_id'))}",
+                f"- 正文大小：{cls._summary_value(arguments.get('byte_size'))} 字节",
+                f"- 内容 SHA-256：{cls._summary_value(arguments.get('content_sha256'))}",
+            ]
+        if tool_name == "archive_document":
+            return [
+                f"- 文件：{cls._summary_value(arguments.get('filename'))}",
+                f"- 集合：{cls._summary_value(arguments.get('collection_id'))}",
+                f"- 文档 ID：{cls._summary_value(arguments.get('document_id'))}",
+                f"- 校验值：{cls._summary_value(arguments.get('checksum'))}",
+            ]
+        if tool_name == "query_knowledge":
+            return [
+                f"- 查询：{cls._summary_value(arguments.get('query'))}",
+                f"- 集合：{cls._summary_value(arguments.get('collection_ids'))}",
+                f"- Top K：{cls._summary_value(arguments.get('top_k'))}",
+            ]
+        if not arguments:
+            return ["- 当前任务没有可显示的安全参数。"]
+        return [
+            f"- {cls._summary_value(key)}：{cls._summary_value(item)}"
+            for key, item in sorted(arguments.items())
+        ]
+
+    @classmethod
+    def format_task_summary(cls, task: dict[str, Any]) -> str:
+        tool_name = str(task.get("tool_name") or "")
+        status = str(task.get("status") or "unknown")
+        approval = task.get("approval") if isinstance(task.get("approval"), dict) else {}
+        requested_at = approval.get("requested_at") or task.get("created_at")
+        lines = [
+            f"动作：{cls._TOOL_LABELS.get(tool_name, cls._summary_value(tool_name))}",
+            f"状态：{cls._TASK_STATUS_LABELS.get(status, cls._summary_value(status))}",
+            f"请求人：{cls._summary_value(task.get('requested_by'))}",
+            f"创建时间：{cls._summary_value(task.get('created_at'))}",
+            f"最近更新：{cls._summary_value(task.get('updated_at'))}",
+            "",
+            "目标与安全参数：",
+            *cls._task_target_lines(task),
+            "",
+            "状态进度：",
+            f"[完成] 请求已提交：{cls._summary_value(requested_at)}",
+        ]
+        if status == "awaiting_approval":
+            lines.extend(
+                (
+                    "[当前] 等待另一位审批人核对精确 Action Preview 后决定。",
+                    f"[期限] {cls._summary_value(approval.get('expires_at'))}",
+                    "[未开始] 写操作尚未执行。",
+                )
+            )
+        elif status == "queued":
+            if approval:
+                lines.append(
+                    f"[完成] 审批人 {cls._summary_value(approval.get('decided_by'))} 已批准。"
+                )
+            else:
+                lines.append("[完成] 只读任务，无需审批。")
+            lines.append("[当前] 已进入执行队列。")
+        elif status == "running":
+            if approval:
+                lines.append(
+                    f"[完成] 审批人 {cls._summary_value(approval.get('decided_by'))} 已批准。"
+                )
+            else:
+                lines.append("[完成] 只读任务，无需审批。")
+            lines.append(f"[当前] 正在执行：{cls._summary_value(task.get('started_at'))}")
+        elif status == "succeeded":
+            if approval:
+                lines.append(
+                    f"[完成] 审批人：{cls._summary_value(approval.get('decided_by'))}"
+                )
+            else:
+                lines.append("[完成] 只读任务，无需审批。")
+            lines.append(f"[完成] 已成功执行：{cls._summary_value(task.get('finished_at'))}")
+        elif status == "rejected":
+            lines.extend(
+                (
+                    f"[终止] 审批人 {cls._summary_value(approval.get('decided_by'))} 已拒绝。",
+                    f"[原因] {cls._summary_value(approval.get('reason'))}",
+                    "[安全结果] 写操作未执行。",
+                )
+            )
+        elif status == "cancelled":
+            lines.extend(
+                (
+                    f"[终止] 任务已取消：{cls._summary_value(task.get('error_message'))}",
+                    "[提示] 请刷新任务并核对取消原因后再决定是否创建新请求。",
+                )
+            )
+        elif status == "failed":
+            lines.extend(
+                (
+                    f"[失败] {cls._summary_value(task.get('error_code'))}："
+                    f"{cls._summary_value(task.get('error_message'))}",
+                    "[警告] 失败可能伴随局部副作用；请核查文档、收据与 Trace 后再重试。",
+                )
+            )
+        else:
+            lines.append("[提示] 当前状态不能确定执行结果，请核查技术详情与 Trace。")
+        lines.extend(
+            (
+                "",
+                "审批提示：此摘要仅用于浏览；批准依据是右侧加载的精确 Action Preview。",
+            )
+        )
+        return "\n".join(lines)
+
+    @classmethod
+    def format_receipt_summary(cls, task: dict[str, Any]) -> str:
+        receipt = task.get("receipt") if isinstance(task.get("receipt"), dict) else None
+        status = str(task.get("status") or "")
+        if receipt is None:
+            if status == "awaiting_approval":
+                return "尚未执行，因此还没有操作收据。请等待另一位审批人处理。"
+            if status == "rejected":
+                return "任务已拒绝；写操作未执行，因此没有执行收据。"
+            if status == "failed":
+                return "没有成功操作收据。失败可能存在局部副作用，请核查文档状态和 Trace。"
+            if status == "cancelled":
+                return "任务已取消或审批已过期，没有成功操作收据。"
+            return "尚未产生操作收据。"
+        safe_receipt = cls._safe_receipt_metadata(
+            str(task.get("tool_name") or ""), receipt
+        )
+        lines = [
+            "成功操作收据",
+            f"operation_id（操作 ID）：{cls._summary_value(safe_receipt.get('operation_id'))}",
+            f"动作：{cls._summary_value(safe_receipt.get('tool_name'))}",
+            f"审批人：{cls._summary_value(safe_receipt.get('approved_by'))}",
+            f"完成时间：{cls._summary_value(safe_receipt.get('completed_at'))}",
+            f"绑定预览哈希：{cls._summary_value(safe_receipt.get('approved_preview_hash'))}",
+        ]
+        for label, key in (("安全参数", "arguments"), ("执行结果", "result")):
+            value = safe_receipt.get(key)
+            if isinstance(value, dict):
+                lines.append(f"{label}：")
+                lines.extend(
+                    f"- {cls._summary_value(item_key)}：{cls._summary_value(item_value)}"
+                    for item_key, item_value in sorted(value.items())
+                )
+        if str(task.get("tool_name") or "") == "archive_document":
+            lines.append("恢复说明：当前没有自助恢复接口；如需恢复，请由管理员核查并处理。")
+        else:
+            lines.append("恢复说明：如需降低新文档的检索可见性，可另建归档审批任务。")
+        return "\n".join(lines)
+
     def _task_selected(self) -> None:
         task = self._selected_task()
         if task is None:
             self.task_detail.setPlainText("请选择一个任务。")
             self.receipt_detail.setPlainText("没有收据。")
+            self.task_technical_detail.clear()
+            self.task_technical_toggle.setChecked(False)
+            self.task_technical_toggle.setEnabled(False)
             self._clear_approval_preview()
             self._update_action_permissions()
             return
-        safe_task = {
-            key: value
-            for key, value in task.items()
-            if key not in {"receipt", "result"}
-        }
-        safe_task["result"] = task.get("result")
-        self.task_detail.setPlainText(_json_text(safe_task))
-        receipt = task.get("receipt")
-        self.receipt_detail.setPlainText(_json_text(receipt) if receipt else "尚未产生操作收据。")
+        safe_task = self._safe_task_metadata(task)
+        self.task_detail.setPlainText(self.format_task_summary(task))
+        self.receipt_detail.setPlainText(self.format_receipt_summary(task))
+        self.task_technical_detail.setPlainText(_json_text(safe_task))
+        self.task_technical_toggle.setEnabled(True)
+        self.task_technical_toggle.setChecked(False)
         approval = task.get("approval") if isinstance(task.get("approval"), dict) else {}
         preview_still_pending = (
             str(task.get("id")) == self._approval_task_id
@@ -1047,6 +1620,7 @@ class KnowledgeAssistantDialog(QDialog):
                 raise ValueError("approval preview returned a different tenant")
         except Exception as exc:
             self._clear_approval_preview()
+            self._update_action_permissions()
             self._show_error("审批预览加载失败", exc)
             return
         self._approval_preview = preview
@@ -1263,20 +1837,28 @@ class KnowledgeAssistantDialog(QDialog):
         if hasattr(self, "approve_button"):
             self.approve_button.setEnabled(False)
 
+    def _clear_task_views(self, task_message: str, receipt_message: str) -> None:
+        self._clear_approval_preview()
+        self._tasks = {}
+        self.task_table.clearSelection()
+        self.task_table.setRowCount(0)
+        self.task_detail.setPlainText(task_message)
+        self.receipt_detail.setPlainText(receipt_message)
+        self.task_technical_detail.clear()
+        self.task_technical_toggle.setChecked(False)
+        self.task_technical_toggle.setEnabled(False)
+
     def _clear_identity_scoped_views(self) -> None:
         self._clear_approval_preview()
         self._documents = {}
         self.document_table.setRowCount(0)
         self.document_detail.clear()
-        self._tasks = {}
-        self.task_table.setRowCount(0)
-        self.task_detail.clear()
-        self.receipt_detail.clear()
+        self._clear_task_views("", "")
         self.query_edit.clear()
         self.query_collections_edit.clear()
         self.answer_state.setText("尚未查询")
         self.answer_edit.clear()
-        self.citation_table.setRowCount(0)
+        self._clear_citations()
         self._last_trace_id = ""
         self.trace_id_edit.clear()
         self.trace_detail.clear()
@@ -1376,6 +1958,16 @@ class KnowledgeAssistantDialog(QDialog):
         except (ValueError, TypeError):
             return
         if self._identity_dirty:
+            if hasattr(self, "approval_hint_label"):
+                reason = "身份草稿尚未应用；所有审批操作已冻结。"
+                self.approval_hint_label.setText(reason)
+                for button in (
+                    self.preview_button,
+                    self.approve_button,
+                    self.reject_button,
+                    self.defer_button,
+                ):
+                    button.setToolTip(reason)
             return
         permissions = principal.permissions
         can_write = "knowledge:write" in permissions
@@ -1388,27 +1980,74 @@ class KnowledgeAssistantDialog(QDialog):
             == self._principal_signature(principal)
         )
         self.upload_button.setEnabled(can_write)
+        self.upload_button.setToolTip(
+            "上传并索引文档。"
+            if can_write
+            else "当前 Viewer 没有上传权限；请使用 Editor 身份。"
+        )
         self.archive_task_button.setText(
             "重试/处理未确认归档任务"
             if has_archive_retry
             else "为所选文档创建归档审批任务"
         )
+        has_selected_document = self._selected_document() is not None
         self.archive_task_button.setEnabled(
-            can_create_task and (self._selected_document() is not None or has_archive_retry)
+            can_create_task and (has_selected_document or has_archive_retry)
         )
+        if not can_create_task:
+            self.archive_task_button.setToolTip("当前身份不能创建归档任务；请使用 Editor。")
+        elif not has_selected_document and not has_archive_retry:
+            self.archive_task_button.setToolTip("请先选择需要申请归档的文档。")
+        else:
+            self.archive_task_button.setToolTip("创建待另一位审批人处理的归档任务。")
         self.create_task_button.setEnabled(can_create_task)
+        self.create_task_button.setToolTip(
+            "创建待另一位审批人处理的写入任务。"
+            if can_create_task
+            else "当前身份不能创建写入任务；请使用 Editor。"
+        )
         task = self._selected_task()
         awaiting = bool(task and task.get("status") == "awaiting_approval")
+        approval = task.get("approval") if isinstance(task and task.get("approval"), dict) else {}
+        approval_pending = bool(approval.get("status") == "pending")
         independent = bool(task and task.get("requested_by") != principal.user_id)
-        self.preview_button.setEnabled(can_approve and awaiting and independent)
-        self.reject_button.setEnabled(can_approve and awaiting and independent)
-        self.defer_button.setEnabled(self._approval_preview is not None)
-        self.approve_button.setEnabled(
-            can_approve
-            and awaiting
-            and independent
+        eligible = can_approve and awaiting and approval_pending and independent
+        preview_current = bool(
+            eligible
             and self._approval_preview is not None
             and self._approval_task_id == self._selected_task_id()
+        )
+        self.preview_button.setEnabled(eligible)
+        self.reject_button.setEnabled(eligible)
+        self.defer_button.setEnabled(preview_current)
+        self.approve_button.setEnabled(preview_current)
+        if task is None:
+            reason = "请先选择一个任务。"
+        elif not can_approve:
+            reason = "当前身份没有审批权限；请使用独立的 Approver。"
+        elif not independent:
+            reason = "请求人不能审批自己的任务，请由另一位 Approver 处理。"
+        elif not awaiting or not approval_pending:
+            reason = "该任务已决定、已失效或不再处于待审批状态，不能再次处理。"
+        elif not preview_current:
+            reason = (
+                "可拒绝并结束任务（删除暂存正文，不执行写操作）；"
+                "批准前必须加载绑定当前审批人的精确预览。"
+            )
+        else:
+            reason = "精确预览已加载。请核对目标、参数、后果和恢复限制后再决定。"
+        self.approval_hint_label.setText(reason)
+        self.preview_button.setToolTip(
+            "加载与当前审批人绑定的精确 Action Preview。" if eligible else reason
+        )
+        self.approve_button.setToolTip(
+            "批准并只执行当前精确预览中的动作。" if preview_current else reason
+        )
+        self.reject_button.setToolTip(
+            "拒绝会结束任务并删除暂存正文，但不会执行写操作。" if eligible else reason
+        )
+        self.defer_button.setToolTip(
+            "关闭当前预览，任务保持待审批。" if preview_current else reason
         )
 
     @staticmethod
