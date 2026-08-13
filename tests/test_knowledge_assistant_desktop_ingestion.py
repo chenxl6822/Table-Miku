@@ -7,7 +7,7 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEventLoop, QTimer, Qt
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 
@@ -1693,7 +1693,38 @@ def test_real_coordinator_api_and_service_complete_without_freezing_qt(tmp_path:
     source = tmp_path / "real.md"
     source.write_text("background ingestion remains responsive", encoding="utf-8")
     updates: list[dict] = []
-    coordinator.updated.connect(updates.append)
+    observed_job_id = ""
+    terminal_job: dict = {}
+    poll_errors: list[Exception] = []
+    event_loop_ticks = 0
+    completion_loop = QEventLoop(app)
+    poll_timer = QTimer()
+    poll_timer.setInterval(250)
+    timeout_timer = QTimer()
+    timeout_timer.setSingleShot(True)
+    timeout_timer.timeout.connect(completion_loop.quit)
+
+    def record_update(update: dict) -> None:
+        nonlocal observed_job_id
+        updates.append(update)
+        observed_job_id = str(update.get("job_id") or observed_job_id)
+
+    def poll_exact_job() -> None:
+        nonlocal event_loop_ticks, terminal_job
+        event_loop_ticks += 1
+        if not observed_job_id:
+            return
+        try:
+            job = controller.get_ingestion_job(_principal(), observed_job_id)
+        except Exception as exc:
+            poll_errors.append(exc)
+            return
+        if job.get("status") in {"succeeded", "failed", "cancelled"}:
+            terminal_job = job
+            completion_loop.quit()
+
+    coordinator.updated.connect(record_update)
+    poll_timer.timeout.connect(poll_exact_job)
     try:
         coordinator.submit_files(
             _principal(),
@@ -1702,28 +1733,27 @@ def test_real_coordinator_api_and_service_complete_without_freezing_qt(tmp_path:
             generation=1,
             expected_snapshots=[_snapshot(source)],
         )
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            app.processEvents()
-            coordinator.refresh(_principal(), generation=1)
-            QTest.qWait(100)
-            if any(
-                item.get("status") == "snapshot"
-                and any(job.get("status") == "succeeded" for job in item.get("jobs", []))
-                for item in updates
-            ):
-                break
+        poll_timer.start()
+        timeout_timer.start(10_000)
+        completion_loop.exec()
 
         assert any(item.get("status") == "queued" for item in updates)
-        assert any(
-            item.get("status") == "snapshot"
-            and any(job.get("status") == "succeeded" for job in item.get("jobs", []))
-            for item in updates
-        )
+        assert event_loop_ticks > 0
+        assert observed_job_id, {"updates": updates, "poll_errors": poll_errors}
+        assert terminal_job.get("status") == "succeeded", {
+            "job": terminal_job,
+            "updates": updates,
+            "poll_errors": poll_errors,
+        }
+        assert terminal_job.get("document_id")
         assert controller.list_documents(_principal())[0]["filename"] == "real.md"
     finally:
-        assert coordinator.shutdown(2000)
-        controller.close()
+        poll_timer.stop()
+        timeout_timer.stop()
+        coordinator_closed = coordinator.shutdown(2000)
+        controller_closed = controller.close()
+        assert coordinator_closed
+        assert controller_closed
 
 
 def test_late_local_cancel_after_worker_completion_is_durably_handed_off_once(
