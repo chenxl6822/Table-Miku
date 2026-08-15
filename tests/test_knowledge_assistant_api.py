@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -382,3 +383,46 @@ def test_api_rejects_non_list_collection_scope(tmp_path: Path):
     assert status == "400 Bad Request"
     assert result["error"]["code"] == "invalid_request"
     assert "must be a list" in result["error"]["message"]
+
+
+def test_document_checksum_lookup_is_read_only_and_scoped(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    headers = auth_headers("editor", "editor-a")
+    headers["Idempotency-Key"] = "lookup-seed-001"
+    content = b"lookup-bytes"
+    digest = hashlib.sha256(content).hexdigest()
+    upload_status, created = call_api(
+        KnowledgeAssistantApi(service),
+        "POST",
+        "/v1/documents",
+        body={
+            "filename": "seed.md",
+            "collection_id": "engineering",
+            "content_base64": base64.b64encode(content).decode(),
+        },
+        headers=headers,
+    )
+    status, payload = call_api(
+        KnowledgeAssistantApi(service),
+        "POST",
+        "/v1/documents/lookup",
+        body={"collection_id": "engineering", "checksums": [digest]},
+        headers=auth_headers("viewer", "viewer-a"),
+    )
+    other_tenant = auth_headers("editor", "editor-b")
+    other_tenant["X-Tenant-ID"] = "tenant-b"
+    miss_status, missed = call_api(
+        KnowledgeAssistantApi(service),
+        "POST",
+        "/v1/documents/lookup",
+        body={"collection_id": "engineering", "checksums": [digest]},
+        headers=other_tenant,
+    )
+
+    assert upload_status == "201 Created"
+    assert status == "200 OK"
+    assert payload["items"][0]["id"] == created["id"]
+    assert payload["items"][0]["filename"] == "seed.md"
+    assert "content" not in payload["items"][0]
+    assert miss_status == "200 OK"
+    assert missed["items"] == []

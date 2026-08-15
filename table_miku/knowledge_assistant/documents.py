@@ -21,8 +21,10 @@ from .observability import TraceRecorder
 
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 MAX_PDF_PAGES = 500
+MAX_CHECKSUM_LOOKUPS = 20
 SUPPORTED_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".json", ".pdf"})
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def utc_now() -> str:
@@ -496,6 +498,56 @@ class DocumentService:
         with self.database.connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def find_indexed_by_checksums(
+        self,
+        principal: Principal,
+        *,
+        collection_id: str,
+        checksums: list[str],
+    ) -> list[dict[str, str]]:
+        principal.require("knowledge:read")
+        collection_id = self._collection_id(collection_id)
+        principal.require_collection(collection_id)
+        if not isinstance(checksums, list):
+            raise ValueError("checksums must be a list")
+        if len(checksums) > MAX_CHECKSUM_LOOKUPS:
+            raise ValueError(f"checksums must not exceed {MAX_CHECKSUM_LOOKUPS} values")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in checksums:
+            digest = str(raw).strip().lower()
+            if _SHA256_HEX.fullmatch(digest) is None:
+                raise ValueError("checksum must be a 64-character SHA-256 hex digest")
+            if digest not in seen:
+                seen.add(digest)
+                cleaned.append(digest)
+        if not cleaned:
+            return []
+        placeholders = ",".join("?" for _ in cleaned)
+        query = (
+            "SELECT id, filename, collection_id, checksum FROM documents "
+            "WHERE tenant_id = ? AND collection_id = ? AND archived = 0 "
+            f"AND status = 'indexed' AND checksum IN ({placeholders})"
+        )
+        params: list[Any] = [principal.tenant_id, collection_id, *cleaned]
+        with self.database.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        by_checksum = {str(row["checksum"]): dict(row) for row in rows}
+        matches: list[dict[str, str]] = []
+        for digest in cleaned:
+            item = by_checksum.get(digest)
+            if item is None:
+                continue
+            matches.append(
+                {
+                    "id": str(item["id"]),
+                    "filename": str(item["filename"]),
+                    "collection_id": str(item["collection_id"]),
+                    "checksum": str(item["checksum"]),
+                }
+            )
+        return matches
 
     def archive(self, principal: Principal, document_id: str) -> dict[str, Any]:
         principal.require("knowledge:write")
