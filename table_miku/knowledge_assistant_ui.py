@@ -42,6 +42,7 @@ from .knowledge_assistant_batch_paths import expand_batch_upload_paths
 from .knowledge_assistant_approval_inbox import (
     can_use_approval_inbox,
     format_expiry_cell,
+    format_inbox_expiry_hint,
     select_inbox_tasks,
 )
 from .knowledge_assistant_batch_summary import summarize_ingestion_batch
@@ -1328,6 +1329,11 @@ class KnowledgeAssistantDialog(QDialog):
         task_actions.addWidget(self.task_filter_label)
         task_actions.addWidget(self.task_filter)
         left_layout.addLayout(task_actions)
+        self.task_expiry_hint = QLabel("", left)
+        self.task_expiry_hint.setObjectName("taskExpiryHint")
+        self.task_expiry_hint.setWordWrap(True)
+        self.task_expiry_hint.setTextFormat(Qt.TextFormat.PlainText)
+        left_layout.addWidget(self.task_expiry_hint)
         self.task_table = self._table(
             ["状态", "工具", "请求人", "审批", "到期", "创建时间", "任务 ID"], parent=left
         )
@@ -2442,6 +2448,13 @@ class KnowledgeAssistantDialog(QDialog):
                 self.task_table.setItem(row, column, item)
         self._restore_selection(self.task_table, selected_id)
         self._task_selected()
+        if hasattr(self, "task_expiry_hint"):
+            if can_use_approval_inbox(principal.permissions):
+                self.task_expiry_hint.setText(
+                    format_inbox_expiry_hint(list(self._tasks.values()), principal.user_id)
+                )
+            else:
+                self.task_expiry_hint.clear()
 
     def _create_ingest_task(self) -> None:
         principal = self._principal()
@@ -3161,6 +3174,8 @@ class KnowledgeAssistantDialog(QDialog):
             self.ingestion_detail.clear()
         if hasattr(self, "ingestion_batch_summary"):
             self.ingestion_batch_summary.clear()
+        if hasattr(self, "task_expiry_hint"):
+            self.task_expiry_hint.clear()
         self._set_status("受保护视图已清空。")
 
     def _tab_changed(self, index: int) -> None:
@@ -3282,6 +3297,10 @@ class KnowledgeAssistantDialog(QDialog):
             show_inbox = can_use_approval_inbox(permissions)
             self.task_filter.setVisible(show_inbox)
             self.task_filter_label.setVisible(show_inbox)
+            if hasattr(self, "task_expiry_hint"):
+                self.task_expiry_hint.setVisible(show_inbox)
+                if not show_inbox:
+                    self.task_expiry_hint.clear()
             if not show_inbox and str(self.task_filter.currentData() or "") == "inbox":
                 self.task_filter.blockSignals(True)
                 self.task_filter.setCurrentIndex(0)

@@ -405,6 +405,73 @@ def test_editor_hides_inbox_filter_and_expired_cell_is_plain_text(tmp_path: Path
         _close(dialog, controller)
 
 
+def test_approver_expiry_hint_counts_expired_and_soon_inbox_tasks(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="human-approver",
+            role="approver",
+            collections="engineering",
+        )
+        dialog.tabs.setCurrentIndex(2)
+        soon_at = (datetime.now(timezone.utc) + timedelta(seconds=45)).replace(microsecond=0)
+        soon = soon_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        dialog._tasks = {
+            "task-exp": {
+                "id": "task-exp",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "editor-a",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            },
+            "task-soon": {
+                "id": "task-soon",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "editor-a",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": soon},
+            },
+            "task-own": {
+                "id": "task-own",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "human-approver",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            },
+        }
+        dialog._render_task_items()
+        hint = dialog.task_expiry_hint
+        assert hint.objectName() == "taskExpiryHint"
+        assert hint.textFormat() == Qt.TextFormat.PlainText
+        assert not hint.isHidden()
+        assert "待我审批 2 个" in hint.text()
+        assert "已过期 1" in hint.text()
+        assert "即将到期 1" in hint.text()
+        cells = [dialog.task_table.item(row, 4).text() for row in range(dialog.task_table.rowCount())]
+        assert any(text.startswith("即将到期 ") for text in cells)
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        dialog.tabs.setCurrentIndex(2)
+        assert dialog.task_expiry_hint.isHidden()
+        assert dialog.task_expiry_hint.text() == ""
+    finally:
+        _close(dialog, controller)
+
+
 def test_console_renders_citations_then_clears_them_on_refusal(tmp_path: Path):
     _app()
     controller = _controller(tmp_path)
