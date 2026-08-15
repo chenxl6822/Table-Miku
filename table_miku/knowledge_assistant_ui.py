@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from .knowledge_assistant.auth import Principal
 from .knowledge_assistant.client import KnowledgeAssistantApiError
 from .knowledge_assistant_batch_paths import expand_batch_upload_paths
+from .knowledge_assistant_batch_summary import summarize_ingestion_batch
 from .knowledge_assistant_collection_mru import CollectionMruStore
 from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 from .knowledge_assistant_desktop import MAX_BATCH_FILES
@@ -995,6 +996,7 @@ class KnowledgeAssistantDialog(QDialog):
         self._needs_refresh_on_show = False
         self._ingestion_generation = 0
         self._ingestion_items: dict[str, dict[str, Any]] = {}
+        self._ingestion_batch_ids: tuple[str, ...] = ()
         self._ingestion_recovery: dict[str, dict[str, Any]] = {}
         self._ingestion_coordinator = None
         self._ingestion_unavailable_reason = ""
@@ -1155,7 +1157,8 @@ class KnowledgeAssistantDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         intro = QLabel(
-            "这里展示后台摄取和失败恢复。进度只显示真实阶段；“取消请求中”不等于已经取消。",
+            "这里展示后台摄取和失败恢复。进度只显示真实阶段；“取消请求中”不等于已经取消。"
+            "最近一次确认提交的批次会显示计数和失败文件名，不会自动重试。",
             tab,
         )
         intro.setWordWrap(True)
@@ -1186,6 +1189,11 @@ class KnowledgeAssistantDialog(QDialog):
         actions.addWidget(QLabel("筛选", tab))
         actions.addWidget(self.ingestion_filter)
         layout.addLayout(actions)
+        self.ingestion_batch_summary = QLabel("", tab)
+        self.ingestion_batch_summary.setObjectName("ingestionBatchSummary")
+        self.ingestion_batch_summary.setWordWrap(True)
+        self.ingestion_batch_summary.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.ingestion_batch_summary)
         self.ingestion_table = self._table(
             ["状态", "文件", "集合", "真实阶段/说明", "任务 ID"], tab
         )
@@ -1714,7 +1722,9 @@ class KnowledgeAssistantDialog(QDialog):
             self._show_error("无法加入摄取队列", exc)
             return
         self._collection_mru.remember(self._principal(), collection_id)
+        self._ingestion_batch_ids = tuple(str(item) for item in local_ids if str(item))
         self.tabs.setCurrentIndex(4)
+        self._render_ingestion_items()
         self._set_status(
             f"已将 {len(local_ids)} 个文件加入后台摄取队列；关闭管理台后任务仍会继续。"
         )
@@ -1755,6 +1765,11 @@ class KnowledgeAssistantDialog(QDialog):
             return
         status = str(update.get("status") or "")
         if status == "snapshot":
+            previous_local_by_job = {
+                str(value.get("job_id") or ""): str(value.get("local_id") or "")
+                for value in self._ingestion_items.values()
+                if value.get("job_id") and value.get("local_id")
+            }
             jobs = update.get("jobs") if isinstance(update.get("jobs"), list) else []
             server_items = {
                 f"job:{job_id}": self._safe_ingestion_server_item(item, job_id)
@@ -1762,6 +1777,10 @@ class KnowledgeAssistantDialog(QDialog):
                 if isinstance(item, dict)
                 and (job_id := str(item.get("id") or item.get("job_id") or "").strip())
             }
+            for item in server_items.values():
+                local_id = previous_local_by_job.get(str(item.get("job_id") or ""), "")
+                if local_id:
+                    item["local_id"] = local_id
             server_job_ids = {
                 str(value.get("job_id") or "") for value in server_items.values()
             }
@@ -1968,6 +1987,11 @@ class KnowledgeAssistantDialog(QDialog):
                 self.ingestion_table.setItem(row, column, cell)
         self._restore_selection(self.ingestion_table, selected_key)
         self._ingestion_selected()
+        if hasattr(self, "ingestion_batch_summary"):
+            summary = summarize_ingestion_batch(
+                self._ingestion_batch_ids, self._ingestion_items
+            )
+            self.ingestion_batch_summary.setText(summary.as_text())
 
     def _selected_ingestion(self) -> tuple[str, dict[str, Any]] | None:
         row = self.ingestion_table.currentRow()
@@ -3101,10 +3125,13 @@ class KnowledgeAssistantDialog(QDialog):
         self.reject_reason_edit.clear()
         self._clear_metrics("身份已改变，等待刷新")
         self._ingestion_items = {}
+        self._ingestion_batch_ids = ()
         self._ingestion_recovery = {}
         if hasattr(self, "ingestion_table"):
             self.ingestion_table.setRowCount(0)
             self.ingestion_detail.clear()
+        if hasattr(self, "ingestion_batch_summary"):
+            self.ingestion_batch_summary.clear()
         self._set_status("受保护视图已清空。")
 
     def _tab_changed(self, index: int) -> None:
