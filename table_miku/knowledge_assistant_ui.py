@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from .knowledge_assistant.auth import Principal
 from .knowledge_assistant.client import KnowledgeAssistantApiError
+from .knowledge_assistant_batch_paths import expand_batch_upload_paths
 from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 from .knowledge_assistant_desktop import MAX_BATCH_FILES
 from .knowledge_assistant_file_precheck import FilePrecheckController, PrecheckBatchResult
@@ -303,7 +304,8 @@ class BatchUploadDialog(QDialog):
         self.intro_label = QLabel(
             f"这是当前 Editor 身份的直接写入，一次最多选择 {MAX_BATCH_FILES} 个文件，"
             "无需审批。每个文件独立摄取，部分成功不会回滚；PDF 仅支持文本层，不支持 OCR。"
-            "选择或拖放文件后会在后台校验 SHA-256，可取消尚未确认的预检。",
+            "可选择或拖放文件/文件夹；文件夹会做有界展开（最多 3 层、200 个条目），"
+            "随后在后台校验 SHA-256，可取消尚未确认的预检。",
             self,
         )
         self.intro_label.setWordWrap(True)
@@ -314,6 +316,10 @@ class BatchUploadDialog(QDialog):
         choose.setObjectName("chooseIngestionFiles")
         choose.clicked.connect(self._choose)
         choose_row.addWidget(choose)
+        choose_dir = QPushButton("选择文件夹…", self)
+        choose_dir.setObjectName("chooseIngestionDirectory")
+        choose_dir.clicked.connect(self._choose_directory)
+        choose_row.addWidget(choose_dir)
         self.cancel_precheck_button = QPushButton("取消预检", self)
         self.cancel_precheck_button.setObjectName("cancelFilePrecheck")
         self.cancel_precheck_button.setEnabled(False)
@@ -447,48 +453,48 @@ class BatchUploadDialog(QDialog):
             return
         self._ingest_path_strings(list(filenames))
 
+    def _choose_directory(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "选择知识资料文件夹")
+        if not directory:
+            return
+        self._ingest_path_strings([directory])
+
     def _ingest_path_strings(self, filenames: list[str]) -> None:
         if self._confirming:
             QMessageBox.warning(self, "正在确认", "确认哈希进行中，请稍候再选择或拖放文件。")
             return
-        unique: list[Path] = []
-        seen: set[str] = set()
-        unsupported: list[str] = []
-        directories: list[str] = []
-        for filename in filenames:
-            try:
-                resolved = Path(filename).resolve(strict=True)
-            except OSError as exc:
-                QMessageBox.warning(
-                    self,
-                    "文件不可读取",
-                    f"无法为所选文件建立安全快照，本次没有加入队列：{exc}",
-                )
-                return
-            if resolved.is_dir():
-                directories.append(resolved.name)
-                continue
-            if not resolved.is_file():
-                QMessageBox.warning(
-                    self,
-                    "文件不可读取",
-                    "只能选择普通文件；本次没有加入队列。",
-                )
-                return
-            if resolved.suffix.casefold() not in BATCH_UPLOAD_SUFFIXES:
-                unsupported.append(resolved.name)
-                continue
-            key = str(resolved).casefold()
-            if key not in seen:
-                seen.add(key)
-                unique.append(resolved)
-        if directories:
-            QMessageBox.warning(
-                self,
-                "不支持目录",
-                "本版本只支持拖放或选择文件，不支持目录导入。本次没有加入队列。",
+        expansion = expand_batch_upload_paths(
+            [Path(name) for name in filenames],
+            suffixes=BATCH_UPLOAD_SUFFIXES,
+            max_files=MAX_BATCH_FILES,
+        )
+        error_messages = {
+            "too_many_files": (
+                "文件过多",
+                f"一次最多选择 {MAX_BATCH_FILES} 个文件；本次没有加入队列。",
+            ),
+            "too_many_visits": (
+                "目录过大",
+                "目录条目超过预检上限；本次没有加入队列。",
+            ),
+            "directory_too_deep": (
+                "目录过深",
+                "目录层级超过 3 层；本次没有加入队列。",
+            ),
+            "unreadable": (
+                "文件不可读取",
+                "无法为所选路径建立安全快照，本次没有加入队列。",
+            ),
+        }
+        if expansion.error is not None:
+            title, message = error_messages.get(
+                expansion.error,
+                ("文件不可读取", "无法为所选路径建立安全快照，本次没有加入队列。"),
             )
+            QMessageBox.warning(self, title, message)
             return
+        unique = list(expansion.files)
+        unsupported = list(expansion.skipped_unsupported)
         if unsupported and not unique:
             QMessageBox.warning(
                 self,
@@ -504,13 +510,6 @@ class BatchUploadDialog(QDialog):
                 + ("…" if len(unsupported) > 5 else ""),
             )
         if not unique:
-            return
-        if len(unique) > MAX_BATCH_FILES:
-            QMessageBox.warning(
-                self,
-                "文件过多",
-                f"一次最多选择 {MAX_BATCH_FILES} 个文件；本次没有加入队列。",
-            )
             return
         self._start_precheck(unique, confirming=False)
 
