@@ -33,3 +33,11 @@ beats the single-Agent score. Do not add a real API call to CI, and do not commi
 输入为 `knowledge_assistant_corpus.jsonl` 与 `knowledge_assistant_cases.jsonl`，结果写入已忽略的
 `evals/results/knowledge_assistant_latest.json`。质量门要求：检索召回率至少 95%、首条引用准确率至少
 85%、引用覆盖率 100%、拒答准确率 100%。
+
+扩展金标集（`--suite gold`）另含冲突文档与 `required_phrases` 引用忠实度检查。A/B 对比：
+
+```powershell
+.\.venv\Scripts\python.exe evals\run_knowledge_assistant_evals.py --suite gold --ab hash,bow
+```
+
+可选本地语义 provider 需额外安装 `requirements-ka2-semantic.txt`，且**不得**在未过金标门槛前把默认 embedding 切离 `local-hash-v1-384`。

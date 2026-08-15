@@ -7,7 +7,7 @@ from typing import Any
 
 from .auth import Principal
 from .database import AssistantDatabase
-from .embeddings import HashingEmbedding, estimate_tokens, text_tokens
+from .embeddings import EmbeddingProvider, estimate_tokens, text_tokens
 from .observability import TraceRecorder
 
 
@@ -33,7 +33,7 @@ class RagService:
     def __init__(
         self,
         database: AssistantDatabase,
-        embedding: HashingEmbedding,
+        embedding: EmbeddingProvider,
         traces: TraceRecorder,
         *,
         default_min_score: float = 0.24,
