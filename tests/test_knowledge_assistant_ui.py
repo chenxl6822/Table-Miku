@@ -1878,6 +1878,165 @@ def test_batch_upload_enters_background_queue_without_blocking_ui(tmp_path: Path
         _close(dialog, controller)
 
 
+def test_ingestion_tab_shows_last_batch_summary_with_failed_filename(
+    tmp_path: Path, monkeypatch
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    source = tmp_path / "guide.md"
+    source.write_text("guide", encoding="utf-8")
+
+    class AcceptedBatchDialog:
+        paths = [source]
+        file_snapshots = [
+            {
+                "canonical_path": str(source.resolve()),
+                "size": source.stat().st_size,
+                "mtime_ns": source.stat().st_mtime_ns,
+                "device": source.stat().st_dev,
+                "inode": source.stat().st_ino,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        ]
+        collection_edit = SimpleNamespace(text=lambda: "engineering")
+
+        def __init__(self, _parent=None, **_kwargs):
+            pass
+
+        @staticmethod
+        def exec():
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ui_module, "BatchUploadDialog", AcceptedBatchDialog)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        dialog._choose_batch_upload()
+
+        summary = dialog.ingestion_batch_summary
+        assert summary.objectName() == "ingestionBatchSummary"
+        assert summary.textFormat() == Qt.TextFormat.PlainText
+        assert "本批 1 个" in summary.text()
+        assert "进行中 1" in summary.text()
+
+        dialog._on_ingestion_update(
+            {
+                "local_id": "local-1",
+                "filename": r"C:\vault\secret\guide.md",
+                "collection_id": "engineering",
+                "status": "failed",
+                "error_message": "Document validation failed.",
+                "generation": dialog._ingestion_generation,
+                "principal_signature": dialog._principal_signature(dialog._principal()),
+            }
+        )
+        text = summary.text()
+        assert "成功 0" in text
+        assert "失败 1" in text
+        assert "guide.md：Document validation failed." in text
+        assert r"C:\vault" not in text
+    finally:
+        _close(dialog, controller)
+
+
+def test_ingestion_batch_summary_follows_job_snapshot_and_clears_on_identity_change(
+    tmp_path: Path, monkeypatch
+):
+    _app()
+    controller = _controller(tmp_path)
+    coordinator = _FakeIngestionCoordinator()
+    monkeypatch.setattr(controller, "create_ingestion_coordinator", lambda: coordinator)
+    source = tmp_path / "guide.md"
+    source.write_text("guide", encoding="utf-8")
+
+    class AcceptedBatchDialog:
+        paths = [source]
+        file_snapshots = [
+            {
+                "canonical_path": str(source.resolve()),
+                "size": source.stat().st_size,
+                "mtime_ns": source.stat().st_mtime_ns,
+                "device": source.stat().st_dev,
+                "inode": source.stat().st_ino,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+        ]
+        collection_edit = SimpleNamespace(text=lambda: "engineering")
+
+        def __init__(self, _parent=None, **_kwargs):
+            pass
+
+        @staticmethod
+        def exec():
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ui_module, "BatchUploadDialog", AcceptedBatchDialog)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        dialog._choose_batch_upload()
+        generation = dialog._ingestion_generation
+        signature = dialog._principal_signature(dialog._principal())
+        dialog._on_ingestion_update(
+            {
+                "local_id": "local-1",
+                "job_id": "job-9",
+                "filename": "guide.md",
+                "collection_id": "engineering",
+                "status": "running",
+                "generation": generation,
+                "principal_signature": signature,
+            }
+        )
+        dialog._on_ingestion_update(
+            {
+                "status": "snapshot",
+                "jobs": [
+                    {
+                        "id": "job-9",
+                        "requested_by": "editor-a",
+                        "filename": "guide.md",
+                        "collection_id": "engineering",
+                        "status": "succeeded",
+                    }
+                ],
+                "generation": generation,
+                "principal_signature": signature,
+            }
+        )
+        text = dialog.ingestion_batch_summary.text()
+        assert "本批 1 个" in text
+        assert "成功 1" in text
+        assert "失败 0" in text
+        assert "job:job-9" in dialog._ingestion_items
+        assert "local-1" not in dialog._ingestion_items
+
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-b",
+            role="editor",
+            collections="engineering",
+        )
+        assert dialog.ingestion_batch_summary.text() == ""
+    finally:
+        _close(dialog, controller)
+
+
 def test_ingestion_snapshot_keeps_safe_job_details_and_recovery_across_refresh(
     tmp_path: Path,
     monkeypatch,
