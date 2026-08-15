@@ -25,8 +25,10 @@ from PySide6.QtWidgets import (
 )
 
 from table_miku.knowledge_assistant import KnowledgeAssistantService
+from table_miku.knowledge_assistant.auth import Principal
 from table_miku.knowledge_assistant.client import KnowledgeAssistantApiError
 from table_miku.knowledge_assistant.documents import MAX_DOCUMENT_BYTES
+from table_miku.knowledge_assistant_collection_mru import CollectionMruStore
 from table_miku.knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 import table_miku.knowledge_assistant_ui as ui_module
 from table_miku.knowledge_assistant_ui import (
@@ -1088,7 +1090,7 @@ def test_uncertain_upload_and_ingest_retries_reuse_the_exact_intent_and_key(
     prepared_paths: list[Path] = []
 
     class FakeUploadDialog:
-        def __init__(self, _controller, _parent, *, draft=None):
+        def __init__(self, _controller, _parent, *, draft=None, **_kwargs):
             upload_seen_drafts.append(dict(draft) if draft is not None else None)
             values = draft or {
                 "path": str(tmp_path / "uncertain.md"),
@@ -1237,7 +1239,7 @@ def test_definite_write_error_discards_retry_capsule(tmp_path: Path, monkeypatch
     dialog = KnowledgeAssistantDialog(controller)
 
     class FakeUploadDialog:
-        def __init__(self, _controller, _parent, *, draft=None):
+        def __init__(self, _controller, _parent, *, draft=None, **_kwargs):
             assert draft is None
             self.path_edit = SimpleNamespace(text=lambda: str(tmp_path / "definite.md"))
             self.collection_edit = SimpleNamespace(text=lambda: "engineering")
@@ -1567,6 +1569,48 @@ def test_batch_upload_choose_directory_enters_precheck(tmp_path: Path, monkeypat
         dialog.close()
 
 
+def test_batch_upload_restricted_collection_combo_lists_allowlist(tmp_path: Path):
+    _app()
+    principal = Principal(
+        "tenant-a",
+        "editor-1",
+        frozenset({"editor"}),
+        frozenset({"ops", "legal"}),
+    )
+    store = CollectionMruStore(tmp_path / "collection_mru.json")
+    store.remember(principal, "legal")
+    dialog = BatchUploadDialog(principal=principal, collection_mru=store)
+    try:
+        items = [dialog.collection_edit.itemText(index) for index in range(dialog.collection_edit.count())]
+        assert items[0] == "legal"
+        assert set(items) == {"legal", "ops"}
+        assert dialog.collection_edit.isEditable() is False
+        assert dialog.collection_edit.objectName() == "batchUploadCollection"
+    finally:
+        dialog.close()
+
+
+def test_batch_upload_deny_all_blocks_accept(tmp_path: Path, monkeypatch):
+    _app()
+    source = tmp_path / "notes.md"
+    source.write_text("notes", encoding="utf-8")
+    principal = Principal("tenant-a", "editor-1", frozenset({"editor"}), frozenset())
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    dialog = BatchUploadDialog(principal=principal)
+    try:
+        dialog._paths = [source]
+        dialog.accept()
+        assert warnings and warnings[-1][0] == "没有可用集合"
+        assert dialog.result() != QDialog.DialogCode.Accepted
+    finally:
+        dialog.close()
+
+
 def test_batch_upload_preview_is_specific_and_fails_closed_if_a_file_changes(
     tmp_path: Path,
     monkeypatch,
@@ -1756,7 +1800,7 @@ def test_batch_upload_enters_background_queue_without_blocking_ui(tmp_path: Path
         ]
         collection_edit = SimpleNamespace(text=lambda: "engineering")
 
-        def __init__(self, _parent=None):
+        def __init__(self, _parent=None, **_kwargs):
             pass
 
         @staticmethod
@@ -1783,6 +1827,9 @@ def test_batch_upload_enters_background_queue_without_blocking_ui(tmp_path: Path
         assert generation == dialog._ingestion_generation
         assert snapshots == AcceptedBatchDialog.file_snapshots
         assert dialog.tabs.currentIndex() == 4
+        assert dialog._collection_mru.suggestions(dialog._principal())[0] == "engineering"
+        other = Principal("tenant-a", "editor-b", frozenset({"editor"}))
+        assert dialog._collection_mru.suggestions(other) == ["default"]
     finally:
         _close(dialog, controller)
 

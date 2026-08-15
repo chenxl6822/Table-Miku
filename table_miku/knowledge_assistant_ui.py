@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from .knowledge_assistant.auth import Principal
 from .knowledge_assistant.client import KnowledgeAssistantApiError
 from .knowledge_assistant_batch_paths import expand_batch_upload_paths
+from .knowledge_assistant_collection_mru import CollectionMruStore
 from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 from .knowledge_assistant_desktop import MAX_BATCH_FILES
 from .knowledge_assistant_file_precheck import FilePrecheckController, PrecheckBatchResult
@@ -200,6 +201,57 @@ class SafeMarkdownBrowser(QTextBrowser):
             cursor.insertText("［图片已禁用］")
 
 
+class CollectionIdEdit(QComboBox):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._read_only = False
+
+    def configure(self, principal: Principal, suggestions: list[str], *, current: str) -> None:
+        deny_all = principal.collection_ids is not None and not principal.collection_ids
+        restricted = principal.collection_ids is not None
+        self.setEditable(not restricted and not self._read_only)
+        self.clear()
+        self.addItems(suggestions)
+        if current:
+            self.setText(current)
+        elif suggestions:
+            self.setCurrentIndex(0)
+        line = self.lineEdit()
+        if line is not None:
+            line.setReadOnly(self._read_only or deny_all)
+
+    def text(self) -> str:
+        return self.currentText().strip()
+
+    def setText(self, value: str) -> None:
+        cleaned = value.strip()
+        if cleaned and self.findText(cleaned) < 0:
+            self.insertItem(0, cleaned)
+        self.setCurrentText(cleaned)
+
+    def setReadOnly(self, read_only: bool) -> None:
+        self._read_only = bool(read_only)
+        self.setEditable(True)
+        line = self.lineEdit()
+        if line is not None:
+            line.setReadOnly(self._read_only)
+
+    def isReadOnly(self) -> bool:
+        return self._read_only
+
+
+def _collection_access_error(principal: Principal, collection_id: str) -> str | None:
+    if principal.collection_ids is not None and not principal.collection_ids:
+        return "没有可用集合"
+    if not collection_id:
+        return "缺少集合"
+    if not principal.can_access_collection(collection_id):
+        return "集合超出范围"
+    return None
+
+
 class UploadDocumentDialog(QDialog):
     def __init__(
         self,
@@ -207,9 +259,13 @@ class UploadDocumentDialog(QDialog):
         parent: QWidget | None = None,
         *,
         draft: dict[str, Any] | None = None,
+        principal: Principal | None = None,
+        collection_mru: CollectionMruStore | None = None,
     ) -> None:
         super().__init__(parent)
         self.controller = controller
+        self._principal = principal or Principal("local", "editor", frozenset({"editor"}))
+        store = collection_mru or CollectionMruStore()
         self.setWindowTitle("上传并索引文档")
         self.resize(650, 240)
         self.setStyleSheet(CONSOLE_STYLE)
@@ -232,8 +288,13 @@ class UploadDocumentDialog(QDialog):
         path_row.addWidget(self.path_edit, 1)
         path_row.addWidget(browse)
         form.addRow("文档文件", path_row)
-        self.collection_edit = QLineEdit((draft or {}).get("collection_id", "default"), self)
+        self.collection_edit = CollectionIdEdit(self)
         self.collection_edit.setObjectName("uploadCollection")
+        self.collection_edit.configure(
+            self._principal,
+            store.suggestions(self._principal),
+            current=str((draft or {}).get("collection_id", "default")),
+        )
         form.addRow("目标集合", self.collection_edit)
         self.idempotency_edit = QLineEdit(
             (draft or {}).get("idempotency_key")
@@ -274,8 +335,16 @@ class UploadDocumentDialog(QDialog):
         if not self.path_edit.text().strip():
             QMessageBox.warning(self, "缺少文件", "请先选择需要索引的文档。")
             return
-        if not self.collection_edit.text().strip():
+        collection_error = _collection_access_error(self._principal, self.collection_edit.text())
+        if collection_error == "缺少集合":
             QMessageBox.warning(self, "缺少集合", "请填写目标集合。")
+            return
+        if collection_error is not None:
+            QMessageBox.warning(
+                self,
+                collection_error,
+                "当前身份不能把文档写入该集合。",
+            )
             return
         if not self.idempotency_edit.text().strip():
             QMessageBox.warning(self, "缺少幂等键", "请填写幂等键。")
@@ -284,8 +353,16 @@ class UploadDocumentDialog(QDialog):
 
 
 class BatchUploadDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        principal: Principal | None = None,
+        collection_mru: CollectionMruStore | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._principal = principal or Principal("local", "editor", frozenset({"editor"}))
+        store = collection_mru or CollectionMruStore()
         self.setWindowTitle("批量添加知识资料")
         self.resize(760, 520)
         self.setStyleSheet(CONSOLE_STYLE)
@@ -355,8 +432,13 @@ class BatchUploadDialog(QDialog):
         self.precheck_progress.setVisible(False)
         layout.addWidget(self.precheck_progress)
         form = QFormLayout()
-        self.collection_edit = QLineEdit("default", self)
+        self.collection_edit = CollectionIdEdit(self)
         self.collection_edit.setObjectName("batchUploadCollection")
+        self.collection_edit.configure(
+            self._principal,
+            store.suggestions(self._principal),
+            current="",
+        )
         form.addRow("目标集合", self.collection_edit)
         layout.addLayout(form)
         buttons = QDialogButtonBox(
@@ -713,8 +795,16 @@ class BatchUploadDialog(QDialog):
                 "请先排除失败项，或重新选择文件。失败项不会被提交。",
             )
             return
-        if not self.collection_edit.text().strip():
+        collection_error = _collection_access_error(self._principal, self.collection_edit.text())
+        if collection_error == "缺少集合":
             QMessageBox.warning(self, "缺少集合", "请填写目标集合。")
+            return
+        if collection_error is not None:
+            QMessageBox.warning(
+                self,
+                collection_error,
+                "当前身份不能把文档写入该集合。",
+            )
             return
         self._start_precheck(list(self._paths), confirming=True)
 
@@ -854,6 +944,7 @@ class KnowledgeAssistantDialog(QDialog):
         self._ingestion_coordinator = None
         self._ingestion_unavailable_reason = ""
         self._ingestion_views_active = True
+        self._collection_mru = CollectionMruStore()
         try:
             self._ingestion_coordinator = self.controller.create_ingestion_coordinator()
         except Exception:
@@ -1487,7 +1578,13 @@ class KnowledgeAssistantDialog(QDialog):
                 PermissionError("请切回发起该请求的身份后重试或明确放弃"),
             )
             return
-        dialog = UploadDocumentDialog(self.controller, self, draft=draft)
+        dialog = UploadDocumentDialog(
+            self.controller,
+            self,
+            draft=draft,
+            principal=principal,
+            collection_mru=self._collection_mru,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             if draft is not None:
                 self._handle_uncertain_cancel("上传", "_upload_draft", draft)
@@ -1525,6 +1622,7 @@ class KnowledgeAssistantDialog(QDialog):
                 self._show_error("上传失败；服务已返回确定结果", exc)
             return
         self._upload_draft = None
+        self._collection_mru.remember(principal, str(draft["collection_id"]))
         replay = "；命中幂等重放" if result.get("idempotent_replay") else ""
         deduplicated = "；复用同集合已有内容" if result.get("deduplicated") else ""
         self._set_status(f"文档已索引：{result.get('filename')}，chunks={result.get('chunk_count')}{replay}{deduplicated}")
@@ -1540,20 +1638,26 @@ class KnowledgeAssistantDialog(QDialog):
                 OSError(self._ingestion_unavailable_reason or "本机安全存储不可用"),
             )
             return
-        dialog = BatchUploadDialog(self)
+        dialog = BatchUploadDialog(
+            self,
+            principal=self._principal(),
+            collection_mru=self._collection_mru,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        collection_id = dialog.collection_edit.text().strip()
         try:
             local_ids = coordinator.submit_files(
                 self._principal(),
                 dialog.paths,
-                collection_id=dialog.collection_edit.text().strip(),
+                collection_id=collection_id,
                 generation=self._ingestion_generation,
                 expected_snapshots=dialog.file_snapshots,
             )
         except Exception as exc:
             self._show_error("无法加入摄取队列", exc)
             return
+        self._collection_mru.remember(self._principal(), collection_id)
         self.tabs.setCurrentIndex(4)
         self._set_status(
             f"已将 {len(local_ids)} 个文件加入后台摄取队列；关闭管理台后任务仍会继续。"
