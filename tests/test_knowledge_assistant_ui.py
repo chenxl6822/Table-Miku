@@ -1441,6 +1441,75 @@ def test_batch_upload_dialog_defaults_to_cancel_and_limits_the_batch(
         dialog.close()
 
 
+def test_batch_upload_drop_files_enters_precheck(tmp_path: Path, monkeypatch):
+    from PySide6.QtCore import QMimeData, QPoint, QPointF, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+
+    _app()
+    source = tmp_path / "dropped.md"
+    source.write_text("dropped content", encoding="utf-8")
+    dialog = BatchUploadDialog()
+    try:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(source))])
+        enter = QDragEnterEvent(
+            QPoint(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        dialog.dragEnterEvent(enter)
+        assert enter.isAccepted()
+        drop = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        dialog.dropEvent(drop)
+        _wait_until(lambda: not dialog._precheck_busy and len(dialog.file_snapshots) == 1)
+        assert dialog.paths[0].resolve() == source.resolve()
+        assert dialog.submit_button.isEnabled()
+        assert "拖放" in dialog.intro_label.text()
+    finally:
+        dialog.close()
+
+
+def test_batch_upload_drop_rejects_directory_without_outbox(tmp_path: Path, monkeypatch):
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent
+
+    _app()
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+    dialog = BatchUploadDialog()
+    try:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(folder))])
+        drop = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        dialog.dropEvent(drop)
+        assert warnings and warnings[-1][0] == "不支持目录"
+        assert dialog.paths == []
+        assert dialog.file_snapshots == []
+        assert dialog.submit_button.isEnabled() is False
+    finally:
+        dialog.close()
+
+
 def test_batch_upload_preview_is_specific_and_fails_closed_if_a_file_changes(
     tmp_path: Path,
     monkeypatch,
