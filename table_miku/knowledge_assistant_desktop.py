@@ -1692,6 +1692,19 @@ class KnowledgeAssistantDesktopController:
         del limit
         return self.client.list_documents(principal)
 
+    def lookup_documents_by_checksum(
+        self,
+        principal: Principal,
+        *,
+        collection_id: str,
+        checksums: list[str],
+    ) -> list[dict]:
+        return self.client.lookup_documents_by_checksum(
+            principal,
+            collection_id=collection_id,
+            checksums=checksums,
+        )
+
     def upload_file(
         self,
         principal: Principal,

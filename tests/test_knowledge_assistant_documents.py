@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import io
 import struct
@@ -455,3 +456,61 @@ def test_pdf_parser_stops_inside_one_page_after_multiple_fragments_exceed_limit(
 def test_chunker_rejects_empty_units():
     with pytest.raises(ValueError, match="indexable"):
         TextChunker().split([ParsedUnit(text="   ")])
+
+
+def test_find_indexed_by_checksums_is_scoped_and_skips_archived(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    actor = principal()
+    other_tenant = principal("editor-2", tenant_id="tenant-b")
+    content = b"duplicate-bytes"
+    digest = hashlib.sha256(content).hexdigest()
+    created = service.documents.upload(
+        actor,
+        filename="original.md",
+        content=content,
+        collection_id="engineering",
+        idempotency_key="dup-original",
+    )
+    matches = service.documents.find_indexed_by_checksums(
+        actor,
+        collection_id="engineering",
+        checksums=[digest],
+    )
+    assert matches == [
+        {
+            "id": created["id"],
+            "filename": "original.md",
+            "collection_id": "engineering",
+            "checksum": digest,
+        }
+    ]
+    assert service.documents.find_indexed_by_checksums(
+        actor, collection_id="legal", checksums=[digest]
+    ) == []
+    assert service.documents.find_indexed_by_checksums(
+        other_tenant, collection_id="engineering", checksums=[digest]
+    ) == []
+    service.documents.archive(actor, created["id"])
+    assert service.documents.find_indexed_by_checksums(
+        actor, collection_id="engineering", checksums=[digest]
+    ) == []
+    restricted = principal(collections=frozenset({"legal"}))
+    with pytest.raises(PermissionDenied):
+        service.documents.find_indexed_by_checksums(
+            restricted, collection_id="engineering", checksums=[digest]
+        )
+    deny_all = principal(collections=frozenset())
+    with pytest.raises(PermissionDenied):
+        service.documents.find_indexed_by_checksums(
+            deny_all, collection_id="engineering", checksums=[digest]
+        )
+    with pytest.raises(ValueError, match="64-character"):
+        service.documents.find_indexed_by_checksums(
+            actor, collection_id="engineering", checksums=["not-a-digest"]
+        )
+    with pytest.raises(ValueError, match="exceed"):
+        service.documents.find_indexed_by_checksums(
+            actor,
+            collection_id="engineering",
+            checksums=[f"{index:064x}" for index in range(21)],
+        )

@@ -1569,6 +1569,50 @@ def test_batch_upload_choose_directory_enters_precheck(tmp_path: Path, monkeypat
         dialog.close()
 
 
+def test_batch_upload_duplicate_hint_after_precheck(tmp_path: Path, monkeypatch):
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent
+
+    _app()
+    source = tmp_path / "dropped.md"
+    source.write_text("dropped content", encoding="utf-8")
+    calls: list[tuple[str, list[str]]] = []
+
+    def lookup(collection_id: str, checksums: list[str]) -> list[dict[str, str]]:
+        calls.append((collection_id, list(checksums)))
+        return [
+            {
+                "id": "doc-existing",
+                "filename": "existing.md",
+                "collection_id": collection_id,
+                "checksum": checksums[0],
+            }
+        ]
+
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    dialog = BatchUploadDialog(duplicate_lookup=lookup)
+    try:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(source))])
+        drop = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        dialog.dropEvent(drop)
+        _wait_until(lambda: not dialog._precheck_busy and len(dialog.file_snapshots) == 1)
+        assert "dropped.md" in dialog.duplicate_label.text()
+        assert "existing.md" in dialog.duplicate_label.text()
+        assert dialog.submit_button.isEnabled()
+        assert calls and calls[0][0] == "default"
+        dialog.collection_edit.setText("engineering")
+        assert calls[-1][0] == "engineering"
+    finally:
+        dialog.close()
+
+
 def test_batch_upload_restricted_collection_combo_lists_allowlist(tmp_path: Path):
     _app()
     principal = Principal(
