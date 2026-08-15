@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-import stat
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -41,9 +38,9 @@ from PySide6.QtWidgets import (
 
 from .knowledge_assistant.auth import Principal
 from .knowledge_assistant.client import KnowledgeAssistantApiError
-from .knowledge_assistant.documents import MAX_DOCUMENT_BYTES
 from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 from .knowledge_assistant_desktop import MAX_BATCH_FILES
+from .knowledge_assistant_file_precheck import FilePrecheckController, PrecheckBatchResult
 
 
 CONSOLE_STYLE = """
@@ -286,23 +283,45 @@ class BatchUploadDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("批量添加知识资料")
-        self.resize(760, 470)
+        self.resize(760, 520)
         self.setStyleSheet(CONSOLE_STYLE)
         self._paths: list[Path] = []
         self._file_snapshots: list[dict[str, int | str]] = []
+        self._failed_prechecks: list[dict[str, str]] = []
+        self._pending_paths: list[Path] = []
+        self._precheck_generation = 0
+        self._precheck_busy = False
+        self._confirming = False
+        self._precheck = FilePrecheckController(self)
+        self._precheck.progress.connect(self._on_precheck_progress)
+        self._precheck.finished.connect(self._on_precheck_finished)
         layout = QVBoxLayout(self)
         self.intro_label = QLabel(
             f"这是当前 Editor 身份的直接写入，一次最多选择 {MAX_BATCH_FILES} 个文件，"
-            "无需审批。每个文件独立摄取，部分成功不会回滚；PDF 仅支持文本层，不支持 OCR。",
+            "无需审批。每个文件独立摄取，部分成功不会回滚；PDF 仅支持文本层，不支持 OCR。"
+            "选择后会在后台校验 SHA-256，可取消尚未确认的预检。",
             self,
         )
         self.intro_label.setWordWrap(True)
         self.intro_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.intro_label)
+        choose_row = QHBoxLayout()
         choose = QPushButton("选择文件…", self)
         choose.setObjectName("chooseIngestionFiles")
         choose.clicked.connect(self._choose)
-        layout.addWidget(choose)
+        choose_row.addWidget(choose)
+        self.cancel_precheck_button = QPushButton("取消预检", self)
+        self.cancel_precheck_button.setObjectName("cancelFilePrecheck")
+        self.cancel_precheck_button.setEnabled(False)
+        self.cancel_precheck_button.clicked.connect(self._cancel_precheck)
+        choose_row.addWidget(self.cancel_precheck_button)
+        self.exclude_failed_button = QPushButton("排除失败项", self)
+        self.exclude_failed_button.setObjectName("excludeFailedPrechecks")
+        self.exclude_failed_button.setEnabled(False)
+        self.exclude_failed_button.clicked.connect(self._exclude_failed_prechecks)
+        choose_row.addWidget(self.exclude_failed_button)
+        choose_row.addStretch(1)
+        layout.addLayout(choose_row)
         self.file_table = QTableWidget(0, 4, self)
         self.file_table.setObjectName("batchUploadFiles")
         self.file_table.setHorizontalHeaderLabels(
@@ -317,6 +336,12 @@ class BatchUploadDialog(QDialog):
         self.count_label = QLabel("尚未选择文件。", self)
         self.count_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.count_label)
+        self.precheck_progress = QProgressBar(self)
+        self.precheck_progress.setObjectName("batchPrecheckProgress")
+        self.precheck_progress.setRange(0, 1)
+        self.precheck_progress.setValue(0)
+        self.precheck_progress.setVisible(False)
+        layout.addWidget(self.precheck_progress)
         form = QFormLayout()
         self.collection_edit = QLineEdit("default", self)
         self.collection_edit.setObjectName("batchUploadCollection")
@@ -328,6 +353,7 @@ class BatchUploadDialog(QDialog):
         )
         self.submit_button = buttons.button(QDialogButtonBox.StandardButton.Save)
         self.submit_button.setText("加入摄取队列（0）")
+        self.submit_button.setEnabled(False)
         cancel = buttons.button(QDialogButtonBox.StandardButton.Cancel)
         cancel.setDefault(True)
         cancel.setFocus()
@@ -343,6 +369,29 @@ class BatchUploadDialog(QDialog):
     def file_snapshots(self) -> list[dict[str, int | str]]:
         return [dict(item) for item in self._file_snapshots]
 
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self._cancel_precheck()
+        if not self._precheck.shutdown(2000):
+            event.ignore()
+            QMessageBox.warning(
+                self,
+                "预检仍在停止",
+                "后台校验尚未安全停止，窗口不能关闭。请稍后再试。",
+            )
+            return
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        self._cancel_precheck()
+        if not self._precheck.shutdown(2000):
+            QMessageBox.warning(
+                self,
+                "预检仍在停止",
+                "后台校验尚未安全停止，窗口不能关闭。请稍后再试。",
+            )
+            return
+        super().reject()
+
     def _choose(self) -> None:
         filenames, _selected_filter = QFileDialog.getOpenFileNames(
             self,
@@ -353,23 +402,21 @@ class BatchUploadDialog(QDialog):
         if not filenames:
             return
         unique: list[Path] = []
-        snapshots: list[dict[str, int | str]] = []
         seen: set[str] = set()
         for filename in filenames:
             try:
-                path, snapshot = self._snapshot(Path(filename))
-            except (OSError, ValueError) as exc:
+                resolved = Path(filename).resolve(strict=True)
+            except OSError as exc:
                 QMessageBox.warning(
                     self,
                     "文件不可读取",
                     f"无法为所选文件建立安全快照，本次没有加入队列：{exc}",
                 )
                 return
-            key = str(path).casefold()
+            key = str(resolved).casefold()
             if key not in seen:
                 seen.add(key)
-                unique.append(path)
-                snapshots.append(snapshot)
+                unique.append(resolved)
         if len(unique) > MAX_BATCH_FILES:
             QMessageBox.warning(
                 self,
@@ -377,96 +424,212 @@ class BatchUploadDialog(QDialog):
                 f"一次最多选择 {MAX_BATCH_FILES} 个文件；本次没有加入队列。",
             )
             return
-        self._paths = unique
-        self._file_snapshots = snapshots
-        self.file_table.setRowCount(len(unique))
-        total = 0
-        for row, (path, snapshot) in enumerate(zip(unique, snapshots, strict=True)):
-            size = int(snapshot["size"])
-            total += size
-            self.file_table.setItem(row, 0, QTableWidgetItem(str(path)))
-            self.file_table.setItem(
-                row,
-                1,
-                QTableWidgetItem(f"{size:,} B"),
-            )
-            modified = datetime.fromtimestamp(
-                int(snapshot["mtime_ns"]) / 1_000_000_000
-            ).astimezone()
-            self.file_table.setItem(
-                row,
-                2,
-                QTableWidgetItem(
-                    f"{modified.isoformat(timespec='seconds')} (ns={snapshot['mtime_ns']})"
-                ),
-            )
-            digest = str(snapshot["sha256"])
-            digest_item = QTableWidgetItem(f"{digest[:16]}…")
-            digest_item.setToolTip(digest)
-            self.file_table.setItem(row, 3, digest_item)
-        self.count_label.setText(f"已选择 {len(unique)} 个文件，共 {total:,} 字节。")
-        self.submit_button.setText(f"加入摄取队列（{len(unique)}）")
+        self._start_precheck(unique, confirming=False)
 
-    def accept(self) -> None:
-        if not self._paths:
-            QMessageBox.warning(self, "尚未选择文件", "请先选择至少一个知识资料文件。")
+    def _start_precheck(self, paths: list[Path], *, confirming: bool) -> None:
+        self._cancel_precheck()
+        self._precheck_generation += 1
+        generation = self._precheck_generation
+        self._confirming = confirming
+        self._precheck_busy = True
+        self._pending_paths = list(paths)
+        self._failed_prechecks = []
+        if not confirming:
+            self._paths = []
+            self._file_snapshots = []
+            self.file_table.setRowCount(len(paths))
+            for row, path in enumerate(paths):
+                self.file_table.setItem(row, 0, QTableWidgetItem(str(path)))
+                self.file_table.setItem(row, 1, QTableWidgetItem("…"))
+                self.file_table.setItem(row, 2, QTableWidgetItem("校验中"))
+                self.file_table.setItem(row, 3, QTableWidgetItem("…"))
+        self.submit_button.setEnabled(False)
+        self.exclude_failed_button.setEnabled(False)
+        self.cancel_precheck_button.setEnabled(True)
+        self.precheck_progress.setVisible(True)
+        self.precheck_progress.setRange(0, max(len(paths), 1))
+        self.precheck_progress.setValue(0)
+        verb = "确认" if confirming else "校验"
+        self.count_label.setText(f"正在{verb}第 0/{len(paths)} 个文件…")
+        self._precheck.start(paths, generation=generation)
+
+    def _cancel_precheck(self) -> None:
+        if self._precheck_busy:
+            self._precheck.cancel()
+
+    def _on_precheck_progress(self, payload: dict[str, Any]) -> None:
+        self._apply_precheck_progress(payload)
+
+    def _apply_precheck_progress(self, payload: dict[str, Any]) -> None:
+        if int(payload.get("generation", -1)) != self._precheck_generation:
             return
-        if not self.collection_edit.text().strip():
-            QMessageBox.warning(self, "缺少集合", "请填写目标集合。")
+        index = int(payload.get("index", 0))
+        total = int(payload.get("total", 0))
+        phase = str(payload.get("phase") or "")
+        path = str(payload.get("path") or "")
+        bytes_processed = int(payload.get("bytes_processed") or 0)
+        verb = "确认" if self._confirming else "校验"
+        if phase == "reading":
+            self.count_label.setText(
+                f"正在{verb}第 {index}/{total} 个文件：{Path(path).name}（已处理 {bytes_processed:,} 字节）"
+            )
+            self.precheck_progress.setValue(max(index - 1, 0))
+        elif phase == "ready":
+            snapshot = payload.get("snapshot")
+            if isinstance(snapshot, dict) and not self._confirming:
+                self._render_ready_row(index - 1, Path(path), snapshot)
+            self.precheck_progress.setValue(index)
+        elif phase == "failed" and not self._confirming:
+            error = str(payload.get("error") or "未知错误")
+            row = index - 1
+            if 0 <= row < self.file_table.rowCount():
+                self.file_table.setItem(row, 1, QTableWidgetItem("失败"))
+                self.file_table.setItem(row, 2, QTableWidgetItem(error))
+                self.file_table.setItem(row, 3, QTableWidgetItem("—"))
+            self.precheck_progress.setValue(index)
+        elif phase == "cancelled":
+            self.count_label.setText("预检已取消。未创建摄取队列，也未发送网络请求。")
+
+    def _on_precheck_finished(self, result: PrecheckBatchResult) -> None:
+        if int(result.generation) != self._precheck_generation:
             return
-        try:
-            current = [self._snapshot(path)[1] for path in self._paths]
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "文件已变化", f"文件无法按确认快照读取：{exc}")
+        self._precheck_busy = False
+        self.cancel_precheck_button.setEnabled(False)
+        self.precheck_progress.setVisible(False)
+        if self._confirming:
+            self._finish_confirm(result)
             return
+        if result.cancelled:
+            self._paths = []
+            self._file_snapshots = []
+            self._failed_prechecks = []
+            self._pending_paths = []
+            self.file_table.setRowCount(0)
+            self.submit_button.setText("加入摄取队列（0）")
+            self.submit_button.setEnabled(False)
+            self.exclude_failed_button.setEnabled(False)
+            self.count_label.setText("预检已取消。尚未选择可提交的文件。")
+            return
+        self._paths = list(result.ready_paths)
+        self._file_snapshots = [dict(item) for item in result.ready_snapshots]
+        self._failed_prechecks = [dict(item) for item in result.failed]
+        if not self._paths and self._failed_prechecks:
+            first_error = self._failed_prechecks[0].get("error") or "未知错误"
+            QMessageBox.warning(
+                self,
+                "文件不可读取",
+                f"无法为所选文件建立安全快照，本次没有加入队列：{first_error}",
+            )
+            self.count_label.setText("预检失败。请重新选择文件。")
+            self.submit_button.setEnabled(False)
+            self.exclude_failed_button.setEnabled(False)
+            return
+        total = sum(int(item["size"]) for item in self._file_snapshots)
+        if self._failed_prechecks:
+            self.count_label.setText(
+                f"预检完成：{len(self._paths)} 个成功，{len(self._failed_prechecks)} 个失败，"
+                f"共 {total:,} 字节。请排除失败项后再确认。"
+            )
+            self.submit_button.setEnabled(False)
+            self.exclude_failed_button.setEnabled(True)
+        else:
+            self.count_label.setText(f"已选择 {len(self._paths)} 个文件，共 {total:,} 字节。")
+            self.submit_button.setEnabled(bool(self._paths))
+            self.exclude_failed_button.setEnabled(False)
+        self.submit_button.setText(f"加入摄取队列（{len(self._paths)}）")
+
+    def _finish_confirm(self, result: PrecheckBatchResult) -> None:
+        self._confirming = False
+        can_retry = bool(self._paths) and not self._failed_prechecks
+        if result.cancelled:
+            self.count_label.setText("确认已取消。文件尚未加入摄取队列。")
+            self.submit_button.setEnabled(can_retry)
+            return
+        if result.failed:
+            QMessageBox.warning(
+                self,
+                "文件已变化",
+                "文件无法按确认快照读取。本次没有加入队列，可重试或重新选择。",
+            )
+            self.count_label.setText("确认失败，可重试或重新选择。")
+            self.submit_button.setEnabled(can_retry)
+            return
+        current = [dict(item) for item in result.ready_snapshots]
         if current != self._file_snapshots:
             QMessageBox.warning(
                 self,
                 "文件已变化",
-                "至少一个文件在预览后发生变化。本次没有加入队列，请重新选择并确认。",
+                "至少一个文件在预览后发生变化。本次没有加入队列，可重试或重新选择。",
             )
+            self.count_label.setText("确认失败，可重试或重新选择。")
+            self.submit_button.setEnabled(can_retry)
             return
         super().accept()
 
-    @staticmethod
-    def _snapshot(path: Path) -> tuple[Path, dict[str, int | str]]:
-        resolved = Path(path).resolve(strict=True)
-        digest = hashlib.sha256()
-        with resolved.open("rb") as handle:
-            before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode):
-                raise ValueError("请选择普通文件")
-            if before.st_size > MAX_DOCUMENT_BYTES:
-                raise ValueError(f"文件超过 {MAX_DOCUMENT_BYTES} 字节上限")
-            bytes_read = 0
-            while chunk := handle.read(1024 * 1024):
-                bytes_read += len(chunk)
-                if bytes_read > MAX_DOCUMENT_BYTES:
-                    raise ValueError(f"文件超过 {MAX_DOCUMENT_BYTES} 字节上限")
-                digest.update(chunk)
-            after = os.fstat(handle.fileno())
-        before_identity = (
-            int(before.st_dev),
-            int(before.st_ino),
-            int(before.st_size),
-            int(before.st_mtime_ns),
+    def _exclude_failed_prechecks(self) -> None:
+        if self._precheck_busy or not self._failed_prechecks:
+            return
+        failed_keys = {str(Path(item["path"]).resolve()).casefold() for item in self._failed_prechecks}
+        kept_rows: list[tuple[Path, dict[str, int | str]]] = []
+        for path, snapshot in zip(self._paths, self._file_snapshots, strict=True):
+            if str(path).casefold() in failed_keys:
+                continue
+            kept_rows.append((path, snapshot))
+        self._paths = [path for path, _snapshot in kept_rows]
+        self._file_snapshots = [snapshot for _path, snapshot in kept_rows]
+        self._failed_prechecks = []
+        self.file_table.setRowCount(len(kept_rows))
+        total = 0
+        for row, (path, snapshot) in enumerate(kept_rows):
+            total += int(snapshot["size"])
+            self._render_ready_row(row, path, snapshot)
+        self.count_label.setText(f"已选择 {len(self._paths)} 个文件，共 {total:,} 字节。")
+        self.submit_button.setText(f"加入摄取队列（{len(self._paths)}）")
+        self.submit_button.setEnabled(bool(self._paths))
+        self.exclude_failed_button.setEnabled(False)
+
+    def _render_ready_row(
+        self,
+        row: int,
+        path: Path,
+        snapshot: dict[str, int | str],
+    ) -> None:
+        if row < 0:
+            return
+        if row >= self.file_table.rowCount():
+            self.file_table.setRowCount(row + 1)
+        size = int(snapshot["size"])
+        self.file_table.setItem(row, 0, QTableWidgetItem(str(path)))
+        self.file_table.setItem(row, 1, QTableWidgetItem(f"{size:,} B"))
+        modified = datetime.fromtimestamp(int(snapshot["mtime_ns"]) / 1_000_000_000).astimezone()
+        self.file_table.setItem(
+            row,
+            2,
+            QTableWidgetItem(f"{modified.isoformat(timespec='seconds')} (ns={snapshot['mtime_ns']})"),
         )
-        after_identity = (
-            int(after.st_dev),
-            int(after.st_ino),
-            int(after.st_size),
-            int(after.st_mtime_ns),
-        )
-        if before_identity != after_identity or bytes_read != int(after.st_size):
-            raise ValueError("文件在建立快照时发生变化")
-        return resolved, {
-            "canonical_path": str(resolved),
-            "size": int(after.st_size),
-            "mtime_ns": int(after.st_mtime_ns),
-            "device": int(after.st_dev),
-            "inode": int(after.st_ino),
-            "sha256": digest.hexdigest(),
-        }
+        digest = str(snapshot["sha256"])
+        digest_item = QTableWidgetItem(f"{digest[:16]}…")
+        digest_item.setToolTip(digest)
+        self.file_table.setItem(row, 3, digest_item)
+
+    def accept(self) -> None:
+        if self._precheck_busy:
+            QMessageBox.warning(self, "预检进行中", "请等待文件校验完成，或取消预检后重试。")
+            return
+        if not self._paths:
+            QMessageBox.warning(self, "尚未选择文件", "请先选择至少一个知识资料文件。")
+            return
+        if self._failed_prechecks:
+            QMessageBox.warning(
+                self,
+                "仍有失败项",
+                "请先排除失败项，或重新选择文件。失败项不会被提交。",
+            )
+            return
+        if not self.collection_edit.text().strip():
+            QMessageBox.warning(self, "缺少集合", "请填写目标集合。")
+            return
+        self._start_precheck(list(self._paths), confirming=True)
 
 
 class IngestTaskDialog(QDialog):
