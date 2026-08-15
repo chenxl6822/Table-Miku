@@ -137,6 +137,14 @@ def _close(dialog: KnowledgeAssistantDialog, controller: KnowledgeAssistantDeskt
     controller.close()
 
 
+def _visible_task_ids(dialog: KnowledgeAssistantDialog) -> list[str]:
+    ids: list[str] = []
+    for row in range(dialog.task_table.rowCount()):
+        cell = dialog.task_table.item(row, 0)
+        ids.append(str(cell.data(Qt.ItemDataRole.UserRole) if cell is not None else ""))
+    return ids
+
+
 def test_safe_markdown_browser_renders_commonmark_without_active_resources():
     _app()
     browser = SafeMarkdownBrowser()
@@ -300,6 +308,99 @@ def test_console_opens_in_safe_read_only_state(tmp_path: Path):
         assert "不是生产登录" in dialog.findChild(
             type(dialog.status_label), "localIdentityWarning"
         ).text()
+        dialog.tabs.setCurrentIndex(2)
+        assert dialog.task_filter.isHidden()
+        dialog.tabs.setCurrentIndex(1)
+    finally:
+        _close(dialog, controller)
+
+
+def test_approver_inbox_shows_others_awaiting_tasks_not_own(tmp_path: Path):
+    _app()
+    controller = _controller(tmp_path)
+    editor = controller.principal("tenant-a", "agent-editor", "editor", "engineering")
+    admin = controller.principal("tenant-a", "admin-a", "admin", "engineering")
+    other = controller.create_ingest_task(
+        editor,
+        filename="other.md",
+        collection_id="engineering",
+        content="other note",
+        idempotency_key="inbox-other-001",
+    )
+    own = controller.create_ingest_task(
+        admin,
+        filename="own.md",
+        collection_id="engineering",
+        content="own note",
+        idempotency_key="inbox-own-001",
+    )
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="admin-a",
+            role="admin",
+            collections="engineering",
+        )
+        dialog.tabs.setCurrentIndex(2)
+        assert not dialog.task_filter.isHidden()
+        assert dialog.task_filter.objectName() == "taskInboxFilter"
+        assert dialog.task_table.horizontalHeaderItem(4).text() == "到期"
+        all_ids = _visible_task_ids(dialog)
+        assert other["id"] in all_ids
+        assert own["id"] in all_ids
+
+        inbox_index = dialog.task_filter.findData("inbox")
+        assert inbox_index >= 0
+        dialog.task_filter.setCurrentIndex(inbox_index)
+        assert _visible_task_ids(dialog) == [other["id"]]
+        expiry = dialog.task_table.item(0, 4).text()
+        assert expiry
+        assert "已过期" not in expiry
+        assert expiry == str(other.get("approval", {}).get("expires_at") or expiry)
+    finally:
+        _close(dialog, controller)
+
+
+def test_editor_hides_inbox_filter_and_expired_cell_is_plain_text(tmp_path: Path):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        dialog.tabs.setCurrentIndex(2)
+        assert dialog.task_filter.isHidden()
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="human-approver",
+            role="approver",
+            collections="engineering",
+        )
+        dialog.tabs.setCurrentIndex(2)
+        assert not dialog.task_filter.isHidden()
+        dialog._tasks = {
+            "task-exp": {
+                "id": "task-exp",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "editor-a",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            }
+        }
+        dialog._render_task_items()
+        cell = dialog.task_table.item(0, 4)
+        assert cell is not None
+        assert cell.text().startswith("已过期 ")
+        assert "2020-01-01T00:00:00Z" in cell.text()
     finally:
         _close(dialog, controller)
 
