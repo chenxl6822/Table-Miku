@@ -1,0 +1,4 @@
+# Optional Knowledge Assistant semantic embedding extras for offline A/B only.
+# Do not install into the default CI/desktop path unless intentionally measuring
+# local MiniLM quality. Product default remains local-hash-v1-384.
+sentence-transformers>=3.0.0,<6
