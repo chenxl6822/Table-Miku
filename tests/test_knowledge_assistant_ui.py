@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QMessageBox,
+    QPushButton,
     QTableWidgetItem,
 )
 
@@ -1477,13 +1478,48 @@ def test_batch_upload_drop_files_enters_precheck(tmp_path: Path, monkeypatch):
         dialog.close()
 
 
-def test_batch_upload_drop_rejects_directory_without_outbox(tmp_path: Path, monkeypatch):
+def test_batch_upload_drop_directory_enters_precheck(tmp_path: Path, monkeypatch):
     from PySide6.QtCore import QMimeData, QPointF, QUrl
     from PySide6.QtGui import QDropEvent
 
     _app()
     folder = tmp_path / "folder"
+    nested = folder / "policy"
+    nested.mkdir(parents=True)
+    source = nested / "dropped.md"
+    source.write_text("dropped content", encoding="utf-8")
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    dialog = BatchUploadDialog()
+    try:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(folder))])
+        drop = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        dialog.dropEvent(drop)
+        _wait_until(lambda: not dialog._precheck_busy and len(dialog.file_snapshots) == 1)
+        assert dialog.paths[0].resolve() == source.resolve()
+        assert dialog.submit_button.isEnabled()
+        assert dialog.findChild(QPushButton, "chooseIngestionDirectory") is not None
+    finally:
+        dialog.close()
+
+
+def test_batch_upload_drop_over_quota_directory_fails_closed(tmp_path: Path, monkeypatch):
+    from PySide6.QtCore import QMimeData, QPointF, QUrl
+    from PySide6.QtGui import QDropEvent
+
+    from table_miku.knowledge_assistant_desktop import MAX_BATCH_FILES
+
+    _app()
+    folder = tmp_path / "many"
     folder.mkdir()
+    for index in range(MAX_BATCH_FILES + 1):
+        (folder / f"doc-{index:02d}.md").write_text("x", encoding="utf-8")
     warnings: list[tuple[str, str]] = []
     monkeypatch.setattr(
         QMessageBox,
@@ -1502,10 +1538,31 @@ def test_batch_upload_drop_rejects_directory_without_outbox(tmp_path: Path, monk
             Qt.KeyboardModifier.NoModifier,
         )
         dialog.dropEvent(drop)
-        assert warnings and warnings[-1][0] == "不支持目录"
+        assert warnings and warnings[-1][0] == "文件过多"
         assert dialog.paths == []
         assert dialog.file_snapshots == []
         assert dialog.submit_button.isEnabled() is False
+    finally:
+        dialog.close()
+
+
+def test_batch_upload_choose_directory_enters_precheck(tmp_path: Path, monkeypatch):
+    _app()
+    folder = tmp_path / "chosen"
+    folder.mkdir()
+    source = folder / "notes.txt"
+    source.write_text("notes", encoding="utf-8")
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        lambda *_args, **_kwargs: str(folder),
+    )
+    dialog = BatchUploadDialog()
+    try:
+        dialog._choose_directory()
+        _wait_until(lambda: not dialog._precheck_busy and len(dialog.file_snapshots) == 1)
+        assert dialog.paths[0].resolve() == source.resolve()
+        assert dialog.submit_button.isEnabled()
     finally:
         dialog.close()
 
