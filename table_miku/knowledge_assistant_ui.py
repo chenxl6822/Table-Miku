@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,6 +41,9 @@ from .knowledge_assistant.client import KnowledgeAssistantApiError
 from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 from .knowledge_assistant_desktop import MAX_BATCH_FILES
 from .knowledge_assistant_file_precheck import FilePrecheckController, PrecheckBatchResult
+
+BATCH_UPLOAD_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".json", ".pdf"})
+BATCH_UPLOAD_FILTER = "支持的文档 (*.txt *.md *.markdown *.rst *.json *.pdf);;所有文件 (*)"
 
 
 CONSOLE_STYLE = """
@@ -295,11 +298,12 @@ class BatchUploadDialog(QDialog):
         self._precheck = FilePrecheckController(self)
         self._precheck.progress.connect(self._on_precheck_progress)
         self._precheck.finished.connect(self._on_precheck_finished)
+        self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
         self.intro_label = QLabel(
             f"这是当前 Editor 身份的直接写入，一次最多选择 {MAX_BATCH_FILES} 个文件，"
             "无需审批。每个文件独立摄取，部分成功不会回滚；PDF 仅支持文本层，不支持 OCR。"
-            "选择后会在后台校验 SHA-256，可取消尚未确认的预检。",
+            "选择或拖放文件后会在后台校验 SHA-256，可取消尚未确认的预检。",
             self,
         )
         self.intro_label.setWordWrap(True)
@@ -332,6 +336,8 @@ class BatchUploadDialog(QDialog):
         self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.file_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.file_table.setAcceptDrops(True)
+        self.file_table.installEventFilter(self)
         layout.addWidget(self.file_table, 1)
         self.count_label = QLabel("尚未选择文件。", self)
         self.count_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -392,17 +398,63 @@ class BatchUploadDialog(QDialog):
             return
         super().reject()
 
+    def eventFilter(self, watched: QWidget, event: QEvent) -> bool:  # noqa: N802 - Qt API
+        if watched is self.file_table:
+            if event.type() == QEvent.Type.DragEnter:
+                self.dragEnterEvent(event)  # type: ignore[arg-type]
+                return True
+            if event.type() == QEvent.Type.Drop:
+                self.dropEvent(event)  # type: ignore[arg-type]
+                return True
+        return super().eventFilter(watched, event)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._accept_drag(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if not self._accept_drag(event):
+            event.ignore()
+            return
+        filenames: list[str] = []
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            filenames.append(url.toLocalFile())
+        event.acceptProposedAction()
+        self._ingest_path_strings(filenames)
+
+    @staticmethod
+    def _accept_drag(event) -> bool:
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls():
+            return False
+        for url in mime.urls():
+            if url.isLocalFile():
+                return True
+        return False
+
     def _choose(self) -> None:
         filenames, _selected_filter = QFileDialog.getOpenFileNames(
             self,
             "选择知识资料",
             "",
-            "支持的文档 (*.txt *.md *.markdown *.rst *.json *.pdf);;所有文件 (*)",
+            BATCH_UPLOAD_FILTER,
         )
         if not filenames:
             return
+        self._ingest_path_strings(list(filenames))
+
+    def _ingest_path_strings(self, filenames: list[str]) -> None:
+        if self._confirming:
+            QMessageBox.warning(self, "正在确认", "确认哈希进行中，请稍候再选择或拖放文件。")
+            return
         unique: list[Path] = []
         seen: set[str] = set()
+        unsupported: list[str] = []
+        directories: list[str] = []
         for filename in filenames:
             try:
                 resolved = Path(filename).resolve(strict=True)
@@ -413,10 +465,46 @@ class BatchUploadDialog(QDialog):
                     f"无法为所选文件建立安全快照，本次没有加入队列：{exc}",
                 )
                 return
+            if resolved.is_dir():
+                directories.append(resolved.name)
+                continue
+            if not resolved.is_file():
+                QMessageBox.warning(
+                    self,
+                    "文件不可读取",
+                    "只能选择普通文件；本次没有加入队列。",
+                )
+                return
+            if resolved.suffix.casefold() not in BATCH_UPLOAD_SUFFIXES:
+                unsupported.append(resolved.name)
+                continue
             key = str(resolved).casefold()
             if key not in seen:
                 seen.add(key)
                 unique.append(resolved)
+        if directories:
+            QMessageBox.warning(
+                self,
+                "不支持目录",
+                "本版本只支持拖放或选择文件，不支持目录导入。本次没有加入队列。",
+            )
+            return
+        if unsupported and not unique:
+            QMessageBox.warning(
+                self,
+                "不支持的文件类型",
+                "仅支持 txt、md、markdown、rst、json、pdf。本次没有加入队列。",
+            )
+            return
+        if unsupported:
+            QMessageBox.warning(
+                self,
+                "部分文件已跳过",
+                "已跳过不支持的类型：" + "、".join(unsupported[:5])
+                + ("…" if len(unsupported) > 5 else ""),
+            )
+        if not unique:
+            return
         if len(unique) > MAX_BATCH_FILES:
             QMessageBox.warning(
                 self,
