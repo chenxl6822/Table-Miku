@@ -4,7 +4,7 @@ import json
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QTextDocument
@@ -359,10 +359,12 @@ class BatchUploadDialog(QDialog):
         *,
         principal: Principal | None = None,
         collection_mru: CollectionMruStore | None = None,
+        duplicate_lookup: Callable[[str, list[str]], list[dict[str, str]]] | None = None,
     ) -> None:
         super().__init__(parent)
         self._principal = principal or Principal("local", "editor", frozenset({"editor"}))
         store = collection_mru or CollectionMruStore()
+        self._duplicate_lookup = duplicate_lookup
         self.setWindowTitle("批量添加知识资料")
         self.resize(760, 520)
         self.setStyleSheet(CONSOLE_STYLE)
@@ -425,6 +427,12 @@ class BatchUploadDialog(QDialog):
         self.count_label = QLabel("尚未选择文件。", self)
         self.count_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.count_label)
+        self.duplicate_label = QLabel("", self)
+        self.duplicate_label.setObjectName("batchDuplicateHint")
+        self.duplicate_label.setWordWrap(True)
+        self.duplicate_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.duplicate_label.setVisible(False)
+        layout.addWidget(self.duplicate_label)
         self.precheck_progress = QProgressBar(self)
         self.precheck_progress.setObjectName("batchPrecheckProgress")
         self.precheck_progress.setRange(0, 1)
@@ -439,6 +447,7 @@ class BatchUploadDialog(QDialog):
             store.suggestions(self._principal),
             current="",
         )
+        self.collection_edit.currentTextChanged.connect(self._refresh_duplicate_hint)
         form.addRow("目标集合", self.collection_edit)
         layout.addLayout(form)
         buttons = QDialogButtonBox(
@@ -678,6 +687,7 @@ class BatchUploadDialog(QDialog):
             self.submit_button.setEnabled(False)
             self.exclude_failed_button.setEnabled(False)
             self.count_label.setText("预检已取消。尚未选择可提交的文件。")
+            self._set_duplicate_hint("")
             return
         self._paths = list(result.ready_paths)
         self._file_snapshots = [dict(item) for item in result.ready_snapshots]
@@ -706,6 +716,7 @@ class BatchUploadDialog(QDialog):
             self.submit_button.setEnabled(bool(self._paths))
             self.exclude_failed_button.setEnabled(False)
         self.submit_button.setText(f"加入摄取队列（{len(self._paths)}）")
+        self._refresh_duplicate_hint()
 
     def _finish_confirm(self, result: PrecheckBatchResult) -> None:
         self._confirming = False
@@ -756,6 +767,50 @@ class BatchUploadDialog(QDialog):
         self.submit_button.setText(f"加入摄取队列（{len(self._paths)}）")
         self.submit_button.setEnabled(bool(self._paths))
         self.exclude_failed_button.setEnabled(False)
+        self._refresh_duplicate_hint()
+
+    def _set_duplicate_hint(self, message: str) -> None:
+        self.duplicate_label.setText(message)
+        self.duplicate_label.setVisible(bool(message))
+
+    def _refresh_duplicate_hint(self, *_args: object) -> None:
+        if self._precheck_busy or self._confirming or not self._file_snapshots:
+            if not self._file_snapshots:
+                self._set_duplicate_hint("")
+            return
+        if self._duplicate_lookup is None:
+            self._set_duplicate_hint("")
+            return
+        collection_id = self.collection_edit.text().strip()
+        checksums = [str(item.get("sha256") or "") for item in self._file_snapshots]
+        if not collection_id or not all(checksums):
+            self._set_duplicate_hint("")
+            return
+        try:
+            matches = self._duplicate_lookup(collection_id, checksums)
+        except Exception:
+            self._set_duplicate_hint("无法检查是否与已有文档重复。")
+            return
+        by_checksum = {
+            str(item.get("checksum") or ""): item
+            for item in matches
+            if isinstance(item, dict)
+        }
+        lines: list[str] = []
+        for path, snapshot in zip(self._paths, self._file_snapshots, strict=False):
+            existing = by_checksum.get(str(snapshot.get("sha256") or ""))
+            if existing is None:
+                continue
+            existing_name = str(existing.get("filename") or existing.get("id") or "已有文档")
+            lines.append(f"{path.name} → {existing_name}")
+        if not lines:
+            self._set_duplicate_hint("")
+            return
+        shown = lines[:3]
+        suffix = "…" if len(lines) > 3 else ""
+        self._set_duplicate_hint(
+            f"{len(lines)} 个文件可能复用已有文档：" + "；".join(shown) + suffix
+        )
 
     def _render_ready_row(
         self,
@@ -1642,6 +1697,7 @@ class KnowledgeAssistantDialog(QDialog):
             self,
             principal=self._principal(),
             collection_mru=self._collection_mru,
+            duplicate_lookup=self._lookup_batch_duplicates,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1662,6 +1718,23 @@ class KnowledgeAssistantDialog(QDialog):
         self._set_status(
             f"已将 {len(local_ids)} 个文件加入后台摄取队列；关闭管理台后任务仍会继续。"
         )
+
+    def _lookup_batch_duplicates(self, collection_id: str, checksums: list[str]) -> list[dict[str, str]]:
+        matches = self.controller.lookup_documents_by_checksum(
+            self._principal(),
+            collection_id=collection_id,
+            checksums=checksums,
+        )
+        return [
+            {
+                "id": str(item.get("id") or ""),
+                "filename": str(item.get("filename") or ""),
+                "collection_id": str(item.get("collection_id") or ""),
+                "checksum": str(item.get("checksum") or ""),
+            }
+            for item in matches
+            if isinstance(item, dict)
+        ]
 
     def _refresh_ingestion_jobs(self, _checked: bool = False) -> None:
         del _checked
