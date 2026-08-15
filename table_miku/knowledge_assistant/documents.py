@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from .auth import ConflictError, Principal, ResourceNotFound
 from .database import AssistantDatabase
-from .embeddings import HashingEmbedding, estimate_tokens
+from .embeddings import EmbeddingProvider, estimate_tokens
 from .observability import TraceRecorder
 
 
@@ -265,7 +265,7 @@ class DocumentService:
     def __init__(
         self,
         database: AssistantDatabase,
-        embedding: HashingEmbedding,
+        embedding: EmbeddingProvider,
         traces: TraceRecorder,
         *,
         parser: DocumentParser | None = None,
