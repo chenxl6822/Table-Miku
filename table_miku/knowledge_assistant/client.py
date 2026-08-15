@@ -70,6 +70,21 @@ class KnowledgeAssistantApiClient:
         items = payload.get("items")
         return self._validated_items(items, "documents")
 
+    def lookup_documents_by_checksum(
+        self,
+        principal: Principal,
+        *,
+        collection_id: str,
+        checksums: list[str],
+    ) -> list[dict[str, Any]]:
+        payload = self._request(
+            "POST",
+            "/v1/documents/lookup",
+            principal=principal,
+            body={"collection_id": collection_id, "checksums": checksums},
+        )
+        return self._validated_items(payload.get("items"), "document lookup matches")
+
     def upload_document(
         self,
         principal: Principal,

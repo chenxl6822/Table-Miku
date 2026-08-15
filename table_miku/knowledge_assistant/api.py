@@ -93,6 +93,18 @@ class KnowledgeAssistantApi:
             return "201 Created", result
         if method == "GET" and path == "/v1/documents":
             return "200 OK", {"items": self.service.documents.list_documents(principal)}
+        if method == "POST" and path == "/v1/documents/lookup":
+            body = self._json_body(environ)
+            checksums = body.get("checksums", [])
+            if not isinstance(checksums, list):
+                raise ValueError("checksums must be a list")
+            return "200 OK", {
+                "items": self.service.documents.find_indexed_by_checksums(
+                    principal,
+                    collection_id=str(body.get("collection_id", "default")),
+                    checksums=[str(item) for item in checksums],
+                )
+            }
         document_match = _DOCUMENT_PATH.match(path)
         if method == "GET" and document_match:
             return "200 OK", self.service.documents.get_document(principal, document_match.group(1))
