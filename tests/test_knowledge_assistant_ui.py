@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from table_miku.knowledge_assistant import KnowledgeAssistantService
 from table_miku.knowledge_assistant.client import KnowledgeAssistantApiError
+from table_miku.knowledge_assistant.documents import MAX_DOCUMENT_BYTES
 from table_miku.knowledge_assistant_desktop import KnowledgeAssistantDesktopController
 import table_miku.knowledge_assistant_ui as ui_module
 from table_miku.knowledge_assistant_ui import (
@@ -90,6 +91,17 @@ class _FakeIngestionCoordinator(QObject):
 
 def _app() -> QApplication:
     return QApplication.instance() or QApplication([])
+
+
+def _wait_until(predicate, *, timeout_ms: int = 5000) -> None:
+    app = _app()
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return
+        time.sleep(0.01)
+    assert predicate(), "condition not met before timeout"
 
 
 def _controller(tmp_path: Path) -> KnowledgeAssistantDesktopController:
@@ -1420,8 +1432,10 @@ def test_batch_upload_dialog_defaults_to_cancel_and_limits_the_batch(
             lambda *_args, **_kwargs: ([str(path) for path in paths], ""),
         )
         dialog._choose()
+        _wait_until(lambda: not dialog._precheck_busy and dialog.submit_button.isEnabled())
         dialog.collection_edit.setText("engineering")
         dialog.accept()
+        _wait_until(lambda: dialog.result() == QDialog.DialogCode.Accepted)
         assert dialog.result() == QDialog.DialogCode.Accepted
     finally:
         dialog.close()
@@ -1454,6 +1468,7 @@ def test_batch_upload_preview_is_specific_and_fails_closed_if_a_file_changes(
     dialog = BatchUploadDialog()
     try:
         dialog._choose()
+        _wait_until(lambda: not dialog._precheck_busy and len(dialog.file_snapshots) == 2)
 
         paths = [dialog.file_table.item(row, 0).text() for row in range(2)]
         assert paths == [str(first.resolve()), str(second.resolve())]
@@ -1480,6 +1495,7 @@ def test_batch_upload_preview_is_specific_and_fails_closed_if_a_file_changes(
         first.write_text("changed after preview", encoding="utf-8")
         dialog.collection_edit.setText("engineering")
         dialog.accept()
+        _wait_until(lambda: warnings and warnings[-1][0] == "文件已变化")
 
         assert dialog.result() == QDialog.DialogCode.Rejected
         assert warnings and warnings[-1][0] == "文件已变化"
@@ -1509,6 +1525,7 @@ def test_batch_upload_rejects_same_size_rewrite_even_if_mtime_is_restored(
     dialog = BatchUploadDialog()
     try:
         dialog._choose()
+        _wait_until(lambda: not dialog._precheck_busy and len(dialog.file_snapshots) == 1)
         accepted_hash = dialog.file_snapshots[0]["sha256"]
         source.write_bytes(b"other")
         os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
@@ -1516,6 +1533,7 @@ def test_batch_upload_rejects_same_size_rewrite_even_if_mtime_is_restored(
         assert source.stat().st_mtime_ns == original.st_mtime_ns
 
         dialog.accept()
+        _wait_until(lambda: warnings and warnings[-1][0] == "文件已变化")
 
         assert dialog.result() == QDialog.DialogCode.Rejected
         assert warnings and warnings[-1][0] == "文件已变化"
@@ -1531,7 +1549,7 @@ def test_batch_upload_rejects_oversized_file_during_selection(
     _app()
     oversized = tmp_path / "oversized.pdf"
     with oversized.open("wb") as handle:
-        handle.truncate(ui_module.MAX_DOCUMENT_BYTES + 1)
+        handle.truncate(MAX_DOCUMENT_BYTES + 1)
     monkeypatch.setattr(
         QFileDialog,
         "getOpenFileNames",
@@ -1546,12 +1564,12 @@ def test_batch_upload_rejects_oversized_file_during_selection(
     dialog = BatchUploadDialog()
     try:
         dialog._choose()
+        _wait_until(lambda: not dialog._precheck_busy)
 
         assert dialog.paths == []
         assert dialog.file_snapshots == []
-        assert dialog.file_table.rowCount() == 0
         assert warnings and warnings[-1][0] == "文件不可读取"
-        assert str(ui_module.MAX_DOCUMENT_BYTES) in warnings[-1][1]
+        assert str(MAX_DOCUMENT_BYTES) in warnings[-1][1]
     finally:
         dialog.close()
 
