@@ -39,6 +39,11 @@ from PySide6.QtWidgets import (
 from .knowledge_assistant.auth import Principal
 from .knowledge_assistant.client import KnowledgeAssistantApiError
 from .knowledge_assistant_batch_paths import expand_batch_upload_paths
+from .knowledge_assistant_approval_inbox import (
+    can_use_approval_inbox,
+    format_expiry_cell,
+    select_inbox_tasks,
+)
 from .knowledge_assistant_batch_summary import summarize_ingestion_batch
 from .knowledge_assistant_collection_mru import CollectionMruStore
 from .knowledge_assistant_desktop import KnowledgeAssistantDesktopController
@@ -1314,9 +1319,17 @@ class KnowledgeAssistantDialog(QDialog):
         task_actions.addWidget(refresh)
         task_actions.addWidget(self.create_task_button)
         task_actions.addStretch(1)
+        self.task_filter_label = QLabel("筛选", left)
+        self.task_filter = QComboBox(left)
+        self.task_filter.setObjectName("taskInboxFilter")
+        self.task_filter.addItem("全部", "all")
+        self.task_filter.addItem("待我审批", "inbox")
+        self.task_filter.currentIndexChanged.connect(self._render_task_items)
+        task_actions.addWidget(self.task_filter_label)
+        task_actions.addWidget(self.task_filter)
         left_layout.addLayout(task_actions)
         self.task_table = self._table(
-            ["状态", "工具", "请求人", "审批", "创建时间", "任务 ID"], parent=left
+            ["状态", "工具", "请求人", "审批", "到期", "创建时间", "任务 ID"], parent=left
         )
         self.task_table.setObjectName("taskTable")
         self.task_table.setMinimumHeight(135)
@@ -2376,7 +2389,6 @@ class KnowledgeAssistantDialog(QDialog):
 
     def _refresh_tasks(self, _checked: bool = False, *, show_error: bool = True) -> None:
         self._clear_approval_preview()
-        selected_id = self._selected_task_id()
         try:
             with self._busy():
                 tasks = self.controller.list_tasks(self._principal())
@@ -2392,6 +2404,22 @@ class KnowledgeAssistantDialog(QDialog):
                 self._set_status(f"任务读取失败：{exc}", error=True)
             return
         self._tasks = {str(item["id"]): item for item in tasks}
+        self._render_task_items()
+
+    def _render_task_items(self, *_args) -> None:
+        if not hasattr(self, "task_table"):
+            return
+        try:
+            principal = self._principal()
+        except (ValueError, TypeError):
+            return
+        tasks: list[dict[str, Any]] = list(self._tasks.values())
+        filter_name = "all"
+        if hasattr(self, "task_filter"):
+            filter_name = str(self.task_filter.currentData() or "all")
+        if filter_name == "inbox":
+            tasks = list(select_inbox_tasks(tasks, principal.user_id))
+        selected_id = self._selected_task_id()
         self.task_table.setRowCount(len(tasks))
         for row, task in enumerate(tasks):
             approval = task.get("approval") if isinstance(task.get("approval"), dict) else {}
@@ -2403,6 +2431,7 @@ class KnowledgeAssistantDialog(QDialog):
                 self._TOOL_LABELS.get(tool_name, tool_name),
                 task.get("requested_by", ""),
                 self._APPROVAL_STATUS_LABELS.get(approval_status, approval_status or "—"),
+                format_expiry_cell(task),
                 task.get("created_at", ""),
                 task.get("id", ""),
             )
@@ -3249,6 +3278,15 @@ class KnowledgeAssistantDialog(QDialog):
         can_write = "knowledge:write" in permissions
         can_create_task = "task:create" in permissions and can_write
         can_approve = "task:approve" in permissions
+        if hasattr(self, "task_filter"):
+            show_inbox = can_use_approval_inbox(permissions)
+            self.task_filter.setVisible(show_inbox)
+            self.task_filter_label.setVisible(show_inbox)
+            if not show_inbox and str(self.task_filter.currentData() or "") == "inbox":
+                self.task_filter.blockSignals(True)
+                self.task_filter.setCurrentIndex(0)
+                self.task_filter.blockSignals(False)
+                self._render_task_items()
         archive_retry = self._archive_task_draft
         has_archive_retry = bool(
             archive_retry is not None
