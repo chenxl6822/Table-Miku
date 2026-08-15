@@ -1,0 +1,8 @@
+{"filename":"spring-ioc.md","collection_id":"engineering","content":"# Spring IoC\nSpring IoC 容器通过依赖注入创建并装配 Bean。构造器注入让依赖显式、便于测试，并降低业务组件之间的耦合。"}
+{"filename":"redis-persistence.md","collection_id":"engineering","content":"# Redis 持久化\nRDB 按时间点生成快照，恢复速度快；AOF 记录写命令，通常数据丢失窗口更小。生产环境应依据恢复目标组合 RDB 与 AOF。"}
+{"filename":"agent-safety.md","collection_id":"operations","content":"# Agent 写入安全\n所有 Agent 写工具先创建 awaiting_approval 任务。审批人与请求人必须分离；批准后只执行一次，并以 operation_id 收据阻止重复写入。失败任务记录 error_code，禁止自动重试。"}
+{"filename":"observability.md","collection_id":"operations","content":"# 可观测性\n每次摄取、检索和工具执行都记录 Trace 与嵌套 Span，并汇总端到端延迟、输入 Token、输出 Token 和错误数量。Trace 属性不得保存原始提示词或文档正文。"}
+{"filename":"document-ingest.md","collection_id":"engineering","content":"# 文档摄取\n系统支持 UTF-8 的 TXT、Markdown、RST、JSON 以及带文本层的 PDF。文档经过解析、重叠切分、本地向量化后原子写入 SQLite；扫描版 PDF 因未启用 OCR 会明确失败。"}
+{"filename":"leave-policy-hr-v1.md","collection_id":"hr","content":"# 年假政策 v1\n全职员工每年享有 10 天带薪年假。未休完的年假不可跨年结转。病假另计，不占用年假额度。"}
+{"filename":"leave-policy-hr-v2.md","collection_id":"hr","content":"# 年假政策 v2\n全职员工每年享有 15 天带薪年假。最多可将 5 天未休年假结转到下一年度。病假另计，不占用年假额度。"}
+{"filename":"expense-policy.md","collection_id":"finance","content":"# 报销规则\n差旅报销须在费用发生后 30 日内提交。单笔超过 2000 元需附发票原件与审批单。现金垫付需保留支付凭证。"}

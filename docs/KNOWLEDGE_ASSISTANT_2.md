@@ -17,7 +17,7 @@
 | RAG、引用、拒答 | 多租户/集合过滤；向量和词项联合排序；阈值拒答；`[S1]` 结构化引用 | `test_knowledge_assistant_rag.py` |
 | 工具调用与任务状态 | `query_knowledge`、`ingest_text`、`archive_document`；状态和错误持久化 | `test_knowledge_assistant_tasks.py` |
 | 写审批、权限、幂等 | RBAC；请求人与审批人分离；10 分钟审批期限；一次性收据；幂等键冲突返回 409 | 同上 |
-| 离线评测 | 固定语料、固定问答、召回/首引/引用覆盖/拒答门禁 | `evals/run_knowledge_assistant_evals.py` |
+| 离线评测 | 固定语料、固定问答、召回/首引/引用覆盖/拒答门禁；金标扩集含冲突与引用忠实度；可 A/B 对比 embedding provider | `test_knowledge_assistant_evals.py`、`evals/run_knowledge_assistant_evals.py` |
 | Trace、延迟、Token | Trace + 嵌套 Span；端到端延迟；输入/输出 Token 估算；租户级聚合 | `observability.py` 与 API/测试 |
 | 自动化测试与 Docker | pytest、Ruff、CI 离线门禁、非 root 容器、健康检查 | `.github/workflows/ci.yml`、`Dockerfile` |
 
@@ -184,7 +184,7 @@ stateDiagram-v2
 - 向量以 little-endian float32 BLOB 存储，同时保存模型名和维度；模型不匹配的旧向量不会被错误参与查询。
 - 相同租户、集合、内容 SHA-256 的活跃文档会去重。
 
-本地哈希向量的优势是离线、无外发、确定性、无额外原生依赖；缺点是不能替代真实语义 embedding。若接入语义模型，应保留现有 provider 接口和模型版本字段，重建向量后再以固定评测集比较，而不是原地混用。
+本地哈希向量的优势是离线、无外发、确定性、无额外原生依赖；缺点是不能替代真实语义 embedding。2.4-B 首切片已抽出 `EmbeddingProvider` 协议，并提供可选本地 MiniLM provider（`requirements-ka2-semantic.txt`）与 CI 安全的 `local-bow-v1-384` A/B 对照；**产品默认仍是 `local-hash-v1-384`**。只有金标集上的质量与成本门槛同时通过后才允许切换默认检索，禁止为过门禁而降阈值或删除失败样例。
 
 ### 4.3 2.3 可恢复后台摄取
 
@@ -783,7 +783,7 @@ Windows 构建仍输出两条非阻塞环境警告：当前 PyInstaller/PySide6 
 1. **2.2 日常可信工作台（已实现）**：首次路径、角色说明、安全 Markdown、证据详情、任务进度和操作原因；目标是让用户不读 JSON 也能完成查询、核查和职责分离审批。
 2. **2.3 可恢复摄取（当前实现）**：后台 job、真实阶段、请求人取消、批量导入、失败中心、DPAPI 加密 outbox 和人工安全重放；目标是文档处理不冻结窗口，并让中断结果可核查、可恢复而不重复写入。
 3. **2.4-A 可取消后台文件预检（当前实现）**：批量选择/确认阶段的 SHA-256 预检在 QThread 中执行，显示逐文件进度与取消，失败项可排除后确认；未确认前不创建 outbox；发送 worker 仍做最终哈希复核。
-4. **2.4-B 检索质量闭环（并行/下一阶段）**：引入真实语义 embedding、reranker、逐句证据、反馈和知识缺口；是否上线由业务金标集与任务完成率共同决定。
+4. **2.4-B 检索质量闭环（首切片已实现）**：企业金标扩集、引用忠实度/冲突处理指标、`EmbeddingProvider` 协议、可选本地语义 provider，以及 hash/bow（及可选 semantic）A/B；默认检索仍为 hash，未启用 reranker/反馈。
 5. **2.4-C 日常摄取体验（进行中）**：批量对话框已支持文件拖放并复用 2.4-A 预检；目录导入、集合选择/最近使用、重复内容提示与批量失败汇总仍待后续切片。
 6. **2.5 可用任务工具**：审批收件箱、通知、到期提示、真实外部工具、远端幂等和补偿；目标是安全完成具体业务动作，而非展示 Agent 对话。
 7. **3.0 企业试点**：真实登录与 ACL、连接器、文档版本、审计导出、SLO 和试点用户指标；达到目标环境的重复证据后再扩大部署。

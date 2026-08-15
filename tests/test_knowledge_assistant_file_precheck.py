@@ -67,10 +67,12 @@ def test_precheck_keeps_qt_event_loop_alive_with_slow_reader(tmp_path: Path):
         heartbeat.start()
         controller.start([source], generation=7)
         assert ticks["count"] == 0
+        # Prove the GUI thread keeps pumping while the worker is blocked.
+        _wait_until(lambda: ticks["count"] >= 3, timeout_ms=2000)
         gate.set()
         timeout.start(8000)
         finished.exec()
-        assert ticks["count"] > 3, ticks
+        assert ticks["count"] >= 3, ticks
         assert any(item.get("phase") == "reading" for item in events)
         assert any(item.get("phase") == "ready" for item in events)
         assert controller.result.ready_snapshots[0]["sha256"] == hashlib.sha256(
@@ -192,9 +194,11 @@ def test_batch_dialog_precheck_is_async_and_shows_progress(tmp_path: Path, monke
         dialog._choose()
         assert dialog.submit_button.isEnabled() is False
         assert "正在校验" in dialog.count_label.text()
+        # Hold the reader until the GUI heartbeat has clearly advanced.
+        _wait_until(lambda: ticks["count"] >= 3, timeout_ms=2000)
         gate.set()
         _wait_until(lambda: dialog.submit_button.isEnabled() and len(dialog.file_snapshots) == 1)
-        assert ticks["count"] > 3, ticks
+        assert ticks["count"] >= 3, ticks
         assert dialog.file_snapshots[0]["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
         assert dialog.submit_button.text() == "加入摄取队列（1）"
     finally:
