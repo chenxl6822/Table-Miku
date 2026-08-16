@@ -4,8 +4,10 @@ from datetime import datetime, timezone
 
 from table_miku.knowledge_assistant_approval_inbox import (
     can_use_approval_inbox,
+    format_approval_notice,
     format_expiry_cell,
     format_inbox_expiry_hint,
+    format_tasks_tab_title,
     is_inbox_task,
     select_inbox_tasks,
 )
@@ -71,6 +73,27 @@ def test_inbox_expiry_hint_counts_expired_and_soon():
     text = format_inbox_expiry_hint(tasks, "approver-b", now=now)
     assert text == "待我审批 3 个：已过期 1，即将到期 1。"
     assert format_inbox_expiry_hint([], "approver-b", now=now) == ""
+
+
+def test_approval_notice_uses_counts_only_and_excludes_own_tasks():
+    now = datetime(2026, 8, 15, 12, 9, tzinfo=timezone.utc)
+    secret = _task("t-exp", expires_at="2026-08-15T12:00:00Z")
+    secret["filename"] = "secret.md"
+    tasks = [
+        _task("t-own", requested_by="approver-b", expires_at="2026-08-15T12:00:00Z"),
+        secret,
+        _task("t-ok", expires_at="2026-08-15T12:20:00Z"),
+    ]
+    text = format_approval_notice(tasks, "approver-b", now=now)
+    assert text.startswith("有待你审批的任务。")
+    assert "待我审批 2 个" in text
+    assert "已过期 1" in text
+    assert "打开收件箱" in text
+    assert "secret.md" not in text
+    assert "t-exp" not in text
+    assert format_approval_notice([], "approver-b", now=now) == ""
+    assert format_tasks_tab_title(0) == "任务与审批"
+    assert format_tasks_tab_title(2) == "任务与审批（2）"
 
 
 def test_inbox_requires_approve_permission():
