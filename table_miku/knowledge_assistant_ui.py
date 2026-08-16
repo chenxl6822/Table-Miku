@@ -41,8 +41,10 @@ from .knowledge_assistant.client import KnowledgeAssistantApiError
 from .knowledge_assistant_batch_paths import expand_batch_upload_paths
 from .knowledge_assistant_approval_inbox import (
     can_use_approval_inbox,
+    format_approval_notice,
     format_expiry_cell,
     format_inbox_expiry_hint,
+    format_tasks_tab_title,
     select_inbox_tasks,
 )
 from .knowledge_assistant_batch_summary import summarize_ingestion_batch
@@ -1057,6 +1059,26 @@ class KnowledgeAssistantDialog(QDialog):
         self.identity_panel.setVisible(False)
         root.addWidget(self.identity_panel)
         self._update_role_summary()
+
+        self.approval_notice_bar = QWidget(self)
+        self.approval_notice_bar.setObjectName("approvalNoticeBar")
+        self.approval_notice_bar.setStyleSheet(
+            "#approvalNoticeBar { background:#fff5d9;border:1px solid #e4c978;"
+            "border-radius:6px;padding:6px; }"
+        )
+        notice_layout = QHBoxLayout(self.approval_notice_bar)
+        notice_layout.setContentsMargins(8, 4, 8, 4)
+        self.approval_inbox_notice = QLabel("", self.approval_notice_bar)
+        self.approval_inbox_notice.setObjectName("approvalInboxNotice")
+        self.approval_inbox_notice.setWordWrap(True)
+        self.approval_inbox_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.open_inbox_button = QPushButton("打开收件箱", self.approval_notice_bar)
+        self.open_inbox_button.setObjectName("openApprovalInbox")
+        self.open_inbox_button.clicked.connect(self._open_approval_inbox)
+        notice_layout.addWidget(self.approval_inbox_notice, 1)
+        notice_layout.addWidget(self.open_inbox_button)
+        self.approval_notice_bar.setVisible(False)
+        root.addWidget(self.approval_notice_bar)
 
         self.tabs = QTabWidget(self)
         self.tabs.setObjectName("knowledgeAssistantTabs")
@@ -2455,6 +2477,42 @@ class KnowledgeAssistantDialog(QDialog):
                 )
             else:
                 self.task_expiry_hint.clear()
+        self._update_approval_notice()
+
+    def _update_approval_notice(self) -> None:
+        if not hasattr(self, "approval_notice_bar"):
+            return
+        try:
+            principal = self._principal()
+        except (ValueError, TypeError):
+            return
+        if self._identity_dirty or not can_use_approval_inbox(principal.permissions):
+            self.approval_notice_bar.setVisible(False)
+            self.approval_inbox_notice.clear()
+            if hasattr(self, "tabs"):
+                self.tabs.setTabText(2, format_tasks_tab_title(0))
+            return
+        tasks = list(self._tasks.values())
+        text = format_approval_notice(tasks, principal.user_id)
+        count = len(select_inbox_tasks(tasks, principal.user_id))
+        self.approval_inbox_notice.setText(text)
+        self.approval_notice_bar.setVisible(bool(text))
+        self.tabs.setTabText(2, format_tasks_tab_title(count))
+
+    def _open_approval_inbox(self) -> None:
+        if self._identity_dirty:
+            return
+        try:
+            principal = self._principal()
+        except (ValueError, TypeError):
+            return
+        if not can_use_approval_inbox(principal.permissions):
+            return
+        self.tabs.setCurrentIndex(2)
+        if hasattr(self, "task_filter"):
+            index = self.task_filter.findData("inbox")
+            if index >= 0:
+                self.task_filter.setCurrentIndex(index)
 
     def _create_ingest_task(self) -> None:
         principal = self._principal()
@@ -3176,6 +3234,7 @@ class KnowledgeAssistantDialog(QDialog):
             self.ingestion_batch_summary.clear()
         if hasattr(self, "task_expiry_hint"):
             self.task_expiry_hint.clear()
+        self._update_approval_notice()
         self._set_status("受保护视图已清空。")
 
     def _tab_changed(self, index: int) -> None:
@@ -3288,6 +3347,7 @@ class KnowledgeAssistantDialog(QDialog):
                     self.defer_button,
                 ):
                     button.setToolTip(reason)
+            self._update_approval_notice()
             return
         permissions = principal.permissions
         can_write = "knowledge:write" in permissions
@@ -3306,6 +3366,7 @@ class KnowledgeAssistantDialog(QDialog):
                 self.task_filter.setCurrentIndex(0)
                 self.task_filter.blockSignals(False)
                 self._render_task_items()
+        self._update_approval_notice()
         archive_retry = self._archive_task_draft
         has_archive_retry = bool(
             archive_retry is not None

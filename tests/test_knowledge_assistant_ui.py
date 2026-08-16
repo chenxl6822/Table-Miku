@@ -472,6 +472,66 @@ def test_approver_expiry_hint_counts_expired_and_soon_inbox_tasks(tmp_path: Path
         _close(dialog, controller)
 
 
+def test_approver_notice_opens_inbox_and_does_not_leak_filenames(tmp_path: Path):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="human-approver",
+            role="approver",
+            collections="engineering",
+        )
+        dialog.tabs.setCurrentIndex(1)
+        dialog._tasks = {
+            "task-exp": {
+                "id": "task-exp",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "editor-a",
+                "filename": "secret.md",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            },
+            "task-own": {
+                "id": "task-own",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "human-approver",
+                "filename": "mine.md",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            },
+        }
+        dialog._render_task_items()
+        notice = dialog.approval_inbox_notice
+        assert notice.objectName() == "approvalInboxNotice"
+        assert notice.textFormat() == Qt.TextFormat.PlainText
+        assert not dialog.approval_notice_bar.isHidden()
+        assert "有待你审批的任务" in notice.text()
+        assert "待我审批 1 个" in notice.text()
+        assert "secret.md" not in notice.text()
+        assert "mine.md" not in notice.text()
+        assert dialog.tabs.tabText(2) == "任务与审批（1）"
+        dialog.open_inbox_button.click()
+        assert dialog.tabs.currentIndex() == 2
+        assert dialog.task_filter.currentData() == "inbox"
+        assert _visible_task_ids(dialog) == ["task-exp"]
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        assert dialog.approval_notice_bar.isHidden()
+        assert dialog.tabs.tabText(2) == "任务与审批"
+    finally:
+        _close(dialog, controller)
+
+
 def test_console_renders_citations_then_clears_them_on_refusal(tmp_path: Path):
     _app()
     controller = _controller(tmp_path)
