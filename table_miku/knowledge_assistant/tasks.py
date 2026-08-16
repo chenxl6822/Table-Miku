@@ -85,6 +85,9 @@ class TaskService:
             "create_work_item": ToolSpec(
                 "create_work_item", True, "knowledge:write", self._validate_create_work_item
             ),
+            "close_work_item": ToolSpec(
+                "close_work_item", True, "knowledge:write", self._validate_close_work_item
+            ),
         }
         self._recover_interrupted_tasks()
 
@@ -523,7 +526,7 @@ class TaskService:
             for collection_id in collections:
                 principal.require_collection(collection_id)
             return collections
-        if tool_name in {"ingest_text", "create_work_item"}:
+        if tool_name in {"ingest_text", "create_work_item", "close_work_item"}:
             collection_id = str(arguments["collection_id"])
         elif tool_name == "archive_document":
             collection_id = str(arguments.get("collection_id", ""))
@@ -618,6 +621,24 @@ class TaskService:
                 ],
                 "reversibility": "administrative_restore_required",
             }
+        elif tool_name == "close_work_item":
+            action = {
+                "tool_name": tool_name,
+                "intent": "ensure_closed",
+                "target": {
+                    "tenant_id": str(row["tenant_id"]),
+                    "collection_id": str(arguments["collection_id"]),
+                    "work_item_id": str(arguments["work_item_id"]),
+                    "title": str(arguments["title"]),
+                    "remote_idempotency_key": str(arguments["remote_idempotency_key"]),
+                },
+                "parameters": {},
+                "consequences": [
+                    "The local work-item ledger row will be marked closed. The row is not deleted.",
+                    "This compensation does not send HTTP to a real ticket system.",
+                ],
+                "reversibility": "administrative_restore_required",
+            }
         else:
             raise ConflictError("task does not support approval preview")
         preview_contract = {
@@ -653,20 +674,33 @@ class TaskService:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
-        if tool_name != "archive_document":
-            return arguments
-        document = self.documents.get_document(principal, str(arguments["document_id"]))
-        current_metadata = {
-            "filename": str(document["filename"]),
-            "collection_id": str(document["collection_id"]),
-            "checksum": str(document["checksum"]),
-        }
-        for key, value in current_metadata.items():
-            if key in arguments and str(arguments[key]) != value:
-                raise ConflictError("archive target no longer matches the stored task metadata")
-        enriched = dict(arguments)
-        enriched.update(current_metadata)
-        return enriched
+        if tool_name == "archive_document":
+            document = self.documents.get_document(principal, str(arguments["document_id"]))
+            current_metadata = {
+                "filename": str(document["filename"]),
+                "collection_id": str(document["collection_id"]),
+                "checksum": str(document["checksum"]),
+            }
+            for key, value in current_metadata.items():
+                if key in arguments and str(arguments[key]) != value:
+                    raise ConflictError("archive target no longer matches the stored task metadata")
+            enriched = dict(arguments)
+            enriched.update(current_metadata)
+            return enriched
+        if tool_name == "close_work_item":
+            item = self._get_work_item(principal, str(arguments["work_item_id"]))
+            current_metadata = {
+                "title": str(item["title"]),
+                "collection_id": str(item["collection_id"]),
+                "remote_idempotency_key": str(item["remote_idempotency_key"]),
+            }
+            for key, value in current_metadata.items():
+                if key in arguments and str(arguments[key]) != value:
+                    raise ConflictError("close target no longer matches the stored task metadata")
+            enriched = dict(arguments)
+            enriched.update(current_metadata)
+            return enriched
+        return arguments
 
     def _execute(
         self,
@@ -814,6 +848,14 @@ class TaskService:
                 payload,
                 request_hash=request_hash,
                 requested_by=requested_by,
+                approved_by=approved_by,
+            )
+        if tool_name == "close_work_item":
+            return self._close_work_item(
+                principal,
+                task_id,
+                arguments,
+                request_hash=request_hash,
                 approved_by=approved_by,
             )
         raise ValueError(f"unknown tool: {tool_name}")
@@ -1024,6 +1066,80 @@ class TaskService:
                 "idempotent_replay": True,
             }
         return record
+
+    def _get_work_item(self, principal: Principal, work_item_id: str) -> sqlite3.Row:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM work_items WHERE id = ? AND tenant_id = ?",
+                (work_item_id, principal.tenant_id),
+            ).fetchone()
+        if row is None:
+            raise ResourceNotFound("work item not found")
+        principal.require_collection(str(row["collection_id"]))
+        return row
+
+    def _validate_close_work_item(
+        self, principal: Principal, arguments: dict[str, Any]
+    ) -> tuple[dict[str, Any], bytes | None]:
+        work_item_id = str(arguments.get("work_item_id", "")).strip()
+        if not work_item_id:
+            raise ValueError("work_item_id is required")
+        item = self._get_work_item(principal, work_item_id)
+        return {
+            "work_item_id": work_item_id,
+            "title": str(item["title"]),
+            "collection_id": str(item["collection_id"]),
+            "remote_idempotency_key": str(item["remote_idempotency_key"]),
+        }, None
+
+    def _close_work_item(
+        self,
+        principal: Principal,
+        task_id: str,
+        arguments: dict[str, Any],
+        *,
+        request_hash: str,
+        approved_by: str,
+    ) -> dict[str, Any]:
+        work_item_id = str(arguments["work_item_id"])
+        closed_at = utc_now()
+        with self.database.connect() as conn:
+            updated = conn.execute(
+                "UPDATE work_items SET status = 'closed', closed_at = ?, closed_by = ?, "
+                "close_task_id = ?, close_request_hash = ? "
+                "WHERE id = ? AND tenant_id = ? AND status = 'open'",
+                (
+                    closed_at,
+                    approved_by,
+                    task_id,
+                    request_hash,
+                    work_item_id,
+                    principal.tenant_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM work_items WHERE id = ? AND tenant_id = ?",
+                (work_item_id, principal.tenant_id),
+            ).fetchone()
+        if row is None:
+            raise ResourceNotFound("work item not found")
+        principal.require_collection(str(row["collection_id"]))
+        replay = updated.rowcount != 1
+        if replay:
+            if str(row["status"]) != "closed":
+                raise ConflictError("work item could not be closed")
+            if str(row["close_request_hash"]) != request_hash:
+                raise ConflictError(
+                    "work item was already closed with a different close request"
+                )
+        return {
+            "id": str(row["id"]),
+            "title": str(row["title"]),
+            "collection_id": str(row["collection_id"]),
+            "status": "closed",
+            "remote_idempotency_key": str(row["remote_idempotency_key"]),
+            "idempotent_replay": replay,
+        }
 
     @staticmethod
     def _safe_error(value: str, limit: int) -> str:

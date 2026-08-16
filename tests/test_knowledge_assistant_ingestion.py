@@ -35,11 +35,11 @@ def test_schema_v2_has_stable_service_instance_id(tmp_path: Path):
     first_id = first.service_instance_id
     second = AssistantDatabase(path)
 
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     assert first_id.startswith("ka-")
     assert second.service_instance_id == first_id
     with second.connect() as conn:
-        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 3
+        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 4
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ingestion_jobs'"
         ).fetchone()[0] == 1
@@ -101,7 +101,7 @@ def test_schema_v1_database_migrates_without_discarding_existing_documents(tmp_p
         assert conn.execute("SELECT filename FROM documents WHERE id = 'doc-legacy'").fetchone()[0] == (
             "legacy.txt"
         )
-        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 3
+        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 4
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'work_items'"
         ).fetchone()[0] == 1
@@ -135,10 +135,55 @@ def test_schema_v2_database_migrates_without_discarding_existing_documents(tmp_p
 
     with migrated.connect() as conn:
         assert conn.execute("SELECT filename FROM documents WHERE id = 'doc-v2'").fetchone()[0] == "v2.txt"
-        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 3
+        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 4
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'work_items'"
         ).fetchone()[0] == 1
+
+
+def test_schema_v3_database_migrates_without_discarding_work_items(tmp_path: Path):
+    path = tmp_path / "legacy-v3.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_versions(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO schema_versions(version, applied_at) VALUES(3, 'legacy-v3');
+            CREATE TABLE work_items(
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                collection_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                summary_sha256 TEXT NOT NULL,
+                remote_idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                approved_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(tenant_id, remote_idempotency_key)
+            );
+            INSERT INTO work_items(
+                id, tenant_id, collection_id, title, summary, summary_sha256,
+                remote_idempotency_key, request_hash, task_id, created_by, approved_by, created_at
+            ) VALUES(
+                'wi-legacy', 'tenant-a', 'engineering', 'Legacy item', 'keep this summary',
+                'abc', 'remote-legacy-001', 'hash-legacy', 'task-legacy',
+                'editor-a', 'human-1', 'legacy-v3'
+            );
+            """
+        )
+
+    migrated = AssistantDatabase(path)
+
+    with migrated.connect() as conn:
+        row = conn.execute("SELECT * FROM work_items WHERE id = 'wi-legacy'").fetchone()
+        assert row["title"] == "Legacy item"
+        assert row["summary"] == "keep this summary"
+        assert row["status"] == "open"
+        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 4
+        columns = {item[1] for item in conn.execute("PRAGMA table_info(work_items)")}
+        assert {"status", "closed_at", "closed_by", "close_task_id", "close_request_hash"} <= columns
 
 
 def test_create_run_and_permanent_idempotency_binding(tmp_path: Path):

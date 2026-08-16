@@ -314,6 +314,30 @@ def test_safe_task_metadata_allowlists_each_contract_and_drops_staged_content():
     assert "wi-1" in work_item_text
     assert "remote-work-001" in work_item_text
 
+    closed = KnowledgeAssistantDialog._safe_task_metadata(
+        {
+            "id": "task-4",
+            "tool_name": "close_work_item",
+            "arguments": {
+                "work_item_id": "wi-1",
+                "title": "Follow up vendor contract",
+                "collection_id": "engineering",
+                "remote_idempotency_key": "remote-work-001",
+                "summary": "TOP SECRET",
+            },
+            "result": {
+                "id": "wi-1",
+                "title": "Follow up vendor contract",
+                "status": "closed",
+                "summary": "TOP SECRET",
+            },
+        }
+    )
+    closed_text = json.dumps(closed, ensure_ascii=False, default=str)
+    assert "TOP SECRET" not in closed_text
+    assert "wi-1" in closed_text
+    assert "closed" in closed_text
+
 
 def test_console_opens_in_safe_read_only_state(tmp_path: Path):
     _app()
@@ -2940,5 +2964,109 @@ def test_work_item_button_disabled_for_viewer(tmp_path: Path):
             collections="engineering",
         )
         assert dialog.create_work_item_button.isEnabled()
+    finally:
+        _close(dialog, controller)
+
+
+def test_close_work_item_task_summary_and_empty_untrusted_preview(tmp_path: Path):
+    from table_miku.knowledge_assistant_ui import CloseWorkItemDialog
+
+    summary = KnowledgeAssistantDialog.format_task_summary(
+        {
+            "id": "task-close-1",
+            "tool_name": "close_work_item",
+            "status": "awaiting_approval",
+            "requested_by": "agent-1",
+            "created_at": "2026-08-16T10:00:00Z",
+            "updated_at": "2026-08-16T10:00:00Z",
+            "arguments": {
+                "work_item_id": "wi-1",
+                "title": "Follow up vendor contract",
+                "collection_id": "engineering",
+                "remote_idempotency_key": "remote-work-001",
+                "summary": "UNTRUSTED WORK ITEM BODY",
+            },
+            "approval": {
+                "status": "pending",
+                "requested_at": "2026-08-16T10:00:00Z",
+                "expires_at": "2026-08-16T10:10:00Z",
+            },
+        }
+    )
+    assert "关闭工作项" in summary
+    assert "wi-1" in summary
+    assert "UNTRUSTED WORK ITEM BODY" not in summary
+
+    _app()
+    controller = _controller(tmp_path)
+    editor = controller.principal("tenant-a", "agent-editor", "editor", "engineering")
+    created = controller.create_work_item_task(
+        editor,
+        title="Follow up vendor contract",
+        collection_id="engineering",
+        summary="UNTRUSTED WORK ITEM BODY",
+        remote_idempotency_key="remote-ui-close-001",
+        idempotency_key="ui-create-then-close-001",
+    )
+    approver = controller.principal("tenant-a", "human-approver", "approver", "engineering")
+    preview = controller.approval_preview(approver, created["id"])
+    completed = controller.approve_task(approver, created["id"], preview["preview_hash"])
+    close_task = controller.create_close_work_item_task(
+        editor,
+        work_item_id=str(completed["result"]["id"]),
+        idempotency_key="ui-close-work-001",
+    )
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="human-approver",
+            role="approver",
+            collections="engineering",
+        )
+        KnowledgeAssistantDialog._select_row(dialog.task_table, close_task["id"])
+        dialog._load_approval_preview()
+        assert "ensure_closed" in dialog.preview_editor.toPlainText() or "关闭" in dialog.preview_editor.toPlainText()
+        assert "UNTRUSTED WORK ITEM BODY" not in dialog.preview_editor.toPlainText()
+        assert dialog.preview_content_editor.toPlainText() in {
+            "当前动作不包含正文。请仅核对上方精确目标和后果。",
+            "当前动作没有已加载的正文。",
+        }
+        assert not dialog.close_work_item_button.isEnabled()
+        KnowledgeAssistantDialog._select_row(dialog.task_table, created["id"])
+    finally:
+        _close(dialog, controller)
+
+    create_dialog = CloseWorkItemDialog(
+        controller,
+        draft={
+            "work_item_id": str(completed["result"]["id"]),
+            "idempotency_key": "draft-close-key",
+        },
+    )
+    try:
+        assert create_dialog.windowTitle() == "关闭工作项审批任务"
+        assert create_dialog.work_item_id_edit.objectName() == "closeWorkItemId"
+        assert create_dialog.work_item_id_edit.text() == completed["result"]["id"]
+    finally:
+        create_dialog.deleteLater()
+        _app().processEvents()
+
+
+def test_close_work_item_button_disabled_for_viewer(tmp_path: Path):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        assert not dialog.close_work_item_button.isEnabled()
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="agent-editor",
+            role="editor",
+            collections="engineering",
+        )
+        assert dialog.close_work_item_button.isEnabled()
     finally:
         _close(dialog, controller)
