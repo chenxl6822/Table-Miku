@@ -8,7 +8,7 @@ from pathlib import Path
 from table_miku.paths import runtime_path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -256,6 +256,11 @@ class AssistantDatabase:
                     created_by TEXT NOT NULL,
                     approved_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    closed_at TEXT,
+                    closed_by TEXT NOT NULL DEFAULT '',
+                    close_task_id TEXT NOT NULL DEFAULT '',
+                    close_request_hash TEXT NOT NULL DEFAULT '',
                     UNIQUE(tenant_id, remote_idempotency_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_ka2_work_items_scope
@@ -270,6 +275,20 @@ class AssistantDatabase:
                 "INSERT OR IGNORE INTO schema_versions(version, applied_at) VALUES(?, datetime('now'))",
                 (SCHEMA_VERSION,),
             )
+            self._ensure_work_item_close_columns(conn)
+
+    @staticmethod
+    def _ensure_work_item_close_columns(conn: sqlite3.Connection) -> None:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(work_items)")}
+        for name, definition in (
+            ("status", "TEXT NOT NULL DEFAULT 'open'"),
+            ("closed_at", "TEXT"),
+            ("closed_by", "TEXT NOT NULL DEFAULT ''"),
+            ("close_task_id", "TEXT NOT NULL DEFAULT ''"),
+            ("close_request_hash", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE work_items ADD COLUMN {name} {definition}")
 
     @property
     def service_instance_id(self) -> str:

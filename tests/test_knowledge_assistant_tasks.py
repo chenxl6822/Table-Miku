@@ -955,3 +955,149 @@ def test_create_work_item_validation_bounds(tmp_path: Path):
             arguments={"title": "no"},
             idempotency_key="unknown-tool-key",
         )
+
+
+def open_work_item(
+    service: KnowledgeAssistantService,
+    actor: Principal,
+    reviewer: Principal,
+    *,
+    http_key: str = "http-open-work-item",
+    remote_key: str = "remote-work-001",
+):
+    task = create_work_item_task(
+        service,
+        actor,
+        http_key,
+        remote_idempotency_key=remote_key,
+    )
+    _, completed = preview_and_approve(service, reviewer, task["id"])
+    return completed["result"]
+
+
+def test_close_work_item_requires_approval_and_marks_ledger_closed(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    requester = Principal("tenant-a", "agent-1", frozenset({"editor", "approver"}))
+    reviewer = approver()
+    item = open_work_item(service, editor(), reviewer)
+    summary = "Open a local work item after legal review."
+    task = service.tasks.create(
+        requester,
+        tool_name="close_work_item",
+        arguments={"work_item_id": item["id"]},
+        idempotency_key="task-close-work-001",
+    )
+
+    assert task["status"] == "awaiting_approval"
+    assert task["arguments"]["work_item_id"] == item["id"]
+    assert task["arguments"]["title"] == "Follow up vendor contract"
+    assert "summary" not in task["arguments"]
+    with pytest.raises(PermissionDenied, match="own"):
+        service.tasks.preview(requester, task["id"])
+
+    preview = service.tasks.preview(reviewer, task["id"])
+    assert preview["action"]["intent"] == "ensure_closed"
+    assert preview["action"]["target"]["work_item_id"] == item["id"]
+    assert preview["action"]["parameters"] == {}
+    assert any("closed" in str(line).casefold() for line in preview["action"]["consequences"])
+    assert any("http" in str(line).casefold() for line in preview["action"]["consequences"])
+    completed = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+    repeated = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["status"] == "closed"
+    assert completed["result"]["id"] == item["id"]
+    assert completed["result"]["idempotent_replay"] is False
+    assert "summary" not in completed["result"]
+    assert summary not in str(completed)
+    assert repeated["result"]["id"] == item["id"]
+    with service.database.connect() as conn:
+        row = conn.execute("SELECT * FROM work_items WHERE id = ?", (item["id"],)).fetchone()
+        assert row["status"] == "closed"
+        assert row["summary"] == summary
+        assert row["closed_by"] == "human-1"
+        assert row["close_task_id"] == task["id"]
+
+
+def test_close_work_item_replays_same_request_and_conflicts_on_different_close(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    actor = editor()
+    reviewer = approver()
+    item = open_work_item(service, actor, reviewer)
+    first = service.tasks.create(
+        actor,
+        tool_name="close_work_item",
+        arguments={"work_item_id": item["id"]},
+        idempotency_key="http-close-a",
+    )
+    duplicate = service.tasks.create(
+        actor,
+        tool_name="close_work_item",
+        arguments={"work_item_id": item["id"]},
+        idempotency_key="http-close-b",
+    )
+    _, first_completed = preview_and_approve(service, reviewer, first["id"])
+    _, replayed = preview_and_approve(service, reviewer, duplicate["id"])
+    assert first_completed["result"]["idempotent_replay"] is False
+    assert replayed["status"] == "succeeded"
+    assert replayed["result"]["idempotent_replay"] is True
+    other = open_work_item(
+        service,
+        actor,
+        reviewer,
+        http_key="http-open-other",
+        remote_key="remote-work-002",
+    )
+    with service.database.connect() as conn:
+        conn.execute(
+            "UPDATE work_items SET status = 'closed', close_request_hash = 'other-hash' "
+            "WHERE id = ?",
+            (other["id"],),
+        )
+    conflicting = service.tasks.create(
+        actor,
+        tool_name="close_work_item",
+        arguments={"work_item_id": other["id"]},
+        idempotency_key="http-close-conflict",
+    )
+    _, failed = preview_and_approve(service, reviewer, conflicting["id"])
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "ConflictError"
+
+
+def test_close_work_item_hides_cross_tenant_and_deny_all(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    item = open_work_item(service, editor(), approver())
+    foreign = editor(tenant="tenant-b")
+    with pytest.raises(ResourceNotFound):
+        service.tasks.create(
+            foreign,
+            tool_name="close_work_item",
+            arguments={"work_item_id": item["id"]},
+            idempotency_key="http-close-foreign",
+        )
+    deny_all = Principal("tenant-a", "editor-1", frozenset({"editor"}), frozenset())
+    with pytest.raises(PermissionDenied, match="collection"):
+        service.tasks.create(
+            deny_all,
+            tool_name="close_work_item",
+            arguments={"work_item_id": item["id"]},
+            idempotency_key="http-close-deny",
+        )
+
+
+def test_close_work_item_preview_fails_when_target_metadata_changes(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    actor = editor()
+    reviewer = approver()
+    item = open_work_item(service, actor, reviewer)
+    task = service.tasks.create(
+        actor,
+        tool_name="close_work_item",
+        arguments={"work_item_id": item["id"]},
+        idempotency_key="http-close-stale",
+    )
+    with service.database.connect() as conn:
+        conn.execute("UPDATE work_items SET title = 'Changed title' WHERE id = ?", (item["id"],))
+    with pytest.raises(ConflictError, match="no longer matches"):
+        service.tasks.preview(reviewer, task["id"])
