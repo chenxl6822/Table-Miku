@@ -61,6 +61,24 @@ def format_inbox_expiry_hint(
     return text + "。"
 
 
+def format_approval_notice(
+    tasks: Sequence[Mapping[str, Any]],
+    user_id: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    summary = format_inbox_expiry_hint(tasks, user_id, now=now)
+    if not summary:
+        return ""
+    return f"有待你审批的任务。{summary}点击打开收件箱。"
+
+
+def format_tasks_tab_title(count: int) -> str:
+    if count <= 0:
+        return "任务与审批"
+    return f"任务与审批（{int(count)}）"
+
+
 def expiry_urgency(task: Mapping[str, Any], *, now: datetime | None = None) -> str:
     expires = approval_expires_at(task)
     if not expires:
