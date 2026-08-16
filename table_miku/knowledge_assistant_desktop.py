@@ -1819,6 +1819,20 @@ class KnowledgeAssistantDesktopController:
             idempotency_key=idempotency_key,
         )
 
+    def create_close_work_item_task(
+        self,
+        principal: Principal,
+        *,
+        work_item_id: str,
+        idempotency_key: str,
+    ) -> dict:
+        return self.client.create_task(
+            principal,
+            tool_name="close_work_item",
+            arguments={"work_item_id": work_item_id},
+            idempotency_key=idempotency_key,
+        )
+
     def create_archive_task(
         self,
         principal: Principal,
