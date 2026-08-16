@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from table_miku.knowledge_assistant_approval_inbox import (
     can_use_approval_inbox,
     format_expiry_cell,
+    format_inbox_expiry_hint,
     is_inbox_task,
     select_inbox_tasks,
 )
@@ -50,6 +51,26 @@ def test_expiry_cell_marks_past_deadlines():
     assert format_expiry_cell(expired, now=now) == "已过期 2026-08-15T12:00:00Z"
     assert format_expiry_cell(open_task, now=now) == "2026-08-15T12:10:00Z"
     assert "C:\\" not in format_expiry_cell(expired, now=now)
+
+
+def test_expiry_cell_marks_deadlines_within_two_minutes():
+    now = datetime(2026, 8, 15, 12, 9, tzinfo=timezone.utc)
+    soon = _task("t-soon", expires_at="2026-08-15T12:10:00Z")
+    assert format_expiry_cell(soon, now=now) == "即将到期 2026-08-15T12:10:00Z"
+
+
+def test_inbox_expiry_hint_counts_expired_and_soon():
+    now = datetime(2026, 8, 15, 12, 9, tzinfo=timezone.utc)
+    tasks = [
+        _task("t-own", requested_by="approver-b", expires_at="2026-08-15T12:00:00Z"),
+        _task("t-exp", expires_at="2026-08-15T12:00:00Z"),
+        _task("t-soon", expires_at="2026-08-15T12:10:00Z"),
+        _task("t-ok", expires_at="2026-08-15T12:20:00Z"),
+        _task("t-done", status="succeeded", expires_at="2026-08-15T12:00:00Z"),
+    ]
+    text = format_inbox_expiry_hint(tasks, "approver-b", now=now)
+    assert text == "待我审批 3 个：已过期 1，即将到期 1。"
+    assert format_inbox_expiry_hint([], "approver-b", now=now) == ""
 
 
 def test_inbox_requires_approve_permission():
