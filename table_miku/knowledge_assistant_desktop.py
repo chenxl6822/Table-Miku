@@ -1797,6 +1797,28 @@ class KnowledgeAssistantDesktopController:
             idempotency_key=idempotency_key,
         )
 
+    def create_work_item_task(
+        self,
+        principal: Principal,
+        *,
+        title: str,
+        collection_id: str,
+        summary: str,
+        remote_idempotency_key: str,
+        idempotency_key: str,
+    ) -> dict:
+        return self.client.create_task(
+            principal,
+            tool_name="create_work_item",
+            arguments={
+                "title": title,
+                "collection_id": collection_id,
+                "summary": summary,
+                "remote_idempotency_key": remote_idempotency_key,
+            },
+            idempotency_key=idempotency_key,
+        )
+
     def create_archive_task(
         self,
         principal: Principal,

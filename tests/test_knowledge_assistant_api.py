@@ -57,7 +57,7 @@ def test_health_is_public_but_data_routes_require_identity(tmp_path: Path):
 
         assert health_status == "200 OK"
         assert health["status"] == "ok"
-        assert health["schema_version"] == 2
+        assert health["schema_version"] == 3
         assert health["service_instance_id"].startswith("ka-")
         assert health["embedding_model"] == "local-hash-v1-384"
         assert health["ingestion"] == {

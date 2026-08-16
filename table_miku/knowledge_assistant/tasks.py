@@ -22,6 +22,7 @@ from .rag import RagService
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "rejected", "cancelled"})
 APPROVAL_PREVIEW_VERSION = 2
 _SECRET = re.compile(r"(?i)(api[_-]?key|authorization|token|password)\s*[:=]\s*[^\s,;]+")
+_REMOTE_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]+")
 _APPROVAL_SIGNING_KEY_BYTES = 32
 
 
@@ -80,6 +81,9 @@ class TaskService:
             ),
             "archive_document": ToolSpec(
                 "archive_document", True, "knowledge:write", self._validate_archive
+            ),
+            "create_work_item": ToolSpec(
+                "create_work_item", True, "knowledge:write", self._validate_create_work_item
             ),
         }
         self._recover_interrupted_tasks()
@@ -480,7 +484,11 @@ class TaskService:
         arguments: dict[str, Any],
         staged_payload: Any,
     ) -> bytes | None:
-        if tool_name != "ingest_text":
+        hash_field = {
+            "ingest_text": "content_sha256",
+            "create_work_item": "summary_sha256",
+        }.get(tool_name)
+        if hash_field is None:
             if staged_payload is not None:
                 raise ConflictError("write task contains an unexpected staged payload")
             return None
@@ -489,7 +497,7 @@ class TaskService:
         payload = bytes(staged_payload)
         try:
             expected_size = int(arguments["byte_size"])
-            expected_hash = str(arguments["content_sha256"])
+            expected_hash = str(arguments[hash_field])
         except (KeyError, TypeError, ValueError) as exc:
             raise ConflictError("stored task payload metadata is invalid") from exc
         if len(payload) != expected_size or not hmac.compare_digest(
@@ -515,7 +523,7 @@ class TaskService:
             for collection_id in collections:
                 principal.require_collection(collection_id)
             return collections
-        if tool_name == "ingest_text":
+        if tool_name in {"ingest_text", "create_work_item"}:
             collection_id = str(arguments["collection_id"])
         elif tool_name == "archive_document":
             collection_id = str(arguments.get("collection_id", ""))
@@ -562,6 +570,35 @@ class TaskService:
                     "Identical active content in the same collection may reuse the existing document.",
                 ],
                 "reversibility": "soft_archive_available_after_indexing",
+            }
+        elif tool_name == "create_work_item":
+            if payload is None:
+                raise ConflictError("write task payload is missing")
+            try:
+                summary = payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ConflictError("write task payload is not valid UTF-8") from exc
+            action = {
+                "tool_name": tool_name,
+                "intent": "ensure_work_item",
+                "target": {
+                    "tenant_id": str(row["tenant_id"]),
+                    "collection_id": str(arguments["collection_id"]),
+                    "title": str(arguments["title"]),
+                    "remote_idempotency_key": str(arguments["remote_idempotency_key"]),
+                },
+                "parameters": {
+                    "content": summary,
+                    "render_as": "plain_text",
+                    "summary_sha256": str(arguments["summary_sha256"]),
+                    "byte_size": int(arguments["byte_size"]),
+                },
+                "consequences": [
+                    "The exact UTF-8 summary will be written to the local work-item ledger, a stand-in for an external ticket system.",
+                    "The same tenant and remote idempotency key with the same request returns the original work item.",
+                    "The same remote idempotency key with a different request is rejected.",
+                ],
+                "reversibility": "administrative_restore_required",
             }
         elif tool_name == "archive_document":
             action = {
@@ -686,6 +723,9 @@ class TaskService:
                         tool_name,
                         arguments,
                         payload,
+                        request_hash=str(row["request_hash"]),
+                        requested_by=str(row["requested_by"]),
+                        approved_by=approved_by,
                     )
         except Exception as exc:
             finished_at = utc_now()
@@ -740,6 +780,10 @@ class TaskService:
         tool_name: str,
         arguments: dict[str, Any],
         payload: bytes | None,
+        *,
+        request_hash: str = "",
+        requested_by: str = "",
+        approved_by: str = "",
     ) -> dict[str, Any]:
         if tool_name == "query_knowledge":
             return self.rag.query(
@@ -760,6 +804,18 @@ class TaskService:
             )
         if tool_name == "archive_document":
             return self.documents.archive(principal, str(arguments["document_id"]))
+        if tool_name == "create_work_item":
+            if payload is None:
+                raise RuntimeError("approved task payload is missing")
+            return self._ensure_work_item(
+                principal,
+                task_id,
+                arguments,
+                payload,
+                request_hash=request_hash,
+                requested_by=requested_by,
+                approved_by=approved_by,
+            )
         raise ValueError(f"unknown tool: {tool_name}")
 
     def _existing_idempotent_task(
@@ -864,6 +920,110 @@ class TaskService:
             "collection_id": str(document["collection_id"]),
             "checksum": str(document["checksum"]),
         }, None
+
+    @staticmethod
+    def _validate_create_work_item(
+        principal: Principal, arguments: dict[str, Any]
+    ) -> tuple[dict[str, Any], bytes | None]:
+        title = str(arguments.get("title", "")).strip()
+        if not title or len(title) > 120:
+            raise ValueError("title must contain 1 to 120 characters")
+        if any(character in title for character in ("\x00", "\r", "\n")):
+            raise ValueError("title contains invalid characters")
+        summary = str(arguments.get("summary", ""))
+        if not summary or len(summary) > 2000:
+            raise ValueError("summary must contain 1 to 2000 characters")
+        payload = summary.encode("utf-8")
+        collection_id = DocumentService._collection_id(
+            str(arguments.get("collection_id", "default"))
+        )
+        principal.require_collection(collection_id)
+        remote_idempotency_key = str(arguments.get("remote_idempotency_key", "")).strip()
+        if (
+            len(remote_idempotency_key) < 8
+            or len(remote_idempotency_key) > 128
+            or _REMOTE_IDEMPOTENCY_KEY.fullmatch(remote_idempotency_key) is None
+        ):
+            raise ValueError(
+                "remote_idempotency_key must contain 8 to 128 URL-safe characters"
+            )
+        return {
+            "title": title,
+            "collection_id": collection_id,
+            "remote_idempotency_key": remote_idempotency_key,
+            "summary_sha256": hashlib.sha256(payload).hexdigest(),
+            "byte_size": len(payload),
+        }, payload
+
+    def _ensure_work_item(
+        self,
+        principal: Principal,
+        task_id: str,
+        arguments: dict[str, Any],
+        payload: bytes,
+        *,
+        request_hash: str,
+        requested_by: str,
+        approved_by: str,
+    ) -> dict[str, Any]:
+        try:
+            summary = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConflictError("write task payload is not valid UTF-8") from exc
+        work_item_id = f"wi-{uuid.uuid4().hex}"
+        created_at = utc_now()
+        record = {
+            "id": work_item_id,
+            "title": str(arguments["title"]),
+            "collection_id": str(arguments["collection_id"]),
+            "status": "open",
+            "remote_idempotency_key": str(arguments["remote_idempotency_key"]),
+            "idempotent_replay": False,
+        }
+        try:
+            with self.database.connect() as conn:
+                conn.execute(
+                    "INSERT INTO work_items(id, tenant_id, collection_id, title, summary, "
+                    "summary_sha256, remote_idempotency_key, request_hash, task_id, "
+                    "created_by, approved_by, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        work_item_id,
+                        principal.tenant_id,
+                        record["collection_id"],
+                        record["title"],
+                        summary,
+                        str(arguments["summary_sha256"]),
+                        record["remote_idempotency_key"],
+                        request_hash,
+                        task_id,
+                        requested_by or principal.user_id,
+                        approved_by,
+                        created_at,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            with self.database.connect() as conn:
+                existing = conn.execute(
+                    "SELECT id, request_hash FROM work_items "
+                    "WHERE tenant_id = ? AND remote_idempotency_key = ?",
+                    (principal.tenant_id, record["remote_idempotency_key"]),
+                ).fetchone()
+            if existing is None:
+                raise
+            if str(existing["request_hash"]) != request_hash:
+                raise ConflictError(
+                    "remote idempotency key was already used with a different work item"
+                )
+            return {
+                "id": str(existing["id"]),
+                "title": record["title"],
+                "collection_id": record["collection_id"],
+                "status": "open",
+                "remote_idempotency_key": record["remote_idempotency_key"],
+                "idempotent_replay": True,
+            }
+        return record
 
     @staticmethod
     def _safe_error(value: str, limit: int) -> str:
