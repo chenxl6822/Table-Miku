@@ -8,7 +8,7 @@ from pathlib import Path
 from table_miku.paths import runtime_path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -242,6 +242,24 @@ class AssistantDatabase:
                     content BLOB NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES ingestion_jobs(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS work_items(
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    collection_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    summary_sha256 TEXT NOT NULL,
+                    remote_idempotency_key TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    approved_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(tenant_id, remote_idempotency_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ka2_work_items_scope
+                    ON work_items(tenant_id, collection_id, created_at DESC);
                 """
             )
             conn.execute(

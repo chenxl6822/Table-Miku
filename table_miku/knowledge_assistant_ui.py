@@ -943,6 +943,88 @@ class IngestTaskDialog(QDialog):
         super().accept()
 
 
+class WorkItemTaskDialog(QDialog):
+    def __init__(
+        self,
+        controller: KnowledgeAssistantDesktopController,
+        parent: QWidget | None = None,
+        *,
+        draft: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowTitle("创建工作项审批任务")
+        self.resize(680, 520)
+        self.setStyleSheet(CONSOLE_STYLE)
+        layout = QVBoxLayout(self)
+        intro_text = (
+            "这里只创建 awaiting_approval 工作项任务，不会立即写入本地账本。"
+            "必须由另一位审批人读取精确预览后决定。本地账本是外部工单系统的替代，不会发出 HTTP。"
+        )
+        if draft is not None:
+            intro_text += " 正在重试结果未知的原请求；标题、正文、集合与幂等键已冻结，不可修改。"
+        intro = QLabel(intro_text)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.title_edit = QLineEdit((draft or {}).get("title", ""), self)
+        self.title_edit.setObjectName("workItemTitle")
+        self.collection_edit = QLineEdit((draft or {}).get("collection_id", "default"), self)
+        self.collection_edit.setObjectName("workItemCollection")
+        self.remote_key_edit = QLineEdit(
+            (draft or {}).get("remote_idempotency_key")
+            or controller.new_idempotency_key("remote-work"),
+            self,
+        )
+        self.remote_key_edit.setObjectName("workItemRemoteKey")
+        self.idempotency_edit = QLineEdit(
+            (draft or {}).get("idempotency_key")
+            or controller.new_idempotency_key("desktop-work-item"),
+            self,
+        )
+        self.idempotency_edit.setObjectName("workItemIdempotencyKey")
+        form.addRow("标题", self.title_edit)
+        form.addRow("目标集合", self.collection_edit)
+        form.addRow("远端幂等键", self.remote_key_edit)
+        form.addRow("HTTP 幂等键", self.idempotency_edit)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("待审批工作项摘要（仅在审批专用预览中回显）"))
+        self.summary_edit = QPlainTextEdit(self)
+        self.summary_edit.setObjectName("workItemSummary")
+        self.summary_edit.setPlaceholderText("输入等待审批的工作项摘要…")
+        self.summary_edit.setPlainText((draft or {}).get("summary", ""))
+        if draft is not None:
+            self.title_edit.setReadOnly(True)
+            self.collection_edit.setReadOnly(True)
+            self.remote_key_edit.setReadOnly(True)
+            self.idempotency_edit.setReadOnly(True)
+            self.summary_edit.setReadOnly(True)
+        layout.addWidget(self.summary_edit, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        save_button.setText("提交审批任务")
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel_button.setDefault(True)
+        cancel_button.setFocus()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:
+        required = (
+            (self.title_edit.text(), "请填写标题。"),
+            (self.collection_edit.text(), "请填写目标集合。"),
+            (self.remote_key_edit.text(), "请填写远端幂等键。"),
+            (self.idempotency_edit.text(), "请填写 HTTP 幂等键。"),
+            (self.summary_edit.toPlainText(), "请填写待审批摘要。"),
+        )
+        for value, message in required:
+            if not value.strip():
+                QMessageBox.warning(self, "输入不完整", message)
+                return
+        super().accept()
+
+
 class KnowledgeAssistantDialog(QDialog):
     """Local visual console for the enterprise Knowledge Assistant vertical slice."""
 
@@ -950,6 +1032,7 @@ class KnowledgeAssistantDialog(QDialog):
         "ingest_text": "写入并索引文档",
         "archive_document": "归档文档",
         "query_knowledge": "知识检索（只读）",
+        "create_work_item": "创建工作项（本地账本）",
     }
     _TASK_STATUS_LABELS = {
         "awaiting_approval": "待另一位审批人",
@@ -1000,6 +1083,7 @@ class KnowledgeAssistantDialog(QDialog):
         self._last_trace_id = ""
         self._upload_draft: dict[str, Any] | None = None
         self._ingest_task_draft: dict[str, Any] | None = None
+        self._work_item_task_draft: dict[str, Any] | None = None
         self._archive_task_draft: dict[str, Any] | None = None
         self._needs_refresh_on_show = False
         self._ingestion_generation = 0
@@ -1339,8 +1423,12 @@ class KnowledgeAssistantDialog(QDialog):
         self.create_task_button = QPushButton("创建写入审批任务…", left)
         self.create_task_button.setObjectName("createIngestTask")
         self.create_task_button.clicked.connect(self._create_ingest_task)
+        self.create_work_item_button = QPushButton("创建工作项…", left)
+        self.create_work_item_button.setObjectName("createWorkItemTask")
+        self.create_work_item_button.clicked.connect(self._create_work_item_task)
         task_actions.addWidget(refresh)
         task_actions.addWidget(self.create_task_button)
+        task_actions.addWidget(self.create_work_item_button)
         task_actions.addStretch(1)
         self.task_filter_label = QLabel("筛选", left)
         self.task_filter = QComboBox(left)
@@ -2560,6 +2648,54 @@ class KnowledgeAssistantDialog(QDialog):
         self._select_row(self.task_table, str(task.get("id") or ""))
         self.tabs.setCurrentIndex(2)
 
+    def _create_work_item_task(self) -> None:
+        principal = self._principal()
+        draft = self._work_item_task_draft
+        if draft is not None and not self._draft_belongs_to_active_identity(draft):
+            self._show_error(
+                "存在其他身份的未确认工作项任务",
+                PermissionError("请切回发起该请求的身份后重试或明确放弃"),
+            )
+            return
+        dialog = WorkItemTaskDialog(self.controller, self, draft=draft)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            if draft is not None:
+                self._handle_uncertain_cancel("工作项任务", "_work_item_task_draft", draft)
+            return
+        if draft is None:
+            draft = {
+                "title": dialog.title_edit.text().strip(),
+                "collection_id": dialog.collection_edit.text().strip(),
+                "summary": dialog.summary_edit.toPlainText(),
+                "remote_idempotency_key": dialog.remote_key_edit.text().strip(),
+                "idempotency_key": dialog.idempotency_edit.text().strip(),
+                "principal_signature": self._principal_signature(principal),
+            }
+            self._work_item_task_draft = draft
+        try:
+            with self._busy():
+                task = self.controller.create_work_item_task(
+                    principal,
+                    title=str(draft["title"]),
+                    collection_id=str(draft["collection_id"]),
+                    summary=str(draft["summary"]),
+                    remote_idempotency_key=str(draft["remote_idempotency_key"]),
+                    idempotency_key=str(draft["idempotency_key"]),
+                )
+        except Exception as exc:
+            if self._outcome_is_uncertain(exc):
+                self._show_error("任务创建结果未确认；再次打开将精确重放原请求", exc)
+            else:
+                self._work_item_task_draft = None
+                self._show_error("任务创建失败；服务已返回确定结果", exc)
+            return
+        self._work_item_task_draft = None
+        replay = "；命中幂等重放" if task.get("idempotent_replay") else ""
+        self._set_status(f"工作项审批任务已创建：{task.get('id')}，当前状态 {task.get('status')}{replay}")
+        self._refresh_tasks(show_error=False)
+        self._select_row(self.task_table, str(task.get("id") or ""))
+        self.tabs.setCurrentIndex(2)
+
     def _create_archive_task(self) -> None:
         principal = self._principal()
         draft = self._archive_task_draft
@@ -2685,6 +2821,13 @@ class KnowledgeAssistantDialog(QDialog):
                 "checksum",
             ),
             "query_knowledge": ("query", "collection_ids", "top_k"),
+            "create_work_item": (
+                "title",
+                "collection_id",
+                "remote_idempotency_key",
+                "summary_sha256",
+                "byte_size",
+            ),
         }.get(tool_name, ())
         safe["arguments"] = {
             key: arguments.get(key) for key in allowed_arguments if key in arguments
@@ -2733,6 +2876,14 @@ class KnowledgeAssistantDialog(QDialog):
                 "archived",
             ),
             "query_knowledge": ("refused", "trace_id"),
+            "create_work_item": (
+                "id",
+                "title",
+                "collection_id",
+                "status",
+                "remote_idempotency_key",
+                "idempotent_replay",
+            ),
         }.get(tool_name, ())
         return {key: result.get(key) for key in allowed_results if key in result}
 
@@ -2758,6 +2909,13 @@ class KnowledgeAssistantDialog(QDialog):
                 "checksum",
             ),
             "query_knowledge": ("query", "collection_ids", "top_k"),
+            "create_work_item": (
+                "title",
+                "collection_id",
+                "remote_idempotency_key",
+                "summary_sha256",
+                "byte_size",
+            ),
         }.get(tool_name, ())
         safe["arguments"] = {
             key: arguments.get(key) for key in allowed_arguments if key in arguments
@@ -2792,6 +2950,14 @@ class KnowledgeAssistantDialog(QDialog):
                 f"- 查询：{cls._summary_value(arguments.get('query'))}",
                 f"- 集合：{cls._summary_value(arguments.get('collection_ids'))}",
                 f"- Top K：{cls._summary_value(arguments.get('top_k'))}",
+            ]
+        if tool_name == "create_work_item":
+            return [
+                f"- 标题：{cls._summary_value(arguments.get('title'))}",
+                f"- 集合：{cls._summary_value(arguments.get('collection_id'))}",
+                f"- 远端幂等键：{cls._summary_value(arguments.get('remote_idempotency_key'))}",
+                f"- 摘要大小：{cls._summary_value(arguments.get('byte_size'))} 字节",
+                f"- 摘要 SHA-256：{cls._summary_value(arguments.get('summary_sha256'))}",
             ]
         if not arguments:
             return ["- 当前任务没有可显示的安全参数。"]
@@ -3404,6 +3570,12 @@ class KnowledgeAssistantDialog(QDialog):
             "创建待另一位审批人处理的写入任务。"
             if can_create_task
             else "当前身份不能创建写入任务；请使用 Editor。"
+        )
+        self.create_work_item_button.setEnabled(can_create_task)
+        self.create_work_item_button.setToolTip(
+            "创建待另一位审批人处理的本地工作项。"
+            if can_create_task
+            else "当前身份不能创建工作项任务；请使用 Editor。"
         )
         task = self._selected_task()
         awaiting = bool(task and task.get("status") == "awaiting_approval")
