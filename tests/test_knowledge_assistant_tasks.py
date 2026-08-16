@@ -36,6 +36,29 @@ def create_ingest_task(service: KnowledgeAssistantService, actor: Principal, key
     )
 
 
+def create_work_item_task(
+    service: KnowledgeAssistantService,
+    actor: Principal,
+    key: str = "task-work-item-001",
+    *,
+    title: str = "Follow up vendor contract",
+    summary: str = "Open a local work item after legal review.",
+    collection_id: str = "engineering",
+    remote_idempotency_key: str = "remote-work-001",
+):
+    return service.tasks.create(
+        actor,
+        tool_name="create_work_item",
+        arguments={
+            "title": title,
+            "summary": summary,
+            "collection_id": collection_id,
+            "remote_idempotency_key": remote_idempotency_key,
+        },
+        idempotency_key=key,
+    )
+
+
 def preview_and_approve(
     service: KnowledgeAssistantService,
     reviewer: Principal,
@@ -755,3 +778,180 @@ def test_restricted_query_task_persists_effective_collection_scope(tmp_path: Pat
     )
 
     assert task["arguments"]["collection_ids"] == ["engineering"]
+
+
+def test_create_work_item_requires_approval_and_writes_ledger_once(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    requester = Principal("tenant-a", "agent-1", frozenset({"editor", "approver"}))
+    summary = "Open a local work item after legal review."
+    task = create_work_item_task(service, requester, summary=summary)
+
+    assert task["status"] == "awaiting_approval"
+    assert "summary" not in task["arguments"]
+    assert "content" not in task["arguments"]
+    assert task["arguments"]["title"] == "Follow up vendor contract"
+    assert task["arguments"]["collection_id"] == "engineering"
+    assert task["arguments"]["remote_idempotency_key"] == "remote-work-001"
+    assert task["arguments"]["summary_sha256"]
+    assert task["arguments"]["byte_size"] == len(summary.encode("utf-8"))
+    with pytest.raises(PermissionDenied, match="own"):
+        service.tasks.preview(requester, task["id"])
+    with service.database.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_payloads WHERE task_id = ?", (task["id"],)
+        ).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM work_items").fetchone()[0] == 0
+
+    reviewer = approver()
+    preview = service.tasks.preview(reviewer, task["id"])
+    with pytest.raises(PermissionDenied, match="own"):
+        service.tasks.approve(requester, task["id"], preview["preview_hash"])
+    completed = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+    repeated = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+
+    assert completed["status"] == "succeeded"
+    assert completed["result"]["title"] == "Follow up vendor contract"
+    assert completed["result"]["status"] == "open"
+    assert completed["result"]["remote_idempotency_key"] == "remote-work-001"
+    assert completed["result"]["idempotent_replay"] is False
+    assert "summary" not in completed["result"]
+    assert "summary" not in completed["arguments"]
+    assert summary not in str(completed)
+    assert completed["receipt"]["approved_by"] == "human-1"
+    assert repeated["result"]["id"] == completed["result"]["id"]
+    with service.database.connect() as conn:
+        row = conn.execute("SELECT * FROM work_items").fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM work_items").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_payloads").fetchone()[0] == 0
+        assert row["title"] == "Follow up vendor contract"
+        assert row["summary"] == summary
+        assert row["tenant_id"] == "tenant-a"
+        assert row["approved_by"] == "human-1"
+        assert row["task_id"] == task["id"]
+
+
+def test_create_work_item_preview_keeps_summary_out_of_task_reads(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    requester = editor()
+    summary = "UNTRUSTED WORK ITEM BODY <script>alert(1)</script>"
+    task = create_work_item_task(service, requester, summary=summary)
+    reviewer = approver()
+
+    listed = service.tasks.list(requester)
+    loaded = service.tasks.get(requester, task["id"])
+    assert summary not in str(task)
+    assert summary not in str(listed)
+    assert summary not in str(loaded)
+    assert "request_hash" not in loaded
+
+    preview = service.tasks.preview(reviewer, task["id"])
+    assert preview["action"]["tool_name"] == "create_work_item"
+    assert preview["action"]["intent"] == "ensure_work_item"
+    assert preview["action"]["target"] == {
+        "tenant_id": "tenant-a",
+        "collection_id": "engineering",
+        "title": "Follow up vendor contract",
+        "remote_idempotency_key": "remote-work-001",
+    }
+    assert preview["action"]["parameters"]["content"] == summary
+    assert preview["action"]["parameters"]["render_as"] == "plain_text"
+    assert preview["action"]["parameters"]["summary_sha256"] == task["arguments"]["summary_sha256"]
+    assert any("work-item ledger" in str(item).casefold() for item in preview["action"]["consequences"])
+    assert preview["decision"]["bound_approver"] == "human-1"
+
+    completed = service.tasks.approve(reviewer, task["id"], preview["preview_hash"])
+    with service.database.connect() as conn:
+        attributes = " ".join(
+            str(row[0])
+            for row in conn.execute(
+                "SELECT attributes_json FROM traces UNION ALL SELECT attributes_json FROM spans"
+            )
+        )
+    assert summary not in attributes
+    assert "remote-work-001" not in attributes
+    assert summary not in str(completed["receipt"])
+
+
+def test_create_work_item_remote_key_replays_same_request_and_conflicts_on_different_request(
+    tmp_path: Path,
+):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    actor = editor()
+    reviewer = approver()
+    first = create_work_item_task(service, actor, "http-work-item-a")
+    duplicate = create_work_item_task(service, actor, "http-work-item-b")
+    _, first_completed = preview_and_approve(service, reviewer, first["id"])
+    _, replayed = preview_and_approve(service, reviewer, duplicate["id"])
+
+    assert first_completed["status"] == "succeeded"
+    assert replayed["status"] == "succeeded"
+    assert replayed["result"]["id"] == first_completed["result"]["id"]
+    assert replayed["result"]["idempotent_replay"] is True
+    with service.database.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM work_items").fetchone()[0] == 1
+
+    conflicting = create_work_item_task(
+        service,
+        actor,
+        "http-work-item-c",
+        summary="A different request using the same remote key.",
+    )
+    _, failed = preview_and_approve(service, reviewer, conflicting["id"])
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "ConflictError"
+    with service.database.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM work_items").fetchone()[0] == 1
+
+
+def test_create_work_item_empty_collection_allowlist_is_deny_all(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    deny_all = Principal("tenant-a", "editor-1", frozenset({"editor"}), frozenset())
+    with pytest.raises(PermissionDenied, match="collection"):
+        create_work_item_task(service, deny_all)
+
+
+def test_create_work_item_is_tenant_isolated(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    tenant_a = editor()
+    tenant_b = editor(tenant="tenant-b")
+    reviewer_a = approver()
+    reviewer_b = approver(tenant="tenant-b")
+    first = create_work_item_task(service, tenant_a, "http-tenant-a")
+    _, completed_a = preview_and_approve(service, reviewer_a, first["id"])
+    with pytest.raises(ResourceNotFound):
+        service.tasks.get(tenant_b, first["id"])
+    second = create_work_item_task(service, tenant_b, "http-tenant-b")
+    _, completed_b = preview_and_approve(service, reviewer_b, second["id"])
+    assert completed_a["result"]["id"] != completed_b["result"]["id"]
+    with service.database.connect() as conn:
+        rows = conn.execute(
+            "SELECT tenant_id, remote_idempotency_key FROM work_items ORDER BY tenant_id"
+        ).fetchall()
+        assert [(row["tenant_id"], row["remote_idempotency_key"]) for row in rows] == [
+            ("tenant-a", "remote-work-001"),
+            ("tenant-b", "remote-work-001"),
+        ]
+
+
+def test_create_work_item_validation_bounds(tmp_path: Path):
+    service = KnowledgeAssistantService(tmp_path / "assistant.db")
+    actor = editor()
+    with pytest.raises(ValueError, match="title"):
+        create_work_item_task(service, actor, "bad-title", title="")
+    with pytest.raises(ValueError, match="summary"):
+        create_work_item_task(service, actor, "bad-summary", summary="")
+    with pytest.raises(ValueError, match="remote_idempotency_key"):
+        create_work_item_task(
+            service,
+            actor,
+            "bad-remote",
+            remote_idempotency_key="short",
+        )
+    with pytest.raises(ValueError, match="unknown tool"):
+        service.tasks.create(
+            actor,
+            tool_name="create_ticket_http",
+            arguments={"title": "no"},
+            idempotency_key="unknown-tool-key",
+        )

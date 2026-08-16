@@ -283,6 +283,37 @@ def test_safe_task_metadata_allowlists_each_contract_and_drops_staged_content():
     assert unknown["result"] == {}
     assert "TOP SECRET" not in json.dumps(unknown, ensure_ascii=False)
 
+    work_item = KnowledgeAssistantDialog._safe_task_metadata(
+        {
+            "id": "task-3",
+            "tool_name": "create_work_item",
+            "arguments": {
+                "title": "Follow up vendor contract",
+                "collection_id": "engineering",
+                "remote_idempotency_key": "remote-work-001",
+                "summary_sha256": "abc123",
+                "byte_size": 12,
+                "summary": "TOP SECRET",
+            },
+            "result": {
+                "id": "wi-1",
+                "title": "Follow up vendor contract",
+                "summary": "TOP SECRET",
+                "status": "open",
+            },
+            "receipt": {
+                "operation_id": "op-3",
+                "arguments": {"summary": "TOP SECRET", "title": "Follow up vendor contract"},
+                "result": {"summary": "TOP SECRET", "id": "wi-1"},
+            },
+        }
+    )
+    work_item_text = json.dumps(work_item, ensure_ascii=False, default=str)
+    assert "TOP SECRET" not in work_item_text
+    assert "Follow up vendor contract" in work_item_text
+    assert "wi-1" in work_item_text
+    assert "remote-work-001" in work_item_text
+
 
 def test_console_opens_in_safe_read_only_state(tmp_path: Path):
     _app()
@@ -2796,5 +2827,118 @@ def test_close_clears_ingestion_view_without_replaying_or_stopping_coordinator(
         assert dialog.ingestion_table.rowCount() == 0
         assert coordinator.replays == []
         assert coordinator.scan_count >= 1
+    finally:
+        _close(dialog, controller)
+
+
+def test_work_item_task_summary_omits_summary_body():
+    summary = KnowledgeAssistantDialog.format_task_summary(
+        {
+            "id": "task-wi-1",
+            "tool_name": "create_work_item",
+            "status": "awaiting_approval",
+            "requested_by": "agent-1",
+            "created_at": "2026-08-15T10:00:00Z",
+            "updated_at": "2026-08-15T10:00:00Z",
+            "arguments": {
+                "title": "Follow up vendor contract",
+                "collection_id": "engineering",
+                "remote_idempotency_key": "remote-work-001",
+                "summary_sha256": "abc123",
+                "byte_size": 42,
+                "summary": "UNTRUSTED WORK ITEM BODY",
+            },
+            "approval": {
+                "status": "pending",
+                "requested_at": "2026-08-15T10:00:00Z",
+                "expires_at": "2026-08-15T10:10:00Z",
+            },
+        }
+    )
+
+    assert "创建工作项" in summary
+    assert "Follow up vendor contract" in summary
+    assert "engineering" in summary
+    assert "remote-work-001" in summary
+    assert "UNTRUSTED WORK ITEM BODY" not in summary
+
+
+def test_console_creates_and_approves_work_item_with_untrusted_summary(tmp_path: Path):
+    from table_miku.knowledge_assistant_ui import WorkItemTaskDialog
+
+    _app()
+    controller = _controller(tmp_path)
+    editor = controller.principal("tenant-a", "agent-editor", "editor", "engineering")
+    summary = "UNTRUSTED WORK ITEM BODY <script>alert(1)</script>"
+    task = controller.create_work_item_task(
+        editor,
+        title="Follow up vendor contract",
+        collection_id="engineering",
+        summary=summary,
+        remote_idempotency_key="remote-ui-work-001",
+        idempotency_key="ui-work-item-001",
+    )
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        dialog.show()
+        _app().processEvents()
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="human-approver",
+            role="approver",
+            collections="engineering",
+        )
+        KnowledgeAssistantDialog._select_row(dialog.task_table, task["id"])
+        assert "创建工作项" in dialog.task_detail.toPlainText()
+        assert summary not in dialog.task_detail.toPlainText()
+        assert summary not in dialog.task_technical_detail.toPlainText()
+
+        dialog._load_approval_preview()
+        _app().processEvents()
+        trusted_text = dialog.preview_editor.toPlainText()
+        untrusted_text = dialog.preview_content_editor.toPlainText()
+        assert summary == untrusted_text
+        assert summary not in trusted_text
+        assert "work-item ledger" in trusted_text.casefold()
+        assert dialog.approve_button.isEnabled()
+
+        dialog._confirm_approval = lambda _preview: True
+        dialog._approve_selected()
+        _app().processEvents()
+        completed = dialog._selected_task()
+        assert completed is not None
+        assert completed["status"] == "succeeded"
+        assert completed["result"]["status"] == "open"
+        assert summary not in json.dumps(completed, ensure_ascii=False, default=str)
+        assert summary not in dialog.receipt_detail.toPlainText()
+    finally:
+        _close(dialog, controller)
+
+    create_dialog = WorkItemTaskDialog(controller)
+    try:
+        assert create_dialog.windowTitle() == "创建工作项审批任务"
+        assert create_dialog.title_edit.objectName() == "workItemTitle"
+        assert create_dialog.summary_edit.objectName() == "workItemSummary"
+        assert create_dialog.remote_key_edit.objectName() == "workItemRemoteKey"
+    finally:
+        create_dialog.deleteLater()
+        _app().processEvents()
+
+
+def test_work_item_button_disabled_for_viewer(tmp_path: Path):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    try:
+        assert not dialog.create_work_item_button.isEnabled()
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="agent-editor",
+            role="editor",
+            collections="engineering",
+        )
+        assert dialog.create_work_item_button.isEnabled()
     finally:
         _close(dialog, controller)

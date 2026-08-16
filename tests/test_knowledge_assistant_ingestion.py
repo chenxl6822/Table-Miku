@@ -35,13 +35,16 @@ def test_schema_v2_has_stable_service_instance_id(tmp_path: Path):
     first_id = first.service_instance_id
     second = AssistantDatabase(path)
 
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
     assert first_id.startswith("ka-")
     assert second.service_instance_id == first_id
     with second.connect() as conn:
-        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 2
+        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 3
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ingestion_jobs'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'work_items'"
         ).fetchone()[0] == 1
 
 
@@ -98,7 +101,44 @@ def test_schema_v1_database_migrates_without_discarding_existing_documents(tmp_p
         assert conn.execute("SELECT filename FROM documents WHERE id = 'doc-legacy'").fetchone()[0] == (
             "legacy.txt"
         )
-        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 2
+        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 3
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'work_items'"
+        ).fetchone()[0] == 1
+
+
+def test_schema_v2_database_migrates_without_discarding_existing_documents(tmp_path: Path):
+    path = tmp_path / "legacy-v2.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_versions(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO schema_versions(version, applied_at) VALUES(2, 'legacy-v2');
+            CREATE TABLE documents(
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, collection_id TEXT NOT NULL,
+                filename TEXT NOT NULL, content_type TEXT NOT NULL, checksum TEXT NOT NULL,
+                byte_size INTEGER NOT NULL, status TEXT NOT NULL, created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO documents(
+                id, tenant_id, collection_id, filename, content_type, checksum, byte_size,
+                status, created_by, created_at, updated_at
+            ) VALUES(
+                'doc-v2', 'tenant-a', 'default', 'v2.txt', 'text/plain',
+                'v2-checksum', 4, 'indexed', 'editor-a', 'legacy-v2', 'legacy-v2'
+            );
+            """
+        )
+
+    migrated = AssistantDatabase(path)
+
+    with migrated.connect() as conn:
+        assert conn.execute("SELECT filename FROM documents WHERE id = 'doc-v2'").fetchone()[0] == "v2.txt"
+        assert conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()[0] == 3
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'work_items'"
+        ).fetchone()[0] == 1
 
 
 def test_create_run_and_permanent_idempotency_binding(tmp_path: Path):
