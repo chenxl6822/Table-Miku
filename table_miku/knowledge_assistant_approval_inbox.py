@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 INBOX_STATUS = "awaiting_approval"
+EXPIRING_SOON_SECONDS = 120
 
 
 def can_use_approval_inbox(permissions: frozenset[str] | set[str]) -> bool:
@@ -25,9 +26,58 @@ def format_expiry_cell(task: Mapping[str, Any], *, now: datetime | None = None) 
     expires = approval_expires_at(task)
     if not expires:
         return "—"
-    if _is_expired(expires, now=now):
+    urgency = expiry_urgency(task, now=now)
+    if urgency == "expired":
         return f"已过期 {expires}"
+    if urgency == "soon":
+        return f"即将到期 {expires}"
     return expires
+
+
+def format_inbox_expiry_hint(
+    tasks: Sequence[Mapping[str, Any]],
+    user_id: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    inbox = select_inbox_tasks(tasks, user_id)
+    if not inbox:
+        return ""
+    expired = soon = 0
+    for task in inbox:
+        urgency = expiry_urgency(task, now=now)
+        if urgency == "expired":
+            expired += 1
+        elif urgency == "soon":
+            soon += 1
+    text = f"待我审批 {len(inbox)} 个"
+    details: list[str] = []
+    if expired:
+        details.append(f"已过期 {expired}")
+    if soon:
+        details.append(f"即将到期 {soon}")
+    if details:
+        text += "：" + "，".join(details)
+    return text + "。"
+
+
+def expiry_urgency(task: Mapping[str, Any], *, now: datetime | None = None) -> str:
+    expires = approval_expires_at(task)
+    if not expires:
+        return "none"
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    parsed = _parse_expires_at(expires)
+    if parsed is None:
+        return "none"
+    remaining = (parsed - current).total_seconds()
+    if remaining <= 0:
+        return "expired"
+    if remaining <= EXPIRING_SOON_SECONDS:
+        return "soon"
+    return "ok"
 
 
 def select_inbox_tasks(
@@ -39,16 +89,6 @@ def select_inbox_tasks(
         matched,
         key=lambda task: (approval_expires_at(task), str(task.get("id") or "")),
     )
-
-
-def _is_expired(expires_at: str, *, now: datetime | None = None) -> bool:
-    parsed = _parse_expires_at(expires_at)
-    if parsed is None:
-        return False
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return parsed <= current.astimezone(timezone.utc)
 
 
 def _parse_expires_at(value: str) -> datetime | None:
