@@ -587,6 +587,82 @@ def test_approver_notice_opens_inbox_and_does_not_leak_filenames(tmp_path: Path)
         _close(dialog, controller)
 
 
+def test_approver_tray_emits_on_rising_edge_without_leaking_filenames(tmp_path: Path):
+    _app()
+    controller = _controller(tmp_path)
+    dialog = KnowledgeAssistantDialog(controller)
+    toasts: list[tuple[str, str]] = []
+    dialog.approval_tray_requested.connect(lambda title, message: toasts.append((title, message)))
+    try:
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="human-approver",
+            role="approver",
+            collections="engineering",
+        )
+        dialog._tasks = {
+            "task-exp": {
+                "id": "task-exp",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "editor-a",
+                "filename": "secret.md",
+                "summary": "token-abc",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            },
+            "task-own": {
+                "id": "task-own",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "human-approver",
+                "filename": "mine.md",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            },
+        }
+        dialog._render_task_items()
+        assert toasts == [("企业知识助手", "待我审批 1 个：已过期 1。")]
+        dialog._render_task_items()
+        assert toasts == [("企业知识助手", "待我审批 1 个：已过期 1。")]
+        dialog._tasks["task-new"] = {
+            "id": "task-new",
+            "tool_name": "ingest_text",
+            "status": "awaiting_approval",
+            "requested_by": "editor-a",
+            "filename": "other.md",
+            "created_at": "2026-08-15T10:01:00Z",
+            "approval": {"status": "pending", "expires_at": "2099-01-01T00:00:00Z"},
+        }
+        dialog._render_task_items()
+        assert len(toasts) == 2
+        assert toasts[1] == ("企业知识助手", "待我审批 2 个：已过期 1。")
+        assert all("secret.md" not in message and "token-abc" not in message for _, message in toasts)
+        _set_identity(
+            dialog,
+            tenant="tenant-a",
+            user="editor-a",
+            role="editor",
+            collections="engineering",
+        )
+        dialog._tasks = {
+            "task-exp": {
+                "id": "task-exp",
+                "tool_name": "ingest_text",
+                "status": "awaiting_approval",
+                "requested_by": "human-approver",
+                "filename": "secret.md",
+                "created_at": "2026-08-15T10:00:00Z",
+                "approval": {"status": "pending", "expires_at": "2020-01-01T00:00:00Z"},
+            }
+        }
+        dialog._render_task_items()
+        assert len(toasts) == 2
+    finally:
+        _close(dialog, controller)
+
+
 def test_console_renders_citations_then_clears_them_on_refusal(tmp_path: Path):
     _app()
     controller = _controller(tmp_path)

@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from table_miku.knowledge_assistant_approval_inbox import (
+    APPROVAL_TRAY_TITLE,
+    ApprovalTrayGate,
     can_use_approval_inbox,
     format_approval_notice,
+    format_approval_tray_message,
     format_expiry_cell,
     format_inbox_expiry_hint,
     format_tasks_tab_title,
@@ -99,3 +102,80 @@ def test_approval_notice_uses_counts_only_and_excludes_own_tasks():
 def test_inbox_requires_approve_permission():
     assert can_use_approval_inbox(frozenset({"task:approve", "task:read"}))
     assert not can_use_approval_inbox(frozenset({"task:read", "task:create"}))
+
+
+def test_tray_message_reuses_count_hint_and_omits_secrets():
+    now = datetime(2026, 8, 15, 12, 9, tzinfo=timezone.utc)
+    secret = _task("t-exp", expires_at="2026-08-15T12:00:00Z")
+    secret["filename"] = "secret.md"
+    secret["summary"] = "token-abc"
+    tasks = [
+        _task("t-own", requested_by="approver-b", expires_at="2026-08-15T12:00:00Z"),
+        secret,
+        _task("t-ok", expires_at="2026-08-15T12:20:00Z"),
+    ]
+    text = format_approval_tray_message(tasks, "approver-b", now=now)
+    assert text == "待我审批 2 个：已过期 1。"
+    assert text == format_inbox_expiry_hint(tasks, "approver-b", now=now)
+    assert "secret.md" not in text
+    assert "token-abc" not in text
+    assert "t-exp" not in text
+    assert format_approval_tray_message([], "approver-b", now=now) == ""
+    assert APPROVAL_TRAY_TITLE == "企业知识助手"
+
+
+def test_tray_gate_notifies_only_on_rising_edge_per_identity():
+    gate = ApprovalTrayGate()
+    first = gate.observe(
+        identity_key="tenant-a|approver-b",
+        can_approve=True,
+        count=2,
+        message="待我审批 2 个。",
+    )
+    assert first is not None
+    assert first.title == APPROVAL_TRAY_TITLE
+    assert first.message == "待我审批 2 个。"
+    assert first.count == 2
+    assert (
+        gate.observe(
+            identity_key="tenant-a|approver-b",
+            can_approve=True,
+            count=2,
+            message="待我审批 2 个。",
+        )
+        is None
+    )
+    assert (
+        gate.observe(
+            identity_key="tenant-a|approver-b",
+            can_approve=True,
+            count=1,
+            message="待我审批 1 个。",
+        )
+        is None
+    )
+    second = gate.observe(
+        identity_key="tenant-a|approver-b",
+        can_approve=True,
+        count=3,
+        message="待我审批 3 个。",
+    )
+    assert second is not None
+    assert second.count == 3
+    assert (
+        gate.observe(
+            identity_key="tenant-a|editor-a",
+            can_approve=False,
+            count=3,
+            message="待我审批 3 个。",
+        )
+        is None
+    )
+    switched = gate.observe(
+        identity_key="tenant-a|approver-c",
+        can_approve=True,
+        count=1,
+        message="待我审批 1 个。",
+    )
+    assert switched is not None
+    assert switched.count == 1
