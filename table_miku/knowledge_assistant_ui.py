@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,8 +40,10 @@ from .knowledge_assistant.auth import Principal
 from .knowledge_assistant.client import KnowledgeAssistantApiError
 from .knowledge_assistant_batch_paths import expand_batch_upload_paths
 from .knowledge_assistant_approval_inbox import (
+    ApprovalTrayGate,
     can_use_approval_inbox,
     format_approval_notice,
+    format_approval_tray_message,
     format_expiry_cell,
     format_inbox_expiry_hint,
     format_tasks_tab_title,
@@ -1087,6 +1089,8 @@ class CloseWorkItemDialog(QDialog):
 class KnowledgeAssistantDialog(QDialog):
     """Local visual console for the enterprise Knowledge Assistant vertical slice."""
 
+    approval_tray_requested = Signal(str, str)
+
     _TOOL_LABELS = {
         "ingest_text": "写入并索引文档",
         "archive_document": "归档文档",
@@ -1135,6 +1139,7 @@ class KnowledgeAssistantDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.controller = controller or KnowledgeAssistantDesktopController()
+        self._approval_tray_gate = ApprovalTrayGate()
         self._documents: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
         self._citations: list[dict[str, Any]] = []
@@ -2646,8 +2651,10 @@ class KnowledgeAssistantDialog(QDialog):
         try:
             principal = self._principal()
         except (ValueError, TypeError):
+            self._reset_approval_tray_gate()
             return
         if self._identity_dirty or not can_use_approval_inbox(principal.permissions):
+            self._reset_approval_tray_gate()
             self.approval_notice_bar.setVisible(False)
             self.approval_inbox_notice.clear()
             if hasattr(self, "tabs"):
@@ -2659,6 +2666,26 @@ class KnowledgeAssistantDialog(QDialog):
         self.approval_inbox_notice.setText(text)
         self.approval_notice_bar.setVisible(bool(text))
         self.tabs.setTabText(2, format_tasks_tab_title(count))
+        notice = self._approval_tray_gate.observe(
+            identity_key=repr(self._principal_signature(principal)),
+            can_approve=True,
+            count=count,
+            message=format_approval_tray_message(tasks, principal.user_id),
+        )
+        if notice is not None:
+            self.approval_tray_requested.emit(notice.title, notice.message)
+
+    def _reset_approval_tray_gate(self) -> None:
+        if hasattr(self, "_approval_tray_gate"):
+            self._approval_tray_gate.observe(
+                identity_key="",
+                can_approve=False,
+                count=0,
+                message="",
+            )
+
+    def open_approval_inbox(self) -> None:
+        self._open_approval_inbox()
 
     def _open_approval_inbox(self) -> None:
         if self._identity_dirty:

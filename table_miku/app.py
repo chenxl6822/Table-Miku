@@ -1154,6 +1154,7 @@ class TableMiku(QWidget):
         self.agent_runtime = AgentRuntime(parent=self)
         self._agent_center_dialog: AgentCenterDialog | None = None
         self._knowledge_assistant_dialog: KnowledgeAssistantDialog | None = None
+        self._approval_tray_awaiting_click = False
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.agent_runtime.shutdown)
@@ -1624,12 +1625,50 @@ class TableMiku(QWidget):
         self._agent_center_dialog.raise_()
         self._agent_center_dialog.activateWindow()
 
+    def _show_approval_tray_message(self, title: str, message: str) -> None:
+        tray = getattr(self, "tray_icon", None)
+        if tray is None:
+            return
+        supports = getattr(tray, "supportsMessages", None)
+        if callable(supports) and not supports():
+            return
+        show = getattr(tray, "showMessage", None)
+        if not callable(show):
+            return
+        clicked = getattr(tray, "messageClicked", None)
+        if clicked is not None and not getattr(self, "_approval_tray_click_bound", False):
+            clicked.connect(self._on_approval_tray_clicked)
+            self._approval_tray_click_bound = True
+        self._approval_tray_awaiting_click = True
+        show(str(title), str(message), QSystemTrayIcon.MessageIcon.Information)
+
+    def _on_approval_tray_clicked(self) -> None:
+        if not getattr(self, "_approval_tray_awaiting_click", False):
+            return
+        self._approval_tray_awaiting_click = False
+        self.show_knowledge_assistant()
+        dialog = getattr(self, "_knowledge_assistant_dialog", None)
+        opener = getattr(dialog, "open_approval_inbox", None)
+        if callable(opener):
+            opener()
+
+    def _bind_approval_tray(self, dialog: KnowledgeAssistantDialog) -> None:
+        requested = getattr(dialog, "approval_tray_requested", None)
+        if requested is None:
+            return
+        requested.connect(
+            lambda title, message, host=self: TableMiku._show_approval_tray_message(
+                host, title, message
+            )
+        )
+
     def show_knowledge_assistant(self) -> None:
         if self._knowledge_assistant_dialog is None:
             controller: KnowledgeAssistantDesktopController | None = None
             try:
                 controller = KnowledgeAssistantDesktopController()
                 self._knowledge_assistant_dialog = KnowledgeAssistantDialog(controller, self)
+                TableMiku._bind_approval_tray(self, self._knowledge_assistant_dialog)
             except Exception as exc:
                 if controller is not None:
                     controller.close()

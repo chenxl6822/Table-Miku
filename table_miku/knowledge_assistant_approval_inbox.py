@@ -1,10 +1,48 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 INBOX_STATUS = "awaiting_approval"
 EXPIRING_SOON_SECONDS = 120
+APPROVAL_TRAY_TITLE = "企业知识助手"
+
+
+@dataclass(frozen=True)
+class ApprovalTrayNotice:
+    title: str
+    message: str
+    count: int
+
+
+class ApprovalTrayGate:
+    def __init__(self) -> None:
+        self._identity_key = ""
+        self._last_count = 0
+
+    def observe(
+        self,
+        *,
+        identity_key: str,
+        can_approve: bool,
+        count: int,
+        message: str,
+    ) -> ApprovalTrayNotice | None:
+        if not can_approve:
+            self._identity_key = ""
+            self._last_count = 0
+            return None
+        if identity_key != self._identity_key:
+            self._identity_key = identity_key
+            self._last_count = 0
+        if count <= self._last_count:
+            self._last_count = count
+            return None
+        self._last_count = count
+        if not message:
+            return None
+        return ApprovalTrayNotice(APPROVAL_TRAY_TITLE, message, count)
 
 
 def can_use_approval_inbox(permissions: frozenset[str] | set[str]) -> bool:
@@ -71,6 +109,15 @@ def format_approval_notice(
     if not summary:
         return ""
     return f"有待你审批的任务。{summary}点击打开收件箱。"
+
+
+def format_approval_tray_message(
+    tasks: Sequence[Mapping[str, Any]],
+    user_id: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    return format_inbox_expiry_hint(tasks, user_id, now=now)
 
 
 def format_tasks_tab_title(count: int) -> str:
